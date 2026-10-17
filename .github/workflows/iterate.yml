@@ -195,11 +195,19 @@ jobs:
           TG_BRIDGE_FORCE_SERVE: "1"
         run: |
           set +e
+          RUN_LOG="$RUNNER_TEMP/opencode-run.log"
           timeout --signal=TERM --kill-after=30s 19200 \
-            opencode run --standalone "从 ${SESSIONS_DIR}/state/current.md 恢复目标。每完成一个可独立验证的最小单元，立即在 sessions/ 和 state/ 中记录，然后再进入下一个单元。不要积攒记录。目标仓库在 ${TARGETS_DIR} 下，如果需要的仓库不在其中，自行克隆。"
+            opencode run --standalone "从 ${SESSIONS_DIR}/state/current.md 恢复目标。每完成一个可独立验证的最小单元，立即在 sessions/ 和 state/ 中记录，然后再进入下一个单元。不要积攒记录。目标仓库在 ${TARGETS_DIR} 下，如果需要的仓库不在其中，自行克隆。" \
+            >"$RUN_LOG" 2>&1
           RC=$?
+          # Session content must never reach the CI log, so only a non-content summary.
+          echo "opencode run exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
           if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+            echo "opencode run hit the time budget; treated as success so the loop continues."
             exit 0
+          fi
+          if [ "$RC" -ne 0 ]; then
+            echo "opencode run failed with exit=$RC; this run will not relay."
           fi
           exit "$RC"
 
