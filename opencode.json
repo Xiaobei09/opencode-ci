@@ -3,7 +3,9 @@
   "permission": {
     "external_directory": {
       "/home/runner/work/sessions/**": "allow",
-      "/home/runner/work/targets/**": "allow"
+      "/home/runner/work/targets/**": "allow",
+      "/home/runner/.opencode/**": "allow",
+      "/home/runner/.config/opencode/**": "allow"
     },
     "doom_loop": "allow",
     "bash": "allow",

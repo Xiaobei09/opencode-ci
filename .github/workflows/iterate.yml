@@ -136,21 +136,42 @@ jobs:
             )
           done
 
-      - name: Install bridge plugin
+      - name: Install bridge environment from sessions repository
         if: steps.lock.outputs.acquired == 'true'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_ALLOWED_CHAT: ${{ secrets.TG_ALLOWED_CHAT }}
+          TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
         run: |
           set -euo pipefail
-          gh repo clone Xiaobei09/opencode-bridge-plugin plugins/opencode-bridge-plugin
-          mkdir -p .opencode/plugins
-          cp -r plugins/opencode-bridge-plugin/src/* .opencode/plugins/
+          ENV_SRC="$SESSIONS_DIR/opencode"
+          if [ ! -d "$ENV_SRC/v2lib" ] || [ ! -d "$ENV_SRC/plugins" ]; then
+            echo "::warning::bridge environment missing under sessions repository; continuing without it"
+            exit 0
+          fi
+          mkdir -p "$HOME/.opencode" "$HOME/.config/opencode"
+          rm -rf "$HOME/.opencode/v2lib" "$HOME/.opencode/.v2lib-live" "$HOME/.config/opencode/plugins"
+          ln -s "$ENV_SRC/v2lib" "$HOME/.opencode/v2lib"
+          ln -s "$ENV_SRC/plugins" "$HOME/.config/opencode/plugins"
+          if [ -f "$ENV_SRC/config/tg-bots.json" ]; then
+            sed "s#__HOME__#$HOME#g" "$ENV_SRC/config/tg-bots.json" > "$HOME/.config/opencode/tg-bots.json"
+          fi
+          : > "$HOME/.config/opencode/tg.env"
+          if [ -n "${TG_BOT_TOKEN:-}" ]; then printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.config/opencode/tg.env"; fi
+          if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.config/opencode/tg.env"; fi
+          if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.config/opencode/tg.env"; fi
+          chmod 600 "$HOME/.config/opencode/tg.env"
 
-      - name: Install OpenCode and workferry
+      - name: Install OpenCode 2 and workferry
         if: steps.lock.outputs.acquired == 'true'
         run: |
           set -euo pipefail
-          npm install -g opencode-ai workferry
+          curl -fsSL https://opencode.ai/v2/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          npm install -g workferry
 
       - name: Run OpenCode
+        id: run_opencode
         if: steps.lock.outputs.acquired == 'true'
         env:
           SESSIONS_DIR: /home/runner/work/sessions
@@ -158,7 +179,7 @@ jobs:
         run: |
           set +e
           timeout --signal=TERM --kill-after=30s 19200 \
-            opencode run "从 ${SESSIONS_DIR}/state/current.md 恢复目标。每完成一个可独立验证的最小单元，立即在 sessions/ 和 state/ 中记录，然后再进入下一个单元。不要积攒记录。目标仓库在 ${TARGETS_DIR} 下，如果需要的仓库不在其中，自行克隆。"
+            opencode run --standalone "从 ${SESSIONS_DIR}/state/current.md 恢复目标。每完成一个可独立验证的最小单元，立即在 sessions/ 和 state/ 中记录，然后再进入下一个单元。不要积攒记录。目标仓库在 ${TARGETS_DIR} 下，如果需要的仓库不在其中，自行克隆。"
           RC=$?
           if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
             exit 0
@@ -237,7 +258,7 @@ jobs:
           git push origin HEAD || echo "::warning::failed to push sessions repository"
 
       - name: Relay next run
-        if: always() && steps.lock.outputs.acquired == 'true'
+        if: always() && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outcome == 'success'
         run: |
           set +e
           CHECKPOINT="$SESSIONS_DIR/state/checkpoint.json"
