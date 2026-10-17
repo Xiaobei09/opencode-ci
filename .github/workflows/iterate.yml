@@ -141,7 +141,10 @@ jobs:
           # left anywhere under $HOME survive across runs.  The managed dirs below
           # are excluded from the snapshot and re-created here, so this never
           # clobbers the live bridge state / sessions DB.
-          if [ -f "$ENV_SRC/home.tar.gz" ]; then
+          if ls "$ENV_SRC"/home.tar.gz.* >/dev/null 2>&1; then
+            cat "$ENV_SRC"/home.tar.gz.* | tar -xzf - -C "$HOME" 2>/dev/null \
+              || echo "::warning::failed to restore environment snapshot"
+          elif [ -f "$ENV_SRC/home.tar.gz" ]; then
             tar -xzf "$ENV_SRC/home.tar.gz" -C "$HOME" 2>/dev/null \
               || echo "::warning::failed to restore environment snapshot"
           fi
@@ -318,7 +321,10 @@ jobs:
             # deltas, so everything restored from the previous run's snapshot (which is
             # older than the marker) would silently vanish on the next restore.
             STAGE=$(mktemp -d)
-            if [ -f "$ENV_SRC/home.tar.gz" ]; then
+            # Reassemble the previous snapshot from its split volumes first.
+            if ls "$ENV_SRC"/home.tar.gz.* >/dev/null 2>&1; then
+              cat "$ENV_SRC"/home.tar.gz.* | tar -xzf - -C "$STAGE" 2>/dev/null || true
+            elif [ -f "$ENV_SRC/home.tar.gz" ]; then
               tar -xzf "$ENV_SRC/home.tar.gz" -C "$STAGE" 2>/dev/null || true
             fi
             (
@@ -329,20 +335,21 @@ jobs:
                 cp -a -- "$f" "$STAGE/$f" 2>/dev/null || true
               done < /tmp/envsnap.list
             )
-            tar -czf "$ENV_SRC/home.tar.gz" -C "$STAGE" . 2>/dev/null \
+            # Split into volumes: GitHub caps each file at 100MiB, so a single archive
+            # would eventually be rejected and the whole snapshot lost. `split` keeps
+            # every piece under the cap; `cat` rejoins them into one gzip stream on
+            # restore, so compression is preserved.
+            rm -f "$ENV_SRC"/home.tar.gz "$ENV_SRC"/home.tar.gz.[a-z][a-z]
+            tar -czf - -C "$STAGE" . 2>/dev/null | split -b 90m - "$ENV_SRC/home.tar.gz." \
               || echo "::warning::environment snapshot failed"
             rm -rf "$STAGE"
           else
             echo "No new files under \$HOME this run; keeping previous snapshot."
           fi
-          if [ -f "$ENV_SRC/home.tar.gz" ]; then
-            SZ=$(stat -c%s "$ENV_SRC/home.tar.gz" 2>/dev/null || echo 0)
-            echo "environment snapshot: $SZ bytes, $(wc -l < /tmp/envsnap.list 2>/dev/null) entries"
-            # GitHub's hard limit is 100MiB; keep a small margin under it.
-            if [ "$SZ" -gt 104000000 ]; then
-              echo "::warning::environment snapshot exceeds 99.2MiB; discarding to keep the repository pushable"
-              rm -f "$ENV_SRC/home.tar.gz"
-            fi
+          PARTS=$(ls "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -l)
+          if [ "$PARTS" -gt 0 ]; then
+            SZ=$(cat "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -c)
+            echo "environment snapshot: $PARTS volumes, $SZ bytes total, $(wc -l < /tmp/envsnap.list 2>/dev/null) entries"
           fi
           rm -f /tmp/envsnap.list
 
@@ -360,13 +367,20 @@ jobs:
             python3 -c 'import sqlite3;c=sqlite3.connect("opencode/data/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
               && echo "sqlite WAL checkpointed" || echo "::warning::sqlite WAL checkpoint skipped"
           fi
-          # Size guard: never stage a file GitHub will refuse.
-          if [ -f opencode/home.tar.gz ]; then
-            SZ=$(stat -c%s opencode/home.tar.gz 2>/dev/null || echo 0)
-            if [ "$SZ" -gt 104000000 ]; then
-              echo "::warning::opencode/home.tar.gz is ${SZ}B; exceeding 99.2MiB, discarding so the push succeeds"
-              rm -f opencode/home.tar.gz
+          # Size guard: never stage a file GitHub will refuse (100MiB hard cap per file).
+          # Split volumes stay under this by construction; this only catches a stray
+          # oversized file (or a legacy unsplitted archive).
+          for f in opencode/home.tar.gz opencode/home.tar.gz.[a-z][a-z]; do
+            [ -f "$f" ] || continue
+            SZ=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$SZ" -gt 104857600 ]; then
+              echo "::warning::$f is ${SZ}B; exceeding GitHub's 100MiB cap, discarding so the push succeeds"
+              rm -f "$f"
             fi
+          done
+          ENV_TOTAL=$(cat opencode/home.tar.gz.* 2>/dev/null | wc -c)
+          if [ "$ENV_TOTAL" -gt 524288000 ]; then
+            echo "::warning::environment snapshot totals ${ENV_TOTAL}B (>500MiB); consider pruning target snapshots"
           fi
           git add -A
           # Sanitize: never commit the bot token, even if a session ever echoed it.
