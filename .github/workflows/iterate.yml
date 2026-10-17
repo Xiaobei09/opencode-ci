@@ -143,11 +143,13 @@ jobs:
           # every run overwrites the previous environment.
           ENV_TAG="env"
           rm -rf /tmp/envdl && mkdir -p /tmp/envdl
-          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'home.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1; then
+          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'home.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1 \
+             && ls /tmp/envdl/home.tar.gz* >/dev/null 2>&1; then
+            echo "environment restored from release '$ENV_TAG'"
             if ls /tmp/envdl/home.tar.gz.* >/dev/null 2>&1; then
               cat /tmp/envdl/home.tar.gz.* | tar -xzf - -C "$HOME" 2>/dev/null \
                 || echo "::warning::failed to restore environment snapshot"
-            elif [ -f /tmp/envdl/home.tar.gz ]; then
+            else
               tar -xzf /tmp/envdl/home.tar.gz -C "$HOME" 2>/dev/null \
                 || echo "::warning::failed to restore environment snapshot"
             fi
