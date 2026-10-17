@@ -353,11 +353,10 @@ jobs:
         if: always() && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outcome == 'success'
         run: |
           set +e
-          CHECKPOINT="$SESSIONS_DIR/state/checkpoint.json"
-          NEXT="stop"
-          if [ -f "$CHECKPOINT" ]; then
-            NEXT=$(jq -r '.next_action // "stop"' "$CHECKPOINT")
-          fi
-          if [ "$NEXT" = "continue" ]; then
-            gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"
-          fi
+          # No checkpoint gate: every run hands off to the next one unconditionally.
+          # Continuity comes from the persisted opencode state (sessions DB under
+          # $HOME/.local/share/opencode, bridge state, state/current.md).  Because
+          # opencode resumes from where it was interrupted, a forced timeout at the
+          # end of a run is seamless on the next run.
+          echo "Relaying next run unconditionally."
+          gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"
