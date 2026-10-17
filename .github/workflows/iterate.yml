@@ -137,16 +137,22 @@ jobs:
           set -euo pipefail
           ENV_SRC="$SESSIONS_DIR/opencode"
           mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/.opencode"
-          # Restore the catch-all environment snapshot first, so files the agent
-          # left anywhere under $HOME survive across runs.  The managed dirs below
-          # are excluded from the snapshot and re-created here, so this never
-          # clobbers the live bridge state / sessions DB.
-          if ls "$ENV_SRC"/home.tar.gz.* >/dev/null 2>&1; then
-            cat "$ENV_SRC"/home.tar.gz.* | tar -xzf - -C "$HOME" 2>/dev/null \
-              || echo "::warning::failed to restore environment snapshot"
-          elif [ -f "$ENV_SRC/home.tar.gz" ]; then
-            tar -xzf "$ENV_SRC/home.tar.gz" -C "$HOME" 2>/dev/null \
-              || echo "::warning::failed to restore environment snapshot"
+          # Restore the catch-all environment snapshot from the sessions repo RELEASE.
+          # Release assets are not part of git history, so the repository stays clean
+          # and each asset can far exceed git's 100MiB file cap. The tag is fixed, so
+          # every run overwrites the previous environment.
+          ENV_TAG="env"
+          rm -rf /tmp/envdl && mkdir -p /tmp/envdl
+          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'home.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1; then
+            if ls /tmp/envdl/home.tar.gz.* >/dev/null 2>&1; then
+              cat /tmp/envdl/home.tar.gz.* | tar -xzf - -C "$HOME" 2>/dev/null \
+                || echo "::warning::failed to restore environment snapshot"
+            elif [ -f /tmp/envdl/home.tar.gz ]; then
+              tar -xzf /tmp/envdl/home.tar.gz -C "$HOME" 2>/dev/null \
+                || echo "::warning::failed to restore environment snapshot"
+            fi
+          else
+            echo "no environment release yet; starting fresh"
           fi
           if [ ! -d "$ENV_SRC/config/plugins" ] || [ ! -d "$ENV_SRC/config/v2lib" ]; then
             echo "::warning::bridge environment missing under sessions repository; continuing without it"
@@ -312,17 +318,20 @@ jobs:
           MARK="$HOME/.opencode/.snapshot-mark"
           [ -f "$MARK" ] || touch "$MARK"
           EXCL='^\./(work|\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials|node_modules|\.venv|__pycache__|\.gradle|\.m2)(/|$)'
+          ENV_TAG="env"
           STAGE=$(mktemp -d)
-          # 1. Unpack the previous snapshot as the baseline, unless it is implausibly
-          #    large (i.e. an older blanket capture that baked in the base image); in
-          #    that case start fresh so the bloat is not carried forward.
-          BASELINE_SZ=$(cat "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -c)
-          if [ "$BASELINE_SZ" -gt 419430400 ]; then
-            echo "::warning::previous environment snapshot is ${BASELINE_SZ}B (base-image bloat); rebuilding from this run's deltas only"
-          elif ls "$ENV_SRC"/home.tar.gz.* >/dev/null 2>&1; then
-            cat "$ENV_SRC"/home.tar.gz.* | tar -xzf - -C "$STAGE" 2>/dev/null || true
-          elif [ -f "$ENV_SRC/home.tar.gz" ]; then
-            tar -xzf "$ENV_SRC/home.tar.gz" -C "$STAGE" 2>/dev/null || true
+          # 1. Unpack the previous environment (from the release) as the baseline, unless
+          #    it is implausibly large (an older blanket capture that baked in the base
+          #    image); in that case start fresh so the bloat is not carried forward.
+          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'home.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1; then
+            BASELINE_SZ=$(cat /tmp/envdl/home.tar.gz* 2>/dev/null | wc -c)
+            if [ "$BASELINE_SZ" -gt 419430400 ]; then
+              echo "::warning::previous environment is ${BASELINE_SZ}B (base-image bloat); rebuilding from this run's deltas only"
+            elif ls /tmp/envdl/home.tar.gz.* >/dev/null 2>&1; then
+              cat /tmp/envdl/home.tar.gz.* | tar -xzf - -C "$STAGE" 2>/dev/null || true
+            elif [ -f /tmp/envdl/home.tar.gz ]; then
+              tar -xzf /tmp/envdl/home.tar.gz -C "$STAGE" 2>/dev/null || true
+            fi
           fi
           # 2. Drop baseline entries the agent deleted since the previous snapshot.
           ( cd "$STAGE" && find . -xdev \( -type f -o -type l \) 2>/dev/null ) | while IFS= read -r p; do
@@ -335,21 +344,37 @@ jobs:
                 mkdir -p "$STAGE/$(dirname "$p")"
                 cp -a -- "$HOME/$p" "$STAGE/$p" 2>/dev/null || true
               done
-          # 4. Split the resulting environment into volumes so it can outgrow GitHub's
-          #    100MiB per-file cap; `cat` rejoins them into one gzip stream on restore.
-          rm -f "$ENV_SRC"/home.tar.gz "$ENV_SRC"/home.tar.gz.[a-z][a-z]
+          # 4. Store it on the fixed `env` RELEASE on the sessions repo. Release assets
+          #    live outside git history (the repository commits stay clean and small)
+          #    and are not capped at git's 100MiB per-file limit. Split at 90MiB anyway
+          #    so a runaway environment still uploads, and replace stale assets so only
+          #    the latest environment is kept.
+          OUT=/tmp/envsnap
+          rm -rf "$OUT" && mkdir -p "$OUT"
           if [ -n "$(ls -A "$STAGE" 2>/dev/null)" ]; then
-            tar -czf - -C "$STAGE" . 2>/dev/null | split -b 90m - "$ENV_SRC/home.tar.gz." \
+            tar -czf - -C "$STAGE" . 2>/dev/null | split -b 90m - "$OUT/home.tar.gz." \
               || echo "::warning::environment snapshot failed"
           else
             echo "No environment files to snapshot this run."
           fi
           rm -rf "$STAGE"
-          PARTS=$(ls "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -l)
-          if [ "$PARTS" -gt 0 ]; then
-            SZ=$(cat "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -c)
-            echo "environment snapshot: $PARTS volumes, $SZ bytes total"
+          # Drop any legacy in-repo copies so they never re-enter git history.
+          rm -f "$ENV_SRC"/home.tar.gz "$ENV_SRC"/home.tar.gz.[a-z][a-z]
+          if [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+            gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
+              || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
+                   --notes "Latest persisted agent environment; replaced every run." >/dev/null 2>&1
+            gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
+              | grep -E '^home\.tar\.gz(\.|$)' \
+              | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
+            if gh release upload "$ENV_TAG" "$OUT"/home.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+              SZ=$(cat "$OUT"/home.tar.gz.* 2>/dev/null | wc -c)
+              echo "environment snapshot uploaded: $(ls "$OUT"/home.tar.gz.* | wc -l) volume(s), $SZ bytes"
+            else
+              echo "::warning::failed to upload environment snapshot to release"
+            fi
           fi
+          rm -rf "$OUT"
 
       - name: Commit and push sessions repository
         if: always() && steps.lock.outputs.acquired == 'true'
@@ -365,21 +390,21 @@ jobs:
             python3 -c 'import sqlite3;c=sqlite3.connect("opencode/data/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
               && echo "sqlite WAL checkpointed" || echo "::warning::sqlite WAL checkpoint skipped"
           fi
-          # Size guard: never stage a file GitHub will refuse (100MiB hard cap per file).
-          # Split volumes stay under this by construction; this only catches a stray
-          # oversized file (or a legacy unsplitted archive).
-          for f in opencode/home.tar.gz opencode/home.tar.gz.[a-z][a-z]; do
+          # The environment snapshot now lives in the `env` release as assets, not in
+          # git. Purge any legacy in-repo copy so it drops out of history, and never
+          # stage a file GitHub will refuse (100MiB hard cap).
+          rm -rf opencode/home.tar.gz opencode/home.tar.gz.[a-z][a-z]
+          if ! grep -qxF 'opencode/home.tar.gz.*' .gitignore 2>/dev/null; then
+            printf '\n# Environment snapshot lives in the env release, not git.\nopencode/home.tar.gz*\n' >> .gitignore
+          fi
+          for f in $(git ls-files); do
             [ -f "$f" ] || continue
             SZ=$(stat -c%s "$f" 2>/dev/null || echo 0)
             if [ "$SZ" -gt 104857600 ]; then
-              echo "::warning::$f is ${SZ}B; exceeding GitHub's 100MiB cap, discarding so the push succeeds"
+              echo "::warning::$f is ${SZ}B; exceeding GitHub's 100MiB cap, removing so the push succeeds"
               rm -f "$f"
             fi
           done
-          ENV_TOTAL=$(cat opencode/home.tar.gz.* 2>/dev/null | wc -c)
-          if [ "$ENV_TOTAL" -gt 524288000 ]; then
-            echo "::warning::environment snapshot totals ${ENV_TOTAL}B (>500MiB); consider pruning target snapshots"
-          fi
           git add -A
           # Sanitize: never commit the bot token, even if a session ever echoed it.
           if [ -n "${TG_BOT_TOKEN:-}" ]; then
