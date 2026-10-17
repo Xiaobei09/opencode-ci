@@ -200,11 +200,18 @@ jobs:
             ARGS=(--standalone --continue)
             echo "no bound session found; continuing the last session"
           fi
-          TERM=xterm-256color timeout --signal=TERM --kill-after=30s 2700 \
+          TERM=xterm-256color timeout --signal=TERM --kill-after=30s 900 \
             opencode "${ARGS[@]}" </dev/null >"$RUN_LOG" 2>&1
           RC=$?
           # Session content must never reach the CI log, so only a non-content summary.
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
+          # Content-safe bridge diagnostics: counters only, never message text.
+          if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
+            jq -c '{iocount, paused, selfmute, halted:(.halted|length)}' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true
+          fi
+          for pat in "pinject delivered" "pinject failed" "inject failed" "getUpdates failed" "loop stopped" "sendMessage chunked ok" "free tier" "instance registered"; do
+            echo "diag '$pat' = $(grep -c -- "$pat" "$RUN_LOG" 2>/dev/null || echo 0)"
+          done
           if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
             echo "opencode hit the time budget; treated as success so the loop continues."
             exit 0
