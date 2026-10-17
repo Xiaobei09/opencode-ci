@@ -196,9 +196,25 @@ jobs:
         run: |
           set +e
           RUN_LOG="$RUNNER_TEMP/opencode-run.log"
+          # Cold-start resume: continue the exact session the bridge is bound to, so no
+          # new session is created and the operator's conversation keeps its context.
+          # Only `opencode run` loads the plugins (serve/service/acp do not) and it
+          # insists on a message, so we pass a minimal continuation seed ("继续") that
+          # does not introduce a new task. Everything else comes from the bridge, which
+          # injects operator Telegram messages into that same session.
+          SID=""
+          if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
+            SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
+          fi
+          if [ -n "$SID" ]; then
+            RESUME=(--standalone --session "$SID")
+            echo "resuming bound session $SID"
+          else
+            RESUME=(--standalone --continue)
+            echo "no bound session found; continuing the last session"
+          fi
           timeout --signal=TERM --kill-after=30s 19200 \
-            opencode run --standalone "从 ${SESSIONS_DIR}/state/current.md 恢复目标。每完成一个可独立验证的最小单元，立即在 sessions/ 和 state/ 中记录，然后再进入下一个单元。不要积攒记录。目标仓库在 ${TARGETS_DIR} 下，如果需要的仓库不在其中，自行克隆。" \
-            >"$RUN_LOG" 2>&1
+            opencode run "${RESUME[@]}" "继续" >"$RUN_LOG" 2>&1
           RC=$?
           # Session content must never reach the CI log, so only a non-content summary.
           echo "opencode run exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
