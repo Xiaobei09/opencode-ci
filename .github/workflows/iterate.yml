@@ -1,0 +1,250 @@
+name: iterate
+
+on:
+  workflow_dispatch:
+    inputs:
+      resume:
+        description: Resume the previous run from saved state
+        type: boolean
+        required: false
+        default: true
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: iterate
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  GH_TOKEN: ${{ secrets.CROSS_PAT }}
+  SESSIONS_REPO: ${{ vars.SESSIONS_REPO }}
+  SESSIONS_DIR: /home/runner/work/sessions
+  TARGETS_DIR: /home/runner/work/targets
+
+jobs:
+  iterate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out ci-repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install GitHub CLI and configure git
+        run: |
+          set -euo pipefail
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          key=$(mktemp)
+          wget -nv -O"$key" https://cli.github.com/packages/githubcli-archive-keyring.gpg
+          sudo install -m 0644 "$key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y gh
+          gh auth setup-git
+          git config --global user.name "opencode-ci"
+          git config --global user.email "opencode-ci@users.noreply.github.com"
+
+      - name: Clone sessions repository
+        run: |
+          set -euo pipefail
+          if [ ! -d "$SESSIONS_DIR/.git" ]; then
+            mkdir -p "$(dirname "$SESSIONS_DIR")"
+            gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR"
+          fi
+          mkdir -p "$SESSIONS_DIR/state" "$SESSIONS_DIR/tasks" "$SESSIONS_DIR/sessions" "$SESSIONS_DIR/workspace-snapshots"
+          [ -f "$SESSIONS_DIR/workspace-snapshots/index.json" ] || echo '{"snapshots": []}' > "$SESSIONS_DIR/workspace-snapshots/index.json"
+
+      - name: Acquire lock
+        id: lock
+        run: |
+          set -euo pipefail
+          mkdir -p "$SESSIONS_DIR/state"
+          LOCK="$SESSIONS_DIR/state/lock.json"
+          NOW=$(date -u +%s)
+          if [ -f "$LOCK" ]; then
+            EXP=$(jq -r '.expires_at // 0' "$LOCK")
+            if [ "$EXP" -gt "$NOW" ]; then
+              echo "Lock is held until $EXP (now $NOW). Skipping this run."
+              echo "acquired=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          EXP=$((NOW + 370 * 60))
+          printf '{"expires_at": %s, "acquired_at": %s}\n' "$EXP" "$NOW" > "$LOCK"
+          cd "$SESSIONS_DIR"
+          git add -A state/lock.json
+          git commit -m "acquire lock $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+          git push origin HEAD
+          echo "acquired=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare target workspace
+        if: steps.lock.outputs.acquired == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$TARGETS_DIR"
+
+      - name: Restore workspace snapshots
+        if: steps.lock.outputs.acquired == 'true'
+        run: |
+          set +e
+          INDEX="$SESSIONS_DIR/workspace-snapshots/index.json"
+          [ -f "$INDEX" ] || exit 0
+          COUNT=$(jq '.snapshots | length' "$INDEX")
+          for i in $(seq 0 $((COUNT - 1))); do
+            dir=$(jq -r ".snapshots[$i].dir // empty" "$INDEX")
+            bundle=$(jq -r ".snapshots[$i].bundle // empty" "$INDEX")
+            worktree=$(jq -r ".snapshots[$i].worktree // empty" "$INDEX")
+            branch=$(jq -r ".snapshots[$i].branch // empty" "$INDEX")
+            commit=$(jq -r ".snapshots[$i].commit // empty" "$INDEX")
+            repo=$(jq -r ".snapshots[$i].repo // empty" "$INDEX")
+            [ -n "$dir" ] || continue
+            target_dir="$TARGETS_DIR/$dir"
+            [ -e "$target_dir" ] && continue
+            if ! git clone "$SESSIONS_DIR/$bundle" "$target_dir"; then
+              echo "::warning::clone failed for $dir, skipping"
+              continue
+            fi
+            (
+              set +e
+              cd "$target_dir" || exit 0
+              if [ -n "$branch" ]; then
+                git checkout "$branch" 2>/dev/null \
+                  || git checkout -b "$branch" "origin/$branch" 2>/dev/null \
+                  || echo "::warning::branch $branch missing for $dir, staying on default"
+              fi
+              if [ -n "$commit" ]; then
+                git rev-parse --verify HEAD >/dev/null 2>&1 || git checkout "$commit" 2>/dev/null || true
+              fi
+              git fetch origin '+refs/stash:refs/stash' 2>/dev/null || true
+              if ! workferry apply --dir "$target_dir" "$SESSIONS_DIR/$worktree"; then
+                echo "::warning::workferry apply failed for $dir, untracked files may be lost"
+              fi
+              if git rev-parse --verify refs/stash >/dev/null 2>&1; then
+                STASH_SHA=$(git rev-parse refs/stash)
+                git stash apply --index "$STASH_SHA" 2>/dev/null \
+                  || echo "::warning::stash apply failed for $dir, staged state may be incomplete"
+              fi
+              if [ -n "$repo" ]; then
+                git remote set-url origin "$repo"
+              fi
+            )
+          done
+
+      - name: Install bridge plugin
+        if: steps.lock.outputs.acquired == 'true'
+        run: |
+          set -euo pipefail
+          gh repo clone Xiaobei09/opencode-bridge-plugin plugins/opencode-bridge-plugin
+          mkdir -p .opencode/plugins
+          cp -r plugins/opencode-bridge-plugin/src/* .opencode/plugins/
+
+      - name: Install OpenCode and workferry
+        if: steps.lock.outputs.acquired == 'true'
+        run: |
+          set -euo pipefail
+          npm install -g opencode-ai workferry
+
+      - name: Run OpenCode
+        if: steps.lock.outputs.acquired == 'true'
+        env:
+          SESSIONS_DIR: /home/runner/work/sessions
+          TARGETS_DIR: /home/runner/work/targets
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=30s 19200 \
+            opencode run "从 ${SESSIONS_DIR}/state/current.md 恢复目标。每完成一个可独立验证的最小单元，立即在 sessions/ 和 state/ 中记录，然后再进入下一个单元。不要积攒记录。目标仓库在 ${TARGETS_DIR} 下，如果需要的仓库不在其中，自行克隆。"
+          RC=$?
+          if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+            exit 0
+          fi
+          exit "$RC"
+
+      - name: Save workspace snapshots
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          set +e
+          SNAP="$SESSIONS_DIR/workspace-snapshots"
+          mkdir -p "$SNAP"
+          INDEX="$SNAP/index.json"
+          [ -f "$INDEX" ] || echo '{"snapshots": []}' > "$INDEX"
+          shopt -s nullglob
+          for target_dir in "$TARGETS_DIR"/*/; do
+            repo_dir="${target_dir%/}"
+            [ -d "$repo_dir/.git" ] || continue
+            name=$(basename "$repo_dir")
+            snap_dir="$SNAP/$name"
+            rm -rf "$snap_dir"
+            mkdir -p "$snap_dir"
+
+            STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
+            if [ -n "$STASH_HASH" ]; then
+              git -C "$repo_dir" stash store -m "snapshot" "$STASH_HASH" 2>/dev/null || true
+            fi
+
+            BUNDLE_ARGS="--branches --tags HEAD"
+            if git -C "$repo_dir" rev-parse --verify refs/stash >/dev/null 2>&1; then
+              BUNDLE_ARGS="$BUNDLE_ARGS refs/stash"
+            fi
+            if ! git -C "$repo_dir" bundle create "$snap_dir/git.bundle" $BUNDLE_ARGS; then
+              echo "::warning::bundle create failed for $name"
+              rm -rf "$snap_dir"
+              continue
+            fi
+
+            if ! workferry pack --dir "$repo_dir" "$snap_dir/worktree.tar.gz"; then
+              echo "::warning::workferry pack failed for $name"
+            fi
+
+            BRANCH=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || true)
+            COMMIT=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)
+            REMOTE=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
+            SAVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+            ENTRY=$(jq -n \
+              --arg repo "$REMOTE" \
+              --arg dir "$name" \
+              --arg bundle "workspace-snapshots/$name/git.bundle" \
+              --arg worktree "workspace-snapshots/$name/worktree.tar.gz" \
+              --arg branch "$BRANCH" \
+              --arg commit "$COMMIT" \
+              --arg saved_at "$SAVED_AT" \
+              '{repo: $repo, dir: $dir, bundle: $bundle, worktree: $worktree, branch: $branch, commit: $commit, saved_at: $saved_at}')
+
+            tmp=$(mktemp)
+            jq --arg dir "$name" '.snapshots |= map(select(.dir != $dir))' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
+            tmp=$(mktemp)
+            jq --argjson e "$ENTRY" '.snapshots += [$e]' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
+          done
+
+      - name: Commit and push sessions repository
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          set +e
+          cd "$SESSIONS_DIR"
+          rm -f state/lock.json
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          git push origin HEAD || echo "::warning::failed to push sessions repository"
+
+      - name: Relay next run
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          set +e
+          CHECKPOINT="$SESSIONS_DIR/state/checkpoint.json"
+          NEXT="stop"
+          if [ -f "$CHECKPOINT" ]; then
+            NEXT=$(jq -r '.next_action // "stop"' "$CHECKPOINT")
+          fi
+          if [ "$NEXT" = "continue" ]; then
+            gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"
+          fi
