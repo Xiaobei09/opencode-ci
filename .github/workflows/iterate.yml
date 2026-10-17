@@ -313,8 +313,25 @@ jobs:
               > /tmp/envsnap.list
           )
           if [ -s /tmp/envsnap.list ]; then
-            ( cd "$HOME" && tar -czf "$ENV_SRC/home.tar.gz" -T /tmp/envsnap.list ) 2>/dev/null \
+            # Cumulative: merge this run's new/changed files INTO the previous archive.
+            # A plain `tar -T list` would replace the archive with only this run's
+            # deltas, so everything restored from the previous run's snapshot (which is
+            # older than the marker) would silently vanish on the next restore.
+            STAGE=$(mktemp -d)
+            if [ -f "$ENV_SRC/home.tar.gz" ]; then
+              tar -xzf "$ENV_SRC/home.tar.gz" -C "$STAGE" 2>/dev/null || true
+            fi
+            (
+              cd "$HOME" || exit 0
+              while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                mkdir -p "$STAGE/$(dirname "$f")"
+                cp -a -- "$f" "$STAGE/$f" 2>/dev/null || true
+              done < /tmp/envsnap.list
+            )
+            tar -czf "$ENV_SRC/home.tar.gz" -C "$STAGE" . 2>/dev/null \
               || echo "::warning::environment snapshot failed"
+            rm -rf "$STAGE"
           else
             echo "No new files under \$HOME this run; keeping previous snapshot."
           fi
@@ -367,15 +384,17 @@ jobs:
           fi
           # The clone can fall behind origin, which makes git reject the push as
           # non-fast-forward and silently loses this run's whole snapshot. Always
-          # fetch + rebase first and retry; force push is the last resort because runs
-          # are serialized by the workflow concurrency group (no concurrent writer).
+          # fetch + merge first and retry. `merge -X ours` resolves conflicts (both
+          # sides touch the same state files) in favour of THIS run's snapshot. Force
+          # push is the last resort because runs are serialized by the concurrency
+          # group (no concurrent writer).
           PUSHED=0
           for attempt in 1 2 3; do
             git fetch origin || true
-            if git rebase origin/main; then
+            if git merge origin/main -m "merge remote snapshot" -X ours; then
               if git push origin HEAD; then PUSHED=1; break; fi
             fi
-            git rebase --abort 2>/dev/null || true
+            git merge --abort 2>/dev/null || true
             echo "::warning::snapshot push attempt $attempt failed; retrying"
             sleep 3
           done
