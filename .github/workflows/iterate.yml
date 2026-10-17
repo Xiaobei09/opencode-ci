@@ -75,7 +75,9 @@ jobs:
               exit 0
             fi
           fi
-          EXP=$((NOW + 370 * 60))
+          # Stale-lock expiry just above the job timeout (75m) so a cancelled run
+          # cannot strand the loop for long.
+          EXP=$((NOW + 80 * 60))
           printf '{"expires_at": %s, "acquired_at": %s}\n' "$EXP" "$NOW" > "$LOCK"
           cd "$SESSIONS_DIR"
           git add -A state/lock.json
