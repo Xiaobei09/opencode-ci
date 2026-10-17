@@ -302,35 +302,54 @@ jobs:
               --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin 2>/dev/null \
               | while IFS= read -r f; do sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null; done
           fi
-          # Full-state capture: the environment is REPLACED (not merged) every run, so
-          # files the agent deletes actually disappear from the snapshot. A delta/merge
-          # approach would keep resurrecting deleted files forever. We still skip the
-          # managed bridge dirs, secrets, caches, toolchains and the work/ tree
-          # (targets + the sessions clone, all persisted elsewhere). Because work/ is
-          # excluded, the archive never contains itself (no recursion).
-          (
-            cd "$HOME" || exit 0
-            find . -xdev \( -type f -o -type l \) 2>/dev/null \
-              | grep -vE '^\./(work|\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials|node_modules|\.venv|__pycache__|\.gradle|\.m2)(/|$)' \
-              > /tmp/envsnap.list
-          )
-          # Replace the snapshot outright so deletions propagate; split into volumes so
-          # it can outgrow GitHub's 100MiB per-file cap. `cat` rejoins them into one
-          # gzip stream on restore, so compression is preserved.
+          # Overlay capture. The persisted environment is only what the agent manages;
+          # the runner base image's $HOME is recreated fresh every run and must NOT be
+          # baked into the snapshot (a blanket capture is ~580MB). So we take the
+          # PREVIOUS snapshot and apply this run's changes to it:
+          #   baseline -> previous snapshot, minus anything the agent deleted
+          #   delta    -> files touched this run (add / modify) copied on top
+          # Add / delete / modify all propagate, yet the archive stays small.
+          MARK="$HOME/.opencode/.snapshot-mark"
+          [ -f "$MARK" ] || touch "$MARK"
+          EXCL='^\./(work|\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials|node_modules|\.venv|__pycache__|\.gradle|\.m2)(/|$)'
+          STAGE=$(mktemp -d)
+          # 1. Unpack the previous snapshot as the baseline, unless it is implausibly
+          #    large (i.e. an older blanket capture that baked in the base image); in
+          #    that case start fresh so the bloat is not carried forward.
+          BASELINE_SZ=$(cat "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -c)
+          if [ "$BASELINE_SZ" -gt 419430400 ]; then
+            echo "::warning::previous environment snapshot is ${BASELINE_SZ}B (base-image bloat); rebuilding from this run's deltas only"
+          elif ls "$ENV_SRC"/home.tar.gz.* >/dev/null 2>&1; then
+            cat "$ENV_SRC"/home.tar.gz.* | tar -xzf - -C "$STAGE" 2>/dev/null || true
+          elif [ -f "$ENV_SRC/home.tar.gz" ]; then
+            tar -xzf "$ENV_SRC/home.tar.gz" -C "$STAGE" 2>/dev/null || true
+          fi
+          # 2. Drop baseline entries the agent deleted since the previous snapshot.
+          ( cd "$STAGE" && find . -xdev \( -type f -o -type l \) 2>/dev/null ) | while IFS= read -r p; do
+            [ -e "$HOME/$p" ] || [ -L "$HOME/$p" ] || rm -f "$STAGE/$p"
+          done
+          # 3. Overlay the files this run added or modified.
+          ( cd "$HOME" && find . -xdev -newer "$MARK" \( -type f -o -type l \) 2>/dev/null | grep -vE "$EXCL" ) \
+            | while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                mkdir -p "$STAGE/$(dirname "$p")"
+                cp -a -- "$HOME/$p" "$STAGE/$p" 2>/dev/null || true
+              done
+          # 4. Split the resulting environment into volumes so it can outgrow GitHub's
+          #    100MiB per-file cap; `cat` rejoins them into one gzip stream on restore.
           rm -f "$ENV_SRC"/home.tar.gz "$ENV_SRC"/home.tar.gz.[a-z][a-z]
-          if [ -s /tmp/envsnap.list ]; then
-            tar -czf - -C "$HOME" -T /tmp/envsnap.list 2>/dev/null \
-              | split -b 90m - "$ENV_SRC/home.tar.gz." \
+          if [ -n "$(ls -A "$STAGE" 2>/dev/null)" ]; then
+            tar -czf - -C "$STAGE" . 2>/dev/null | split -b 90m - "$ENV_SRC/home.tar.gz." \
               || echo "::warning::environment snapshot failed"
           else
-            echo "No files under \$HOME to snapshot this run."
+            echo "No environment files to snapshot this run."
           fi
+          rm -rf "$STAGE"
           PARTS=$(ls "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -l)
           if [ "$PARTS" -gt 0 ]; then
             SZ=$(cat "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -c)
-            echo "environment snapshot: $PARTS volumes, $SZ bytes total, $(wc -l < /tmp/envsnap.list 2>/dev/null) entries"
+            echo "environment snapshot: $PARTS volumes, $SZ bytes total"
           fi
-          rm -f /tmp/envsnap.list
 
       - name: Commit and push sessions repository
         if: always() && steps.lock.outputs.acquired == 'true'
