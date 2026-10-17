@@ -145,22 +145,27 @@ jobs:
         run: |
           set -euo pipefail
           ENV_SRC="$SESSIONS_DIR/opencode"
-          if [ ! -d "$ENV_SRC/v2lib" ] || [ ! -d "$ENV_SRC/plugins" ]; then
+          if [ ! -d "$ENV_SRC/config/plugins" ] || [ ! -d "$ENV_SRC/config/v2lib" ]; then
             echo "::warning::bridge environment missing under sessions repository; continuing without it"
             exit 0
           fi
-          mkdir -p "$HOME/.opencode" "$HOME/.config/opencode"
-          rm -rf "$HOME/.opencode/v2lib" "$HOME/.opencode/.v2lib-live" "$HOME/.config/opencode/plugins"
-          ln -s "$ENV_SRC/v2lib" "$HOME/.opencode/v2lib"
-          ln -s "$ENV_SRC/plugins" "$HOME/.config/opencode/plugins"
-          if [ -f "$ENV_SRC/config/tg-bots.json" ]; then
-            sed "s#__HOME__#$HOME#g" "$ENV_SRC/config/tg-bots.json" > "$HOME/.config/opencode/tg-bots.json"
-          fi
-          : > "$HOME/.config/opencode/tg.env"
-          if [ -n "${TG_BOT_TOKEN:-}" ]; then printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.config/opencode/tg.env"; fi
-          if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.config/opencode/tg.env"; fi
-          if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.config/opencode/tg.env"; fi
-          chmod 600 "$HOME/.config/opencode/tg.env"
+          mkdir -p "$ENV_SRC/data"
+          # Link the whole opencode state into the sessions repo so the environment
+          # (sessions DB + bridge state) survives across runs. Individual state-file
+          # symlinks would be clobbered by the plugin's atomic temp+rename writes, so a
+          # directory symlink is required.
+          rm -rf "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.opencode/v2lib" "$HOME/.opencode/.v2lib-live"
+          mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/.opencode"
+          ln -s "$ENV_SRC/config" "$HOME/.config/opencode"
+          ln -s "$ENV_SRC/config/v2lib" "$HOME/.opencode/v2lib"
+          ln -s "$ENV_SRC/data" "$HOME/.local/share/opencode"
+          # Registry (derived, gitignored) pointing envFile at a secret living outside the repo.
+          sed "s#__HOME__#$HOME#g" "$ENV_SRC/templates/tg-bots.json" > "$HOME/.config/opencode/tg-bots.json"
+          : > "$HOME/.opencode/tg.env"
+          if [ -n "${TG_BOT_TOKEN:-}" ]; then printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.opencode/tg.env"; fi
+          if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
+          if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
+          chmod 600 "$HOME/.opencode/tg.env"
 
       - name: Install OpenCode 2 and workferry
         if: steps.lock.outputs.acquired == 'true'
@@ -176,6 +181,7 @@ jobs:
         env:
           SESSIONS_DIR: /home/runner/work/sessions
           TARGETS_DIR: /home/runner/work/targets
+          TG_BRIDGE_FORCE_SERVE: "1"
         run: |
           set +e
           timeout --signal=TERM --kill-after=30s 19200 \
@@ -245,11 +251,21 @@ jobs:
 
       - name: Commit and push sessions repository
         if: always() && steps.lock.outputs.acquired == 'true'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         run: |
           set +e
           cd "$SESSIONS_DIR"
           rm -f state/lock.json
           git add -A
+          # Sanitize: never commit the bot token, even if a session ever echoed it.
+          if [ -n "${TG_BOT_TOKEN:-}" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null
+              git add -- "$f"
+            done < <(git grep --cached -Il -F "$TG_BOT_TOKEN" 2>/dev/null)
+          fi
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else

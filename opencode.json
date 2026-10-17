@@ -5,7 +5,8 @@
       "/home/runner/work/sessions/**": "allow",
       "/home/runner/work/targets/**": "allow",
       "/home/runner/.opencode/**": "allow",
-      "/home/runner/.config/opencode/**": "allow"
+      "/home/runner/.config/opencode/**": "allow",
+      "/home/runner/.opencode/tg.env": "deny"
     },
     "doom_loop": "allow",
     "bash": "allow",
