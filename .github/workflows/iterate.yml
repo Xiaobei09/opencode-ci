@@ -63,26 +63,10 @@ jobs:
       - name: Acquire lock
         id: lock
         run: |
-          set -euo pipefail
-          mkdir -p "$SESSIONS_DIR/state"
-          LOCK="$SESSIONS_DIR/state/lock.json"
-          NOW=$(date -u +%s)
-          if [ -f "$LOCK" ]; then
-            EXP=$(jq -r '.expires_at // 0' "$LOCK")
-            if [ "$EXP" -gt "$NOW" ]; then
-              echo "Lock is held until $EXP (now $NOW). Skipping this run."
-              echo "acquired=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-          # Stale-lock expiry just above the job timeout (75m) so a cancelled run
-          # cannot strand the loop for long.
-          EXP=$((NOW + 80 * 60))
-          printf '{"expires_at": %s, "acquired_at": %s}\n' "$EXP" "$NOW" > "$LOCK"
-          cd "$SESSIONS_DIR"
-          git add -A state/lock.json
-          git commit -m "acquire lock $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
-          git push origin HEAD
+          # Runs are serialized by the workflow-level `concurrency` group, so no
+          # cross-run lock file is needed. The step id/output are kept so downstream
+          # `if:` guards stay simple. A committed lock file used to deadlock the loop
+          # whenever a push failed; removing it removes that whole failure class.
           echo "acquired=true" >> "$GITHUB_OUTPUT"
 
       - name: Prepare target workspace
@@ -337,14 +321,7 @@ jobs:
         run: |
           set +e
           cd "$SESSIONS_DIR"
-          # 1) Release the lock FIRST, as its own small commit. If it shared a commit
-          #    with a large snapshot and that push failed, the lock would stay held and
-          #    every subsequent run would be skipped for hours.
-          rm -f state/lock.json
-          git add -A state/ 2>/dev/null
-          git commit -m "release lock $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1
-          git push origin HEAD || echo "::warning::failed to release lock"
-          # 2) Size guard: never stage a file GitHub will refuse.
+          # Size guard: never stage a file GitHub will refuse.
           if [ -f opencode/home.tar.gz ]; then
             SZ=$(stat -c%s opencode/home.tar.gz 2>/dev/null || echo 0)
             if [ "$SZ" -gt 90000000 ]; then
