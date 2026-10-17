@@ -302,49 +302,28 @@ jobs:
               --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin 2>/dev/null \
               | while IFS= read -r f; do sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null; done
           fi
-          # Capture ONLY what this run created or changed under $HOME (files newer than
-          # the marker taken before the agent started), skipping the managed bridge
-          # dirs, secrets, caches and toolchains. A blanket $HOME archive of a GitHub
-          # runner image is ~900MB and is rejected by GitHub's 100MB file limit, which
-          # would block every push.
-          MARK="$HOME/.opencode/.snapshot-mark"
-          [ -f "$MARK" ] || touch "$MARK"
+          # Full-state capture: the environment is REPLACED (not merged) every run, so
+          # files the agent deletes actually disappear from the snapshot. A delta/merge
+          # approach would keep resurrecting deleted files forever. We still skip the
+          # managed bridge dirs, secrets, caches, toolchains and the work/ tree
+          # (targets + the sessions clone, all persisted elsewhere). Because work/ is
+          # excluded, the archive never contains itself (no recursion).
           (
             cd "$HOME" || exit 0
-            find . -xdev -newer "$MARK" \( -type f -o -type l \) 2>/dev/null \
-              | grep -vE '^\./(\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials|node_modules|\.venv|__pycache__|\.gradle|\.m2)(/|$)' \
+            find . -xdev \( -type f -o -type l \) 2>/dev/null \
+              | grep -vE '^\./(work|\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials|node_modules|\.venv|__pycache__|\.gradle|\.m2)(/|$)' \
               > /tmp/envsnap.list
           )
+          # Replace the snapshot outright so deletions propagate; split into volumes so
+          # it can outgrow GitHub's 100MiB per-file cap. `cat` rejoins them into one
+          # gzip stream on restore, so compression is preserved.
+          rm -f "$ENV_SRC"/home.tar.gz "$ENV_SRC"/home.tar.gz.[a-z][a-z]
           if [ -s /tmp/envsnap.list ]; then
-            # Cumulative: merge this run's new/changed files INTO the previous archive.
-            # A plain `tar -T list` would replace the archive with only this run's
-            # deltas, so everything restored from the previous run's snapshot (which is
-            # older than the marker) would silently vanish on the next restore.
-            STAGE=$(mktemp -d)
-            # Reassemble the previous snapshot from its split volumes first.
-            if ls "$ENV_SRC"/home.tar.gz.* >/dev/null 2>&1; then
-              cat "$ENV_SRC"/home.tar.gz.* | tar -xzf - -C "$STAGE" 2>/dev/null || true
-            elif [ -f "$ENV_SRC/home.tar.gz" ]; then
-              tar -xzf "$ENV_SRC/home.tar.gz" -C "$STAGE" 2>/dev/null || true
-            fi
-            (
-              cd "$HOME" || exit 0
-              while IFS= read -r f; do
-                [ -n "$f" ] || continue
-                mkdir -p "$STAGE/$(dirname "$f")"
-                cp -a -- "$f" "$STAGE/$f" 2>/dev/null || true
-              done < /tmp/envsnap.list
-            )
-            # Split into volumes: GitHub caps each file at 100MiB, so a single archive
-            # would eventually be rejected and the whole snapshot lost. `split` keeps
-            # every piece under the cap; `cat` rejoins them into one gzip stream on
-            # restore, so compression is preserved.
-            rm -f "$ENV_SRC"/home.tar.gz "$ENV_SRC"/home.tar.gz.[a-z][a-z]
-            tar -czf - -C "$STAGE" . 2>/dev/null | split -b 90m - "$ENV_SRC/home.tar.gz." \
+            tar -czf - -C "$HOME" -T /tmp/envsnap.list 2>/dev/null \
+              | split -b 90m - "$ENV_SRC/home.tar.gz." \
               || echo "::warning::environment snapshot failed"
-            rm -rf "$STAGE"
           else
-            echo "No new files under \$HOME this run; keeping previous snapshot."
+            echo "No files under \$HOME to snapshot this run."
           fi
           PARTS=$(ls "$ENV_SRC"/home.tar.gz.* 2>/dev/null | wc -l)
           if [ "$PARTS" -gt 0 ]; then
