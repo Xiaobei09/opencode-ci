@@ -309,7 +309,7 @@ jobs:
           (
             cd "$HOME" || exit 0
             find . -xdev -newer "$MARK" \( -type f -o -type l \) 2>/dev/null \
-              | grep -vE '^\./(\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials)(/|$)' \
+              | grep -vE '^\./(\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials|node_modules|\.venv|__pycache__|\.gradle|\.m2)(/|$)' \
               > /tmp/envsnap.list
           )
           if [ -s /tmp/envsnap.list ]; then
@@ -321,8 +321,9 @@ jobs:
           if [ -f "$ENV_SRC/home.tar.gz" ]; then
             SZ=$(stat -c%s "$ENV_SRC/home.tar.gz" 2>/dev/null || echo 0)
             echo "environment snapshot: $SZ bytes, $(wc -l < /tmp/envsnap.list 2>/dev/null) entries"
-            if [ "$SZ" -gt 90000000 ]; then
-              echo "::warning::environment snapshot exceeds 90MB; discarding to keep the repository pushable"
+            # GitHub's hard limit is 100MiB; keep a small margin under it.
+            if [ "$SZ" -gt 104000000 ]; then
+              echo "::warning::environment snapshot exceeds 99.2MiB; discarding to keep the repository pushable"
               rm -f "$ENV_SRC/home.tar.gz"
             fi
           fi
@@ -345,8 +346,8 @@ jobs:
           # Size guard: never stage a file GitHub will refuse.
           if [ -f opencode/home.tar.gz ]; then
             SZ=$(stat -c%s opencode/home.tar.gz 2>/dev/null || echo 0)
-            if [ "$SZ" -gt 90000000 ]; then
-              echo "::warning::opencode/home.tar.gz is ${SZ}B; exceeding 90MB, discarding so the push succeeds"
+            if [ "$SZ" -gt 104000000 ]; then
+              echo "::warning::opencode/home.tar.gz is ${SZ}B; exceeding 99.2MiB, discarding so the push succeeds"
               rm -f opencode/home.tar.gz
             fi
           fi
@@ -364,7 +365,27 @@ jobs:
           else
             git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           fi
-          git push origin HEAD || echo "::warning::failed to push sessions repository"
+          # The clone can fall behind origin, which makes git reject the push as
+          # non-fast-forward and silently loses this run's whole snapshot. Always
+          # fetch + rebase first and retry; force push is the last resort because runs
+          # are serialized by the workflow concurrency group (no concurrent writer).
+          PUSHED=0
+          for attempt in 1 2 3; do
+            git fetch origin || true
+            if git rebase origin/main; then
+              if git push origin HEAD; then PUSHED=1; break; fi
+            fi
+            git rebase --abort 2>/dev/null || true
+            echo "::warning::snapshot push attempt $attempt failed; retrying"
+            sleep 3
+          done
+          if [ "$PUSHED" != "1" ]; then
+            if git push --force origin HEAD; then
+              echo "snapshot pushed (force)"
+            else
+              echo "::warning::failed to push sessions repository"
+            fi
+          fi
 
       - name: Relay next run
         if: always() && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outcome == 'success'
