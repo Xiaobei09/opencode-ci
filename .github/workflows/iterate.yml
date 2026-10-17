@@ -198,34 +198,35 @@ jobs:
         run: |
           set +e
           RUN_LOG="$RUNNER_TEMP/opencode-run.log"
-          # Cold-start resume: continue the exact session the bridge is bound to, so no
-          # new session is created and the operator's conversation keeps its context.
-          # Only `opencode run` loads the plugins (serve/service/acp do not) and it
-          # insists on a message, so we pass a minimal continuation seed ("继续") that
-          # does not introduce a new task. Everything else comes from the bridge, which
-          # injects operator Telegram messages into that same session.
+          # Cold-start resume. `opencode run` is one-shot: it loads the plugins, sends
+          # one message and exits, so the tg-bridge is only alive for that one turn and
+          # most operator messages get no reply. Instead we open the exact session the
+          # bridge is bound to in the long-lived interactive mode, whose server loads
+          # the plugins and stays up for the whole budget. No prompt is injected and no
+          # new session is created; the bridge feeds operator Telegram messages into
+          # this same session and pushes the replies.
           SID=""
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
           fi
           if [ -n "$SID" ]; then
-            RESUME=(--standalone --session "$SID")
+            ARGS=(--standalone --session "$SID")
             echo "resuming bound session $SID"
           else
-            RESUME=(--standalone --continue)
+            ARGS=(--standalone --continue)
             echo "no bound session found; continuing the last session"
           fi
-          timeout --signal=TERM --kill-after=30s 2700 \
-            opencode run "${RESUME[@]}" "继续" >"$RUN_LOG" 2>&1
+          TERM=xterm-256color timeout --signal=TERM --kill-after=30s 2700 \
+            opencode "${ARGS[@]}" </dev/null >"$RUN_LOG" 2>&1
           RC=$?
           # Session content must never reach the CI log, so only a non-content summary.
-          echo "opencode run exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
+          echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
           if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
-            echo "opencode run hit the time budget; treated as success so the loop continues."
+            echo "opencode hit the time budget; treated as success so the loop continues."
             exit 0
           fi
           if [ "$RC" -ne 0 ]; then
-            echo "opencode run failed with exit=$RC; this run will not relay."
+            echo "opencode exited with $RC; this run will not relay."
           fi
           exit "$RC"
 
