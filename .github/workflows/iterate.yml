@@ -28,7 +28,7 @@ env:
 jobs:
   iterate:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 75
     steps:
       - name: Check out ci-repo
         uses: actions/checkout@v6
@@ -213,7 +213,7 @@ jobs:
             RESUME=(--standalone --continue)
             echo "no bound session found; continuing the last session"
           fi
-          timeout --signal=TERM --kill-after=30s 19200 \
+          timeout --signal=TERM --kill-after=30s 2700 \
             opencode run "${RESUME[@]}" "继续" >"$RUN_LOG" 2>&1
           RC=$?
           # Session content must never reach the CI log, so only a non-content summary.
