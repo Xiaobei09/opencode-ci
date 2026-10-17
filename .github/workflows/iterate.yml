@@ -136,7 +136,7 @@ jobs:
             )
           done
 
-      - name: Install bridge environment from sessions repository
+      - name: Restore environment and install bridge from sessions repository
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -145,6 +145,15 @@ jobs:
         run: |
           set -euo pipefail
           ENV_SRC="$SESSIONS_DIR/opencode"
+          mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/.opencode"
+          # Restore the catch-all environment snapshot first, so files the agent
+          # left anywhere under $HOME survive across runs.  The managed dirs below
+          # are excluded from the snapshot and re-created here, so this never
+          # clobbers the live bridge state / sessions DB.
+          if [ -f "$ENV_SRC/home.tar.gz" ]; then
+            tar -xzf "$ENV_SRC/home.tar.gz" -C "$HOME" 2>/dev/null \
+              || echo "::warning::failed to restore environment snapshot"
+          fi
           if [ ! -d "$ENV_SRC/config/plugins" ] || [ ! -d "$ENV_SRC/config/v2lib" ]; then
             echo "::warning::bridge environment missing under sessions repository; continuing without it"
             exit 0
@@ -155,7 +164,6 @@ jobs:
           # symlinks would be clobbered by the plugin's atomic temp+rename writes, so a
           # directory symlink is required.
           rm -rf "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.opencode/v2lib" "$HOME/.opencode/.v2lib-live"
-          mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/.opencode"
           ln -s "$ENV_SRC/config" "$HOME/.config/opencode"
           ln -s "$ENV_SRC/config/v2lib" "$HOME/.opencode/v2lib"
           ln -s "$ENV_SRC/data" "$HOME/.local/share/opencode"
@@ -248,6 +256,41 @@ jobs:
             tmp=$(mktemp)
             jq --argjson e "$ENTRY" '.snapshots += [$e]' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
           done
+
+      - name: Snapshot environment to sessions repository
+        if: always() && steps.lock.outputs.acquired == 'true'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          set +e
+          ENV_SRC="$SESSIONS_DIR/opencode"
+          mkdir -p "$ENV_SRC"
+          # Best-effort scrub of the bot token from plaintext files under $HOME.
+          if [ -n "${TG_BOT_TOKEN:-}" ]; then
+            grep -rlI -F "$TG_BOT_TOKEN" "$HOME" \
+              --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin 2>/dev/null \
+              | while IFS= read -r f; do sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null; done
+          fi
+          # Catch-all snapshot of everything under $HOME except the dirs managed via
+          # symlink, secrets, caches and the opencode binary (reinstalled each run).
+          # This preserves files the agent leaves in unexpected places.  The managed
+          # dirs are excluded so we never recurse into (or duplicate) the sessions repo.
+          tar -czf "$ENV_SRC/home.tar.gz" \
+            --exclude='./.config/opencode' \
+            --exclude='./.local/share/opencode' \
+            --exclude='./.opencode/v2lib' \
+            --exclude='./.opencode/bin' \
+            --exclude='./.opencode/tg.env' \
+            --exclude='./.cache' \
+            --exclude='./.npm' \
+            --exclude='./.bun' \
+            --exclude='./.config/gh' \
+            --exclude='./.ssh' \
+            --exclude='./.gitconfig' \
+            --exclude='./.git-credentials' \
+            -C "$HOME" . 2>/dev/null \
+            || echo "::warning::environment snapshot failed"
+          ls -la "$ENV_SRC/home.tar.gz" 2>/dev/null
 
       - name: Commit and push sessions repository
         if: always() && steps.lock.outputs.acquired == 'true'
