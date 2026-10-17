@@ -370,34 +370,26 @@ jobs:
               git add -- "$f"
             done < <(git grep --cached -Il -F "$TG_BOT_TOKEN" 2>/dev/null)
           fi
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          fi
-          # The clone can fall behind origin, which makes git reject the push as
-          # non-fast-forward and silently loses this run's whole snapshot. Always
-          # fetch + merge first and retry. `merge -X ours` resolves conflicts (both
-          # sides touch the same state files) in favour of THIS run's snapshot. Force
-          # push is the last resort because runs are serialized by the concurrency
-          # group (no concurrent writer).
-          PUSHED=0
-          for attempt in 1 2 3; do
-            git fetch origin || true
-            if git merge origin/main -m "merge remote snapshot" -X ours; then
-              if git push origin HEAD; then PUSHED=1; break; fi
+          # Collapse to a SINGLE commit holding the current environment, then force
+          # push. Keeping exactly one (latest) commit is what stops the repository from
+          # growing forever with one full environment snapshot per run; the previous
+          # commit becomes unreachable and GitHub garbage-collects its objects.
+          git checkout --orphan snapshot-reset >/dev/null 2>&1
+          git add -A
+          git -c user.name="opencode-ci" -c user.email="opencode-ci@users.noreply.github.com" \
+            commit -q -m "environment $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            || echo "::warning::nothing to commit"
+          git branch -M snapshot-reset main
+          # Runs are serialized by the workflow concurrency group, so there is never a
+          # concurrent writer; force push therefore only ever discards stale history.
+          for attempt in 1 2 3 4 5; do
+            if git push --force origin main; then
+              echo "snapshot pushed (single commit)"
+              break
             fi
-            git merge --abort 2>/dev/null || true
             echo "::warning::snapshot push attempt $attempt failed; retrying"
-            sleep 3
+            sleep 4
           done
-          if [ "$PUSHED" != "1" ]; then
-            if git push --force origin HEAD; then
-              echo "snapshot pushed (force)"
-            else
-              echo "::warning::failed to push sessions repository"
-            fi
-          fi
 
       - name: Relay next run
         if: always() && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outcome == 'success'
