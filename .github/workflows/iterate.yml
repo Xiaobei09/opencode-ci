@@ -174,6 +174,9 @@ jobs:
           if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
           if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
           chmod 600 "$HOME/.opencode/tg.env"
+          # Marker for the catch-all snapshot: only files newer than this were created
+          # or changed by this run, so the snapshot stays small and bounded.
+          touch "$HOME/.opencode/.snapshot-mark"
 
       - name: Install OpenCode 2 and workferry
         if: steps.lock.outputs.acquired == 'true'
@@ -271,26 +274,34 @@ jobs:
               --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin 2>/dev/null \
               | while IFS= read -r f; do sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null; done
           fi
-          # Catch-all snapshot of everything under $HOME except the dirs managed via
-          # symlink, secrets, caches and the opencode binary (reinstalled each run).
-          # This preserves files the agent leaves in unexpected places.  The managed
-          # dirs are excluded so we never recurse into (or duplicate) the sessions repo.
-          tar -czf "$ENV_SRC/home.tar.gz" \
-            --exclude='./.config/opencode' \
-            --exclude='./.local/share/opencode' \
-            --exclude='./.opencode/v2lib' \
-            --exclude='./.opencode/bin' \
-            --exclude='./.opencode/tg.env' \
-            --exclude='./.cache' \
-            --exclude='./.npm' \
-            --exclude='./.bun' \
-            --exclude='./.config/gh' \
-            --exclude='./.ssh' \
-            --exclude='./.gitconfig' \
-            --exclude='./.git-credentials' \
-            -C "$HOME" . 2>/dev/null \
-            || echo "::warning::environment snapshot failed"
-          ls -la "$ENV_SRC/home.tar.gz" 2>/dev/null
+          # Capture ONLY what this run created or changed under $HOME (files newer than
+          # the marker taken before the agent started), skipping the managed bridge
+          # dirs, secrets, caches and toolchains. A blanket $HOME archive of a GitHub
+          # runner image is ~900MB and is rejected by GitHub's 100MB file limit, which
+          # would block every push.
+          MARK="$HOME/.opencode/.snapshot-mark"
+          [ -f "$MARK" ] || touch "$MARK"
+          (
+            cd "$HOME" || exit 0
+            find . -xdev -newer "$MARK" \( -type f -o -type l \) 2>/dev/null \
+              | grep -vE '^\./(\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials)(/|$)' \
+              > /tmp/envsnap.list
+          )
+          if [ -s /tmp/envsnap.list ]; then
+            ( cd "$HOME" && tar -czf "$ENV_SRC/home.tar.gz" -T /tmp/envsnap.list ) 2>/dev/null \
+              || echo "::warning::environment snapshot failed"
+          else
+            echo "No new files under \$HOME this run; keeping previous snapshot."
+          fi
+          if [ -f "$ENV_SRC/home.tar.gz" ]; then
+            SZ=$(stat -c%s "$ENV_SRC/home.tar.gz" 2>/dev/null || echo 0)
+            echo "environment snapshot: $SZ bytes, $(wc -l < /tmp/envsnap.list 2>/dev/null) entries"
+            if [ "$SZ" -gt 90000000 ]; then
+              echo "::warning::environment snapshot exceeds 90MB; discarding to keep the repository pushable"
+              rm -f "$ENV_SRC/home.tar.gz"
+            fi
+          fi
+          rm -f /tmp/envsnap.list
 
       - name: Commit and push sessions repository
         if: always() && steps.lock.outputs.acquired == 'true'
@@ -299,7 +310,21 @@ jobs:
         run: |
           set +e
           cd "$SESSIONS_DIR"
+          # 1) Release the lock FIRST, as its own small commit. If it shared a commit
+          #    with a large snapshot and that push failed, the lock would stay held and
+          #    every subsequent run would be skipped for hours.
           rm -f state/lock.json
+          git add -A state/ 2>/dev/null
+          git commit -m "release lock $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1
+          git push origin HEAD || echo "::warning::failed to release lock"
+          # 2) Size guard: never stage a file GitHub will refuse.
+          if [ -f opencode/home.tar.gz ]; then
+            SZ=$(stat -c%s opencode/home.tar.gz 2>/dev/null || echo 0)
+            if [ "$SZ" -gt 90000000 ]; then
+              echo "::warning::opencode/home.tar.gz is ${SZ}B; exceeding 90MB, discarding so the push succeeds"
+              rm -f opencode/home.tar.gz
+            fi
+          fi
           git add -A
           # Sanitize: never commit the bot token, even if a session ever echoed it.
           if [ -n "${TG_BOT_TOKEN:-}" ]; then
