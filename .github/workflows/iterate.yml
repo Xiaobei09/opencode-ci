@@ -786,6 +786,11 @@ jobs:
           rm -rf opencode/data
           mkdir -p opencode/data
           touch opencode/data/.gitkeep
+          # 循环记录同样是**运行态**：它活在 env release 的工作树里，绝不进"出厂基线"。
+          # 否则 reset 出来的"干净、开箱即用"环境会带着历史轮次记录（运营者 2026-10-18 指出）。
+          # 注：assets 快照已排除 ./work（见 --exclude='./work'），因此记录**不**会进 env 包；
+          # 若运营者要求"仓库树也永远干净"，需再把记录迁到 $HOME 内被快照的路径（待决策）。
+          rm -rf sessions state tasks workspace-snapshots loop-state.md
           rm -f opencode/config/tg-chats.json opencode/config/tg-chats-bot*.json \
                 opencode/config/loop-ctl.json opencode/config/loop-marker.json \
                 opencode/config/tg-bots.json opencode/config/loop-guard.json \
@@ -796,6 +801,12 @@ jobs:
             echo '# Runtime state lives in the env release, not in git.'
             echo 'opencode/data/*'
             echo '!opencode/data/.gitkeep'
+            # 循环记录（轮次笔记 / 状态 / 任务 / 快照索引）也不是基线的一部分
+            echo 'sessions/'
+            echo 'state/'
+            echo 'tasks/'
+            echo 'workspace-snapshots/'
+            echo 'loop-state.md'
             echo 'opencode/config/tg-chats*.json'
             echo 'opencode/config/tg-bots.json'
             echo 'opencode/config/loop-ctl.json'
