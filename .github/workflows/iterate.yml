@@ -443,14 +443,22 @@ jobs:
         run: |
           set +e
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
+          relayed=0
           for attempt in 1 2 3; do
             if gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"; then
               echo "relayed next run on attempt $attempt"
+              relayed=1
               break
             fi
             echo "::warning::relay attempt $attempt failed; retrying"
             sleep 5
           done
+          # ROUND 51：三次都失败时**原先静默成功** ⇒ 无后继、无告警，循环只能等 6h cron，
+          # 运营者观感又是「循环停了」。改为显式失败（红 run/通知），快照步仍因 always() 照常执行。
+          if [ "$relayed" != "1" ]; then
+            echo "::error::relay failed after 3 attempts; no successor queued (falls back to the 6h cron)."
+            exit 1
+          fi
 
       - name: Save workspace snapshots
         # ROUND 46（防数据丢失）：只有 workspace 还原步**成功**才允许快照；若本轮在还原期间被取消
