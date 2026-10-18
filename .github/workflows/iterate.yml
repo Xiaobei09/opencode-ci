@@ -195,9 +195,15 @@ jobs:
             [ -f "$HOME/.config/opencode/$j" ] || cp -a "$ENV_SRC/config/$j" "$HOME/.config/opencode/" 2>/dev/null || true
           done
           # Plugin libraries also resolve under ~/.opencode/v2lib.
+          # ROUND 19：**目标目录必然已存在**（由 env release 还原），此时裸 `cp -a src dst`
+          # 会把源目录**嵌套**进目标（→ ~/.opencode/v2lib/v2lib），而插件真正加载的
+          # ~/.opencode/v2lib/*.ts 保持旧内容 → **仓库代码改动在每次重启后都不生效**
+          # （与"repo 对桥代码权威"的注释相反，实测 mtime 停在旧的 env 还原时间）。
+          # 改为复制**目录内容**，并清掉历史嵌套产物。
           mkdir -p "$HOME/.opencode"
           if [ -d "$ENV_SRC/config/v2lib" ]; then
-            cp -a "$ENV_SRC/config/v2lib" "$HOME/.opencode/v2lib" 2>/dev/null || true
+            cp -a "$ENV_SRC/config/v2lib/." "$HOME/.opencode/v2lib/" 2>/dev/null || true
+            rm -rf "$HOME/.opencode/v2lib/v2lib" 2>/dev/null || true
           fi
 
           if [ ! -d "$HOME/.config/opencode/plugins" ]; then
