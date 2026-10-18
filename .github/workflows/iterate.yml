@@ -331,13 +331,26 @@ jobs:
           # the plugins and stays up for the whole budget. No prompt is injected and no
           # new session is created; the bridge feeds operator Telegram messages into
           # this same session and pushes the replies.
+          # ROUND 42（重启自动恢复的加固，运营者第 3 项要求）：pin 来自**随包还原**的
+          # tg-chats.json.front，但"文件在"不等于"会话在" —— 若会话 DB 缺失/被换成旧代，
+          # `--session <sid>` 会开一个**空的**新会话，看起来"恢复了"其实上下文全丢。
+          # 故先查 DB 里是否真有该会话：确认为 "no" 才退回 `--continue`（恢复最近一次会话）；
+          # DB 读不出（err/n-a）时**保持 pin**（pin 是已验证路径，不因探针抖动而改写）。
+          # 诊断只打计数/是否，绝不打会话内容。
           SID=""
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
           fi
-          if [ -n "$SID" ]; then
+          SID_PRESENT="n/a"
+          if [ -n "$SID" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
+            SID_PRESENT=$(python3 -c 'import sqlite3,sys,os;c=sqlite3.connect("file:"+os.path.expanduser("~/.local/share/opencode/opencode.db")+"?mode=ro",uri=True);print("yes" if c.execute("select 1 from session_v2 where id=?",(sys.argv[1],)).fetchone() else "no")' "$SID" 2>/dev/null || echo "err")
+          fi
+          if [ -n "$SID" ] && [ "$SID_PRESENT" != "no" ]; then
             ARGS=(--standalone --session "$SID")
-            echo "resuming bound session $SID"
+            echo "resuming bound session present_in_db=$SID_PRESENT"
+          elif [ -n "$SID" ]; then
+            ARGS=(--standalone --continue)
+            echo "bound session absent from the restored db ($SID_PRESENT); falling back to --continue"
           else
             ARGS=(--standalone --continue)
             echo "no bound session found; continuing the last session"
@@ -362,6 +375,28 @@ jobs:
             echo "opencode exited with $RC; this run will not relay."
           fi
           exit "$RC"
+
+      - name: Relay next run
+        # ROUND 42（取消也要接力，运营者第 2 项要求）：运营者要用**一系列取消**验证无缝，
+        # 而原先 `outcome == 'success'` 使取消的 run 不接力 ⇒ 没有后继 run，循环只能等
+        # 6 小时 cron。实证：run 39090552818 的第 11/12 步（两个 always() 快照步）都
+        # completed/success，唯独第 14 步 Relay 被 skipped。故：success **或 cancelled**
+        # 都接力；failure 仍不接力（避免失败快循环）。
+        # 位置也前移到快照步**之前**：接力只是 `gh workflow run` 排队（concurrency
+        # cancel-in-progress:false ⇒ 后继必然等本轮结束），所以即使随后的快照步被取消
+        # 信号打断，后继也已经排上——无缝性不再依赖"重活能不能跑完"。带 3 次重试。
+        if: always() && steps.lock.outputs.acquired == 'true' && (steps.run_opencode.outcome == 'success' || steps.run_opencode.outcome == 'cancelled')
+        run: |
+          set +e
+          echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
+          for attempt in 1 2 3; do
+            if gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"; then
+              echo "relayed next run on attempt $attempt"
+              break
+            fi
+            echo "::warning::relay attempt $attempt failed; retrying"
+            sleep 5
+          done
 
       - name: Save workspace snapshots
         if: always() && steps.lock.outputs.acquired == 'true'
@@ -524,35 +559,68 @@ jobs:
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
               || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
                    --notes "Whole-\$HOME environment + target workspace packages; replaced every run." >/dev/null 2>&1
-            # Delete every previous volume AND the previous manifest (old 'home.*' and new
-            # names) so only the latest generation survives.
-            gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-              | grep -E '^(env|home|targets)\.tar\.gz(\.|$)|^meta\.json$' \
-              | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
-            if gh release upload "$ENV_TAG" "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-              # ROUND 35：manifest（体积/页数/sha256）。只在**页上传成功之后**才写并上传 ⇒
-              # 它的存在即代表页是完整的；读侧据它检测"下载不全"并拒绝半套应用。它缺失时读侧
-              # 退回旧的无校验直解（降级读），所以旧包/漏传都不会把流程堵死。
-              jq -n --arg tag "$ENV_TAG" --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
-                    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
-                    --argjson env_bytes "${SZ:-0}" --argjson targets_bytes "${TZ:-0}" \
-                    --argjson env_volumes "${ENV_N:-0}" --argjson targets_volumes "${TGT_N:-0}" \
-                    --arg env_sha "$ENV_SHA" --arg targets_sha "$TGT_SHA" \
-                    '{version:2, tag:$tag, run_id:$run, commit:$commit, created_at:$at, split_size:$split,
-                      env:{volumes:$env_volumes, bytes:$env_bytes, sha256:$env_sha},
-                      targets:{volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha}}' \
-                    > "$OUT/meta.json" 2>/dev/null
-              if [ -s "$OUT/meta.json" ]; then
-                gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
-                  || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
-              else
-                echo "::warning::failed to build meta.json (readers will fall back to unverified extract)"
-              fi
-              echo "environment package uploaded: $ENV_N volume(s), $SZ bytes"
-              echo "target workspace package uploaded: $TGT_N volume(s), $TZ bytes"
-              echo "package manifest: split=$SPLIT_SIZE env=$ENV_N vol targets=$TGT_N vol"
+            # ROUND 42（取消安全换装，关键）：旧序是「先删光旧卷、再上传」——取消若切在中间，
+            # release 会**没有包或只剩残包**，下一轮就还原不出环境。运营者现在会**故意**做
+            # 一系列取消来验证无缝，故改成与 `env-backup.sh swap` 同款的原子序：
+            #   ① 先建好 manifest（本地）
+            #   ② 新代以 STAGE 名上传（读侧 glob `env.tar.gz*` 与删除正则都不匹配 stage-*）
+            #   ③ 远程逐个比对 STAGE 尺寸
+            #   ④ 删旧代  ⑤ 真名上传（manifest 最后）  ⑥ 远程校验真名  ⑦ 删 STAGE 副本
+            # 任何中断都退化成「上一代完整包仍在」，永不出现混杂/空缺。
+            jq -n --arg tag "$ENV_TAG" --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
+                  --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
+                  --argjson env_bytes "${SZ:-0}" --argjson targets_bytes "${TZ:-0}" \
+                  --argjson env_volumes "${ENV_N:-0}" --argjson targets_volumes "${TGT_N:-0}" \
+                  --arg env_sha "$ENV_SHA" --arg targets_sha "$TGT_SHA" \
+                  '{version:2, tag:$tag, run_id:$run, commit:$commit, created_at:$at, split_size:$split,
+                    env:{volumes:$env_volumes, bytes:$env_bytes, sha256:$env_sha},
+                    targets:{volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha}}' \
+                  > "$OUT/meta.json" 2>/dev/null
+            mkdir -p "$OUT/stage"
+            for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT/meta.json"; do
+              [ -f "$f" ] || continue
+              cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
+            done
+            stage_ok=0
+            if gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+              stage_ok=1
+              for f in "$OUT"/stage/stage-*; do
+                n=$(basename "$f"); l=$(stat -c%s "$f")
+                r=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq ".assets[] | select(.name==\"$n\") | .size")
+                if [ "$l" = "$r" ]; then
+                  echo "staged ok $n = $l bytes"
+                else
+                  stage_ok=0
+                  echo "::warning::staged size mismatch $n ($l vs $r)"
+                fi
+              done
             else
-              echo "::warning::failed to upload packages to release"
+              echo "::warning::staged upload failed; the previous package is left untouched"
+            fi
+            if [ "$stage_ok" -eq 1 ]; then
+              # 旧代删除（正则与读侧 glob 都不匹配 stage-*，故暂存副本安全）
+              gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
+                | grep -E '^(env|home|targets)\.tar\.gz(\.|$)|^meta\.json$' \
+                | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
+              if gh release upload "$ENV_TAG" "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+                # ROUND 35：manifest 最后上传 ⇒ 它的存在即代表页是完整的；读侧据它检测
+                # "下载不全"并拒绝半套应用；缺失时读侧退回无校验直解（降级读）。
+                if [ -s "$OUT/meta.json" ]; then
+                  gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
+                    || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
+                else
+                  echo "::warning::failed to build meta.json (readers will fall back to unverified extract)"
+                fi
+                echo "environment package uploaded: $ENV_N volume(s), $SZ bytes"
+                echo "target workspace package uploaded: $TGT_N volume(s), $TZ bytes"
+                echo "package manifest: split=$SPLIT_SIZE env=$ENV_N vol targets=$TGT_N vol"
+              else
+                echo "::warning::failed to upload packages to release"
+              fi
+              for f in "$OUT"/stage/stage-*; do
+                gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
+                  && echo "staged copy removed: $(basename "$f")"
+              done
             fi
           else
             echo "::warning::environment package is empty"
@@ -611,15 +679,3 @@ jobs:
             echo "::warning::baseline tag push attempt $attempt failed; retrying"
             sleep 4
           done
-
-      - name: Relay next run
-        if: always() && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outcome == 'success'
-        run: |
-          set +e
-          # No checkpoint gate: every run hands off to the next one unconditionally.
-          # Continuity comes from the persisted environment (the whole-$HOME package and
-          # the target workspace bundles in the `env` release). Because opencode resumes
-          # from where it was interrupted, a forced timeout at the end of a run is
-          # seamless on the next run.
-          echo "Relaying next run unconditionally."
-          gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"
