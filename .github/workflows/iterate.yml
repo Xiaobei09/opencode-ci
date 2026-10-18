@@ -178,10 +178,15 @@ jobs:
           # after an aborted/cancelled run it is OLDER than the fresh clone of the sessions repo.
           # Extracting it above would then downgrade the *tracked* knowledge dirs in the working
           # tree (state/ tasks/ sessions/), and the next agent could re-commit that as a revert.
-          # Git is authoritative for these dirs, so re-assert them from the clone's index here.
           # `workspace-snapshots/` is deliberately left as the package provided it: its index.json
           # and the target bundles are runtime artifacts that must stay mutually consistent.
-          if [ -d "$SESSIONS_DIR/.git" ]; then
+          #
+          # ROUND 77: records are no longer tracked in the sessions repo (the operator's model:
+          # the release targets package is the authority for records, the repo tree is a clean
+          # reset baseline). Only re-assert from git while those dirs are actually tracked;
+          # otherwise the package content must stay in place and there is nothing to warn about.
+          if [ -d "$SESSIONS_DIR/.git" ] \
+             && git -C "$SESSIONS_DIR" ls-files --error-unmatch state >/dev/null 2>&1; then
             git -C "$SESSIONS_DIR" checkout -- state tasks sessions 2>/dev/null \
               || echo "::warning::could not re-assert tracked knowledge dirs (state/tasks/sessions) from git"
           fi
