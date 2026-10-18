@@ -709,7 +709,10 @@ jobs:
             || echo "::warning::environment package failed"
           # Package the repo's runtime dirs (target workspace bundles etc.) as a whole tar
           # too, so the repository itself can stay a clean baseline.
-          ( cd "$SESSIONS_DIR" && tar -czf - workspace-snapshots state tasks sessions 2>/dev/null ) \
+          # ROUND 69: include loop-state.md — it is the canonical round history and lives
+          # at the repo root (env excludes ./work, targets packed only the 4 dirs), so it
+          # was the one record NOT backed up in the release. A repo reset would lose it.
+          ( cd "$SESSIONS_DIR" && tar -czf - workspace-snapshots state tasks sessions loop-state.md 2>/dev/null ) \
             | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
             || echo "::warning::target workspace package failed"
           SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
