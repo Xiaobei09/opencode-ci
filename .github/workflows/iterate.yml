@@ -367,6 +367,19 @@ jobs:
             python3 -c 'import sqlite3;c=sqlite3.connect("'"$HOME"'/.local/share/opencode/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
               && echo "sqlite WAL checkpointed" || echo "::warning::sqlite WAL checkpoint skipped"
           fi
+          # Binary DB redaction (ROUND 14 / D3). The text scrub above uses `grep -I`, so it
+          # SKIPS the binary sqlite session DB - which therefore carried bot tokens straight
+          # into every env package (measured: 62 hits, two distinct tokens). The DB cannot
+          # be sed-edited, but a telegram token is ASCII and lives only inside string
+          # values, so a LENGTH-PRESERVING byte replacement is safe for sqlite: page
+          # offsets never move (verified on a copy: PRAGMA integrity_check=ok, all rows
+          # intact). Runs AFTER the WAL checkpoint so the main file holds every page, and
+          # before the tar; temp+rename makes an interrupted run non-destructive.
+          for dbf in "$HOME/.local/share/opencode/opencode.db" "$HOME/.local/share/opencode/opencode.db-wal"; do
+            [ -f "$dbf" ] || continue
+            python3 -c 'import os,re,sys;p=sys.argv[1];pat=re.compile(rb"[0-9]{6,12}:[A-Za-z0-9_-]{30,}");b=open(p,"rb").read();nb=pat.sub(lambda m:b"X"*len(m.group(0)),b);m=os.stat(p).st_mode&0o777;t=p+".redact";open(t,"wb").write(nb);os.chmod(t,m);os.replace(t,p)' "$dbf" \
+              && echo "db token-redacted: $(basename "$dbf")" || echo "::warning::db redaction skipped: $(basename "$dbf")"
+          done
           OUT=/tmp/envsnap
           rm -rf "$OUT" && mkdir -p "$OUT"
           tar -czf - -C "$HOME" \
