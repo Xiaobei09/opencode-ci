@@ -345,6 +345,15 @@ jobs:
               --exclude-dir=work --exclude-dir=.git 2>/dev/null \
               | while IFS= read -r f; do sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null; done
           fi
+          # Value-independent scrub (ROUND 10 / D3): telegram bot tokens have a fixed
+          # shape (<6-12 digits>:<30+ base64url chars>). This also covers the per-bot
+          # tokens (tg-bot3 / tg-bot4) which are NOT present as CI secrets, so the
+          # value-only scrub above silently misses them. Text files only (-I skips the
+          # binary sqlite session db, which is excluded from the package separately).
+          grep -rlIE '[0-9]{6,12}:[A-Za-z0-9_-]{30,}' "$HOME" \
+            --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin \
+            --exclude-dir=work --exclude-dir=.git 2>/dev/null \
+            | while IFS= read -r f; do sed -i -E 's/[0-9]{6,12}:[A-Za-z0-9_-]{30,}/REDACTED/g' "$f" 2>/dev/null; done
           # Whole-package capture: tar the ENTIRE $HOME in one go - a complete snapshot,
           # not a delta/overlay. This is what guarantees completeness: the agent may drop
           # files anywhere, and files it copies or moves keep their old timestamps, so a
@@ -365,6 +374,8 @@ jobs:
             --exclude='./.cache' \
             --exclude='./.opencode/bin' \
             --exclude='./.opencode/tg.env' \
+            --exclude='./.config/opencode/tg.env' \
+            --exclude='./.config/opencode/tg-bot*.env' \
             --exclude='./.ssh' \
             --exclude='./.config/gh' \
             --exclude='./.gitconfig' \
@@ -427,6 +438,8 @@ jobs:
             echo 'opencode/config/tg-bots.json'
             echo 'opencode/config/loop-ctl.json'
             echo 'opencode/config/loop-marker.json'
+            echo 'opencode/config/halt-release.json*'
+            echo 'opencode/config/botname-*.json*'
             echo 'opencode/home.tar.gz*'
           } > .gitignore
           git add -A
