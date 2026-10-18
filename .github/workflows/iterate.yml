@@ -91,6 +91,7 @@ jobs:
           mkdir -p "$TARGETS_DIR"
 
       - name: Restore workspace snapshots
+        id: restore_ws
         if: steps.lock.outputs.acquired == 'true'
         run: |
           set +e
@@ -191,6 +192,7 @@ jobs:
           done
 
       - name: Restore environment and install bridge from sessions repository
+        id: restore_env
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -423,7 +425,11 @@ jobs:
         # 位置也前移到快照步**之前**：接力只是 `gh workflow run` 排队（concurrency
         # cancel-in-progress:false ⇒ 后继必然等本轮结束），所以即使随后的快照步被取消
         # 信号打断，后继也已经排上——无缝性不再依赖"重活能不能跑完"。带 3 次重试。
-        if: always() && steps.lock.outputs.acquired == 'true' && (steps.run_opencode.outcome == 'success' || steps.run_opencode.outcome == 'cancelled')
+        # ROUND 46：条件由 `steps.run_opencode.outcome == 'cancelled'` 改为 run 级 `cancelled()`。
+        # 旧写法只在「取消发生在 Run OpenCode 步」时接力；若运营者在**还原/安装期间**就取消
+        # （此时 run_opencode 是 skipped、不是 cancelled）⇒ 不接力 ⇒ 只能等 6 小时 cron，
+        # 运营者观感＝「循环没启动」。用 `cancelled()` 覆盖任意时刻的取消（lock 已获得即可）。
+        if: always() && steps.lock.outputs.acquired == 'true' && (steps.run_opencode.outcome == 'success' || cancelled())
         run: |
           set +e
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
@@ -437,7 +443,10 @@ jobs:
           done
 
       - name: Save workspace snapshots
-        if: always() && steps.lock.outputs.acquired == 'true'
+        # ROUND 46（防数据丢失）：只有 workspace 还原步**成功**才允许快照；若本轮在还原期间被取消
+        # （outcome=cancelled）或根本没跑到（skipped），$HOME/targets 是半套/空壳，快照它会把
+        # 「半套世界」固化进 release。跳过 ⇒ 保留上一代完好包。
+        if: always() && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         run: |
           set +e
           SNAP="$SESSIONS_DIR/workspace-snapshots"
@@ -494,7 +503,9 @@ jobs:
           done
 
       - name: Snapshot environment to sessions repository
-        if: always() && steps.lock.outputs.acquired == 'true'
+        # ROUND 46（防数据丢失）：同 workspace —— 只有 env 还原步**成功**才允许快照，避免把
+        # 「取消在还原途中」留下的半套/空 $HOME 固化进 release（那正是 R44 那轮丢失的成因）。
+        if: always() && steps.lock.outputs.acquired == 'true' && steps.restore_env.outcome == 'success'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           SPLIT_SIZE: ${{ inputs.split_size }}
