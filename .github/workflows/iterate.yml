@@ -203,9 +203,19 @@ jobs:
             [ -n "$dir" ] || continue
             target_dir="$TARGETS_DIR/$dir"
             [ -e "$target_dir" ] && continue
+            # R203（D6 还原链缺口）：快照 bundle 克隆失败时**退回远端**再试一次。
+            # 背景：`git bundle create` 对 **shallow 仓**（`git clone --depth N`）会造出无法
+            # 独立克隆的包（实测 proxyip：`Could not read <oid>` / `remote did not send all
+            # necessary objects`），而这里原先只打一句 warning 就 skip ⇒ 换 runner 时该目标
+            # 工作区**整个缺失**（R202 实测：那一代靠代理自己从 GitHub clone 才补回）。
+            # 只影响失败路径：bundle 正常时行为与本补丁前完全一致。
             if ! git clone "$SESSIONS_DIR/$bundle" "$target_dir"; then
-              echo "::warning::clone failed for $dir, skipping"
-              continue
+              rm -rf "$target_dir"
+              if [ -z "$repo" ] || ! git clone "$repo" "$target_dir"; then
+                echo "::warning::clone failed for $dir (bundle and remote), skipping"
+                continue
+              fi
+              echo "::warning::bundle clone failed for $dir; recovered from remote $repo (shallow snapshot)"
             fi
             (
               set +e
@@ -586,6 +596,14 @@ jobs:
             STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
             if [ -n "$STASH_HASH" ]; then
               git -C "$repo_dir" stash store -m "snapshot" "$STASH_HASH" 2>/dev/null || true
+            fi
+
+            # R203（D6）：shallow 仓（`--depth N` 克隆出来的目标工作区）先把历史补全，否则
+            # `git bundle create` 造出的包**无法独立克隆**（缺前置对象）。best-effort：
+            # 远端不可达就保持原样（还原步已有远端兜底）。只动对象库，不碰工作区/分支。
+            if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+              git -C "$repo_dir" fetch --unshallow --tags >/dev/null 2>&1 \
+                || echo "::warning::unshallow failed for $name (snapshot bundle may not be standalone-cloneable)"
             fi
 
             BUNDLE_ARGS="--branches --tags HEAD"
