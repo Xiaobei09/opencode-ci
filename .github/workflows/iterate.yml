@@ -13,6 +13,11 @@ on:
         type: string
         required: false
         default: "19800"
+      reset_baseline:
+        description: Rewrite the repository back to its clean initial baseline (runtime state stays in the release)
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: "0 */6 * * *"
 
@@ -84,6 +89,15 @@ jobs:
         if: steps.lock.outputs.acquired == 'true'
         run: |
           set +e
+          # Target workspace bundles also live in the release now (a whole tar of the
+          # repo's runtime dirs), not in git, so the repository can stay a clean baseline.
+          ENV_TAG="env"
+          rm -rf /tmp/tgdl && mkdir -p /tmp/tgdl
+          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'targets.tar.gz*' --dir /tmp/tgdl --clobber >/dev/null 2>&1 \
+             && ls /tmp/tgdl/targets.tar.gz* >/dev/null 2>&1; then
+            cat /tmp/tgdl/targets.tar.gz* | tar -xzf - -C "$SESSIONS_DIR" 2>/dev/null \
+              || echo "::warning::failed to restore target workspace bundles"
+          fi
           INDEX="$SESSIONS_DIR/workspace-snapshots/index.json"
           [ -f "$INDEX" ] || exit 0
           COUNT=$(jq '.snapshots | length' "$INDEX")
@@ -137,48 +151,68 @@ jobs:
           set -euo pipefail
           ENV_SRC="$SESSIONS_DIR/opencode"
           mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/.opencode"
-          # Restore the catch-all environment snapshot from the sessions repo RELEASE.
-          # Release assets are not part of git history, so the repository stays clean
-          # and each asset can far exceed git's 100MiB file cap. The tag is fixed, so
-          # every run overwrites the previous environment.
           ENV_TAG="env"
+
+          # 1. Restore the WHOLE persisted environment from the release. It is a full
+          #    package of $HOME (a complete tar, not a delta/overlay), so files the agent
+          #    put ANYWHERE come back - including files copied or moved with old
+          #    timestamps, which a "changed-since-the-last-run" scan would silently miss.
+          #    Exclusions are only reinstallable caches, the work/ tree, the opencode
+          #    binary, server logs and secrets.
           rm -rf /tmp/envdl && mkdir -p /tmp/envdl
-          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'home.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1 \
-             && ls /tmp/envdl/home.tar.gz* >/dev/null 2>&1; then
+          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'env.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1 \
+             && ls /tmp/envdl/env.tar.gz* >/dev/null 2>&1; then
             echo "environment restored from release '$ENV_TAG'"
-            if ls /tmp/envdl/home.tar.gz.* >/dev/null 2>&1; then
-              cat /tmp/envdl/home.tar.gz.* | tar -xzf - -C "$HOME" 2>/dev/null \
-                || echo "::warning::failed to restore environment snapshot"
-            else
-              tar -xzf /tmp/envdl/home.tar.gz -C "$HOME" 2>/dev/null \
-                || echo "::warning::failed to restore environment snapshot"
-            fi
+            cat /tmp/envdl/env.tar.gz* | tar -xzf - -C "$HOME" 2>/dev/null \
+              || echo "::warning::failed to restore environment"
           else
-            echo "no environment release yet; starting fresh"
+            echo "no environment release yet; bootstrapping from the repository baseline"
           fi
-          if [ ! -d "$ENV_SRC/config/plugins" ] || [ ! -d "$ENV_SRC/config/v2lib" ]; then
-            echo "::warning::bridge environment missing under sessions repository; continuing without it"
+
+          # 2. The repository is the clean baseline and stays authoritative for the
+          #    bridge CODE. Copy it in (except the runtime-state files, which come from
+          #    the release) so code updates always take effect over a restored env.
+          if [ -d "$ENV_SRC/config" ]; then
+            mkdir -p "$HOME/.config/opencode"
+            for f in "$ENV_SRC"/config/*; do
+              [ -e "$f" ] || continue
+              case "$(basename "$f")" in
+                tg-chats.json|tg-chats-bot*.json|loop-ctl.json|loop-marker.json|tg-bots.json) continue ;;
+              esac
+              cp -a "$f" "$HOME/.config/opencode/" 2>/dev/null || true
+            done
+          fi
+          # First run only (no release yet): seed runtime state from the repo so the
+          # existing sessions are not dropped while migrating to release storage.
+          if [ ! -e "$HOME/.local/share/opencode/opencode.db" ] && [ -d "$ENV_SRC/data" ]; then
+            mkdir -p "$HOME/.local/share/opencode"
+            cp -a "$ENV_SRC/data/." "$HOME/.local/share/opencode/" 2>/dev/null || true
+          fi
+          if [ ! -f "$HOME/.config/opencode/tg-chats.json" ] && [ -f "$ENV_SRC/config/tg-chats.json" ]; then
+            cp -a "$ENV_SRC/config/tg-chats.json" "$HOME/.config/opencode/" 2>/dev/null || true
+          fi
+          for j in loop-ctl.json loop-marker.json service.json; do
+            [ -f "$HOME/.config/opencode/$j" ] || cp -a "$ENV_SRC/config/$j" "$HOME/.config/opencode/" 2>/dev/null || true
+          done
+          # Plugin libraries also resolve under ~/.opencode/v2lib.
+          mkdir -p "$HOME/.opencode"
+          if [ -d "$ENV_SRC/config/v2lib" ]; then
+            cp -a "$ENV_SRC/config/v2lib" "$HOME/.opencode/v2lib" 2>/dev/null || true
+          fi
+
+          if [ ! -d "$HOME/.config/opencode/plugins" ]; then
+            echo "::warning::bridge plugins missing; continuing without them"
             exit 0
           fi
-          mkdir -p "$ENV_SRC/data"
-          # Link the whole opencode state into the sessions repo so the environment
-          # (sessions DB + bridge state) survives across runs. Individual state-file
-          # symlinks would be clobbered by the plugin's atomic temp+rename writes, so a
-          # directory symlink is required.
-          rm -rf "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.opencode/v2lib" "$HOME/.opencode/.v2lib-live"
-          ln -s "$ENV_SRC/config" "$HOME/.config/opencode"
-          ln -s "$ENV_SRC/config/v2lib" "$HOME/.opencode/v2lib"
-          ln -s "$ENV_SRC/data" "$HOME/.local/share/opencode"
-          # Registry (derived, gitignored) pointing envFile at a secret living outside the repo.
-          sed "s#__HOME__#$HOME#g" "$ENV_SRC/templates/tg-bots.json" > "$HOME/.config/opencode/tg-bots.json"
+          # 3. Derived registry plus the secret env file, both kept outside the repo.
+          if [ -f "$ENV_SRC/templates/tg-bots.json" ]; then
+            sed "s#__HOME__#$HOME#g" "$ENV_SRC/templates/tg-bots.json" > "$HOME/.config/opencode/tg-bots.json"
+          fi
           : > "$HOME/.opencode/tg.env"
           if [ -n "${TG_BOT_TOKEN:-}" ]; then printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.opencode/tg.env"; fi
           if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
           if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
           chmod 600 "$HOME/.opencode/tg.env"
-          # Marker for the catch-all snapshot: only files newer than this were created
-          # or changed by this run, so the snapshot stays small and bounded.
-          touch "$HOME/.opencode/.snapshot-mark"
 
       - name: Install OpenCode 2 and workferry
         if: steps.lock.outputs.acquired == 'true'
@@ -307,133 +341,114 @@ jobs:
           # Best-effort scrub of the bot token from plaintext files under $HOME.
           if [ -n "${TG_BOT_TOKEN:-}" ]; then
             grep -rlI -F "$TG_BOT_TOKEN" "$HOME" \
-              --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin 2>/dev/null \
+              --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin \
+              --exclude-dir=work --exclude-dir=.git 2>/dev/null \
               | while IFS= read -r f; do sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null; done
           fi
-          # Overlay capture. The persisted environment is only what the agent manages;
-          # the runner base image's $HOME is recreated fresh every run and must NOT be
-          # baked into the snapshot (a blanket capture is ~580MB). So we take the
-          # PREVIOUS snapshot and apply this run's changes to it:
-          #   baseline -> previous snapshot, minus anything the agent deleted
-          #   delta    -> files touched this run (add / modify) copied on top
-          # Add / delete / modify all propagate, yet the archive stays small.
-          MARK="$HOME/.opencode/.snapshot-mark"
-          [ -f "$MARK" ] || touch "$MARK"
-          EXCL='^\./(work|\.cache|\.npm|\.bun|\.nvm|\.rustup|\.cargo|\.go|\.sdkman|\.rvm|\.pyenv|\.ssh|\.config/gh|\.config/opencode|\.local/share/opencode|\.opencode/bin|\.opencode/tg\.env|\.opencode/v2lib|\.opencode/\.snapshot-mark|\.gitconfig|\.git-credentials|node_modules|\.venv|__pycache__|\.gradle|\.m2)(/|$)'
+          # Whole-package capture: tar the ENTIRE $HOME in one go - a complete snapshot,
+          # not a delta/overlay. This is what guarantees completeness: the agent may drop
+          # files anywhere, and files it copies or moves keep their old timestamps, so a
+          # "changed-since-the-last-run" scan would silently miss them. Exclusions are
+          # only reinstallable caches, the work/ tree (targets + the repo clone, both
+          # persisted elsewhere and the latter would recurse), the opencode binary,
+          # server logs and secrets.
           ENV_TAG="env"
-          STAGE=$(mktemp -d)
-          # 1. Unpack the previous environment (from the release) as the baseline, unless
-          #    it is implausibly large (an older blanket capture that baked in the base
-          #    image); in that case start fresh so the bloat is not carried forward.
-          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'home.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1; then
-            BASELINE_SZ=$(cat /tmp/envdl/home.tar.gz* 2>/dev/null | wc -c)
-            if [ "$BASELINE_SZ" -gt 419430400 ]; then
-              echo "::warning::previous environment is ${BASELINE_SZ}B (base-image bloat); rebuilding from this run's deltas only"
-            elif ls /tmp/envdl/home.tar.gz.* >/dev/null 2>&1; then
-              cat /tmp/envdl/home.tar.gz.* | tar -xzf - -C "$STAGE" 2>/dev/null || true
-            elif [ -f /tmp/envdl/home.tar.gz ]; then
-              tar -xzf /tmp/envdl/home.tar.gz -C "$STAGE" 2>/dev/null || true
-            fi
+          # Checkpoint the SQLite sessions DB first so the packaged copy is consistent.
+          if command -v python3 >/dev/null 2>&1 && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
+            python3 -c 'import sqlite3;c=sqlite3.connect("'"$HOME"'/.local/share/opencode/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
+              && echo "sqlite WAL checkpointed" || echo "::warning::sqlite WAL checkpoint skipped"
           fi
-          # 2. Drop baseline entries the agent deleted since the previous snapshot.
-          ( cd "$STAGE" && find . -xdev \( -type f -o -type l \) 2>/dev/null ) | while IFS= read -r p; do
-            [ -e "$HOME/$p" ] || [ -L "$HOME/$p" ] || rm -f "$STAGE/$p"
-          done
-          # 3. Overlay the files this run added or modified.
-          ( cd "$HOME" && find . -xdev -newer "$MARK" \( -type f -o -type l \) 2>/dev/null | grep -vE "$EXCL" ) \
-            | while IFS= read -r p; do
-                [ -n "$p" ] || continue
-                mkdir -p "$STAGE/$(dirname "$p")"
-                cp -a -- "$HOME/$p" "$STAGE/$p" 2>/dev/null || true
-              done
-          # 4. Store it on the fixed `env` RELEASE on the sessions repo. Release assets
-          #    live outside git history (the repository commits stay clean and small)
-          #    and are not capped at git's 100MiB per-file limit. Split at 90MiB anyway
-          #    so a runaway environment still uploads, and replace stale assets so only
-          #    the latest environment is kept.
           OUT=/tmp/envsnap
           rm -rf "$OUT" && mkdir -p "$OUT"
-          if [ -n "$(ls -A "$STAGE" 2>/dev/null)" ]; then
-            tar -czf - -C "$STAGE" . 2>/dev/null | split -b 90m - "$OUT/home.tar.gz." \
-              || echo "::warning::environment snapshot failed"
-          else
-            echo "No environment files to snapshot this run."
-          fi
-          rm -rf "$STAGE"
-          # Drop any legacy in-repo copies so they never re-enter git history.
-          rm -f "$ENV_SRC"/home.tar.gz "$ENV_SRC"/home.tar.gz.[a-z][a-z]
+          tar -czf - -C "$HOME" \
+            --exclude='./work' \
+            --exclude='./.cache' \
+            --exclude='./.opencode/bin' \
+            --exclude='./.opencode/tg.env' \
+            --exclude='./.ssh' \
+            --exclude='./.config/gh' \
+            --exclude='./.gitconfig' \
+            --exclude='./.git-credentials' \
+            --exclude='./.local/share/opencode/log' \
+            --exclude='./.npm/_cacache' \
+            --exclude='./.bun/install/cache' \
+            . 2>/dev/null | split -b 90m - "$OUT/env.tar.gz." \
+            || echo "::warning::environment package failed"
+          # Package the repo's runtime dirs (target workspace bundles etc.) as a whole tar
+          # too, so the repository itself can stay a clean baseline.
+          ( cd "$SESSIONS_DIR" && tar -czf - workspace-snapshots state tasks sessions 2>/dev/null ) \
+            | split -b 90m - "$OUT/targets.tar.gz." \
+            || echo "::warning::target workspace package failed"
           if [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
               || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
-                   --notes "Latest persisted agent environment; replaced every run." >/dev/null 2>&1
+                   --notes "Whole-\$HOME environment + target workspace packages; replaced every run." >/dev/null 2>&1
+            # Delete every previous volume (old 'home.*' and new names) so only the latest
+            # environment survives.
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-              | grep -E '^home\.tar\.gz(\.|$)' \
+              | grep -E '^(env|home|targets)\.tar\.gz(\.|$)' \
               | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
-            if gh release upload "$ENV_TAG" "$OUT"/home.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-              SZ=$(cat "$OUT"/home.tar.gz.* 2>/dev/null | wc -c)
-              echo "environment snapshot uploaded: $(ls "$OUT"/home.tar.gz.* | wc -l) volume(s), $SZ bytes"
+            if gh release upload "$ENV_TAG" "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+              SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
+              TZ=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c)
+              echo "environment package uploaded: $(ls "$OUT"/env.tar.gz.* | wc -l) volume(s), $SZ bytes"
+              echo "target workspace package uploaded: $(ls "$OUT"/targets.tar.gz.* | wc -l) volume(s), $TZ bytes"
             else
-              echo "::warning::failed to upload environment snapshot to release"
+              echo "::warning::failed to upload packages to release"
             fi
+          else
+            echo "::warning::environment package is empty"
           fi
           rm -rf "$OUT"
 
-      - name: Commit and push sessions repository
-        if: always() && steps.lock.outputs.acquired == 'true'
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      - name: Rebuild repository baseline
+        if: always() && steps.lock.outputs.acquired == 'true' && inputs.reset_baseline
         run: |
           set +e
           cd "$SESSIONS_DIR"
-          # Make the SQLite sessions DB self-contained so the commit captures ALL session
-          # data even if the run was killed before the WAL was checkpointed (otherwise
-          # recent turns live only in the -wal file and can look "lost").
-          if command -v python3 >/dev/null 2>&1 && [ -f opencode/data/opencode.db ]; then
-            python3 -c 'import sqlite3;c=sqlite3.connect("opencode/data/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
-              && echo "sqlite WAL checkpointed" || echo "::warning::sqlite WAL checkpoint skipped"
-          fi
-          # The environment snapshot now lives in the `env` release as assets, not in
-          # git. Purge any legacy in-repo copy so it drops out of history, and never
-          # stage a file GitHub will refuse (100MiB hard cap).
-          rm -rf opencode/home.tar.gz opencode/home.tar.gz.[a-z][a-z]
-          if ! grep -qxF 'opencode/home.tar.gz.*' .gitignore 2>/dev/null; then
-            printf '\n# Environment snapshot lives in the env release, not git.\nopencode/home.tar.gz*\n' >> .gitignore
-          fi
-          for f in $(git ls-files); do
-            [ -f "$f" ] || continue
-            SZ=$(stat -c%s "$f" 2>/dev/null || echo 0)
-            if [ "$SZ" -gt 104857600 ]; then
-              echo "::warning::$f is ${SZ}B; exceeding GitHub's 100MiB cap, removing so the push succeeds"
-              rm -f "$f"
-            fi
-          done
-          git add -A
-          # Sanitize: never commit the bot token, even if a session ever echoed it.
-          if [ -n "${TG_BOT_TOKEN:-}" ]; then
-            while IFS= read -r f; do
-              [ -n "$f" ] || continue
-              sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null
-              git add -- "$f"
-            done < <(git grep --cached -Il -F "$TG_BOT_TOKEN" 2>/dev/null)
-          fi
-          # Collapse to a SINGLE commit holding the current environment, then force
-          # push. Keeping exactly one (latest) commit is what stops the repository from
-          # growing forever with one full environment snapshot per run; the previous
-          # commit becomes unreachable and GitHub garbage-collects its objects.
-          git checkout --orphan snapshot-reset >/dev/null 2>&1
+          # Rewrite the repository to its clean initial baseline. Only the bridge CODE and
+          # templates stay in git; ALL runtime state (sessions DB, bridge chats, loop
+          # control, shell capture) now lives in the `env` release. This is the "reset to
+          # factory" baseline: restoring it - and dropping the env release - returns the
+          # loop to the initial state. Run this with reset_baseline=true once (or whenever
+          # you want to re-freeze the baseline).
+          git checkout --orphan baseline-reset >/dev/null 2>&1
+          rm -rf opencode/data
+          mkdir -p opencode/data
+          touch opencode/data/.gitkeep
+          rm -f opencode/config/tg-chats.json opencode/config/tg-chats-bot*.json \
+                opencode/config/loop-ctl.json opencode/config/loop-marker.json \
+                opencode/config/tg-bots.json
+          {
+            echo '# Runtime state lives in the env release, not in git.'
+            echo 'opencode/data/*'
+            echo '!opencode/data/.gitkeep'
+            echo 'opencode/config/tg-chats*.json'
+            echo 'opencode/config/tg-bots.json'
+            echo 'opencode/config/loop-ctl.json'
+            echo 'opencode/config/loop-marker.json'
+            echo 'opencode/home.tar.gz*'
+          } > .gitignore
           git add -A
           git -c user.name="opencode-ci" -c user.email="opencode-ci@users.noreply.github.com" \
-            commit -q -m "environment $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            commit -q -m "baseline: clean initial state ($(date -u +%Y-%m-%dT%H:%M:%SZ))" \
             || echo "::warning::nothing to commit"
-          git branch -M snapshot-reset main
-          # Runs are serialized by the workflow concurrency group, so there is never a
-          # concurrent writer; force push therefore only ever discards stale history.
+          git branch -M baseline-reset main
           for attempt in 1 2 3 4 5; do
             if git push --force origin main; then
-              echo "snapshot pushed (single commit)"
+              echo "baseline pushed (single commit)"
               break
             fi
-            echo "::warning::snapshot push attempt $attempt failed; retrying"
+            echo "::warning::baseline push attempt $attempt failed; retrying"
+            sleep 4
+          done
+          git tag -f baseline >/dev/null 2>&1
+          for attempt in 1 2 3 4 5; do
+            if git push --force origin refs/tags/baseline; then
+              echo "baseline tag pushed"
+              break
+            fi
+            echo "::warning::baseline tag push attempt $attempt failed; retrying"
             sleep 4
           done
 
@@ -442,9 +457,9 @@ jobs:
         run: |
           set +e
           # No checkpoint gate: every run hands off to the next one unconditionally.
-          # Continuity comes from the persisted opencode state (sessions DB under
-          # $HOME/.local/share/opencode, bridge state, state/current.md).  Because
-          # opencode resumes from where it was interrupted, a forced timeout at the
-          # end of a run is seamless on the next run.
+          # Continuity comes from the persisted environment (the whole-$HOME package and
+          # the target workspace bundles in the `env` release). Because opencode resumes
+          # from where it was interrupted, a forced timeout at the end of a run is
+          # seamless on the next run.
           echo "Relaying next run unconditionally."
           gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"
