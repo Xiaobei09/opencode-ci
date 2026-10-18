@@ -98,6 +98,17 @@ jobs:
             cat /tmp/tgdl/targets.tar.gz* | tar -xzf - -C "$SESSIONS_DIR" 2>/dev/null \
               || echo "::warning::failed to restore target workspace bundles"
           fi
+          # ROUND 34 (D6): the target-workspace package is built at the END of a run, so right
+          # after an aborted/cancelled run it is OLDER than the fresh clone of the sessions repo.
+          # Extracting it above would then downgrade the *tracked* knowledge dirs in the working
+          # tree (state/ tasks/ sessions/), and the next agent could re-commit that as a revert.
+          # Git is authoritative for these dirs, so re-assert them from the clone's index here.
+          # `workspace-snapshots/` is deliberately left as the package provided it: its index.json
+          # and the target bundles are runtime artifacts that must stay mutually consistent.
+          if [ -d "$SESSIONS_DIR/.git" ]; then
+            git -C "$SESSIONS_DIR" checkout -- state tasks sessions 2>/dev/null \
+              || echo "::warning::could not re-assert tracked knowledge dirs (state/tasks/sessions) from git"
+          fi
           INDEX="$SESSIONS_DIR/workspace-snapshots/index.json"
           [ -f "$INDEX" ] || exit 0
           COUNT=$(jq '.snapshots | length' "$INDEX")
