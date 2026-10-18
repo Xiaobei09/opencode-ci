@@ -402,6 +402,10 @@ jobs:
             --exclude='./.local/share/opencode/log' \
             --exclude='./.npm/_cacache' \
             --exclude='./.bun/install/cache' \
+            --exclude='./actions-runner' \
+            --exclude='./.rustup' \
+            --exclude='./.dotnet' \
+            --exclude='./.opencode/.v2lib-live' \
             . 2>/dev/null | split -b 90m - "$OUT/env.tar.gz." \
             || echo "::warning::environment package failed"
           # Package the repo's runtime dirs (target workspace bundles etc.) as a whole tar
