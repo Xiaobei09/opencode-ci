@@ -97,34 +97,44 @@ jobs:
           # Target workspace bundles also live in the release now (a whole tar of the
           # repo's runtime dirs), not in git, so the repository can stay a clean baseline.
           ENV_TAG="env"
-          rm -rf /tmp/tgdl && mkdir -p /tmp/tgdl
           # ROUND 35（降级读取策略，与 env 包同口径）：页按 `sort -V` 定序；有 meta.json 时先核对
           # 拼接字节数，不一致则拒绝应用（宁可用克隆里的 git 版本，也不铺半套 targets）；
           # 压缩格式按魔数判定；manifest 缺失 ⇒ 退回旧的无校验直解。
-          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'targets.tar.gz*' --dir /tmp/tgdl --clobber >/dev/null 2>&1 \
-             && ls /tmp/tgdl/targets.tar.gz* >/dev/null 2>&1; then
-            gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir /tmp/tgdl --clobber >/dev/null 2>&1 || true
-            TGT_VOLS=$(ls /tmp/tgdl/targets.tar.gz* 2>/dev/null | sort -V)
-            TGT_PAGES=$(echo "$TGT_VOLS" | wc -l)
-            TGT_BYTES=$(cat $TGT_VOLS 2>/dev/null | wc -c)
-            TGT_EXPECT=$(jq -r '.targets.bytes // empty' /tmp/tgdl/meta.json 2>/dev/null || true)
-            if [ -n "$TGT_EXPECT" ] && [ "$TGT_BYTES" != "$TGT_EXPECT" ]; then
-              echo "::warning::targets package incomplete ($TGT_BYTES of $TGT_EXPECT bytes, $TGT_PAGES page(s)); refusing to apply a partial restore"
-            else
-              TGT_HDR=$(head -c 6 "$(echo "$TGT_VOLS" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-              case "$TGT_HDR" in
-                1f8b*)        TGT_FLAG="-z" ;;
-                fd377a585a00) TGT_FLAG="-J" ;;
-                28b52ffd*)    TGT_FLAG="--zstd" ;;
-                425a68*)      TGT_FLAG="-j" ;;
-                *)            TGT_FLAG="" ;;
-              esac
-              if cat $TGT_VOLS | tar -xf - -C "$SESSIONS_DIR" $TGT_FLAG 2>/dev/null; then
-                echo "target workspace package restored ($TGT_PAGES page(s), $TGT_BYTES bytes, tar ${TGT_FLAG:-plain}${TGT_EXPECT:+, size-verified})"
-              else
-                echo "::warning::failed to restore target workspace bundles (tar ${TGT_FLAG:-plain}, $TGT_BYTES bytes)"
-              fi
+          # ROUND 44：同 env 读侧——主包不可用时改从保险 tag 'env-safe' 还原，避免撕裂包铺半套/空 targets。
+          FALLBACK_TAG="${SESSIONS_FALLBACK_TAG:-env-safe}"
+          tgt_try() {
+            local tag="$1" dl="/tmp/tgdl-$1" vols pages bytes expect hdr tflag
+            rm -rf "$dl" && mkdir -p "$dl"
+            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'targets.tar.gz*' --dir "$dl" --clobber >/dev/null 2>&1 || return 1
+            ls "$dl"/targets.tar.gz* >/dev/null 2>&1 || return 1
+            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
+            vols=$(ls "$dl"/targets.tar.gz* 2>/dev/null | sort -V)
+            pages=$(echo "$vols" | wc -l)
+            bytes=$(cat $vols 2>/dev/null | wc -c)
+            expect=$(jq -r '.targets.bytes // empty' "$dl/meta.json" 2>/dev/null || true)
+            if [ -n "$expect" ] && [ "$bytes" != "$expect" ]; then
+              echo "::warning::$tag targets package incomplete ($bytes of $expect bytes, $pages page(s)); refusing to apply a partial restore"
+              return 1
             fi
+            hdr=$(head -c 6 "$(echo "$vols" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            case "$hdr" in
+              1f8b*)        tflag="-z" ;;
+              fd377a585a00) tflag="-J" ;;
+              28b52ffd*)    tflag="--zstd" ;;
+              425a68*)      tflag="-j" ;;
+              *)            tflag="" ;;
+            esac
+            if cat $vols | tar -xf - -C "$SESSIONS_DIR" $tflag 2>/dev/null; then
+              echo "target workspace package restored from '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified})"
+              return 0
+            fi
+            echo "::warning::$tag target workspace package failed to extract (tar ${tflag:-plain}, $bytes bytes)"
+            return 1
+          }
+          if tgt_try "$ENV_TAG"; then
+            :
+          elif [ "$FALLBACK_TAG" != "$ENV_TAG" ] && tgt_try "$FALLBACK_TAG"; then
+            echo "::warning::primary targets package '$ENV_TAG' unusable; restored the insurance generation '$FALLBACK_TAG'"
           fi
           # ROUND 34 (D6): the target-workspace package is built at the END of a run, so right
           # after an aborted/cancelled run it is OLDER than the fresh clone of the sessions repo.
@@ -200,39 +210,53 @@ jobs:
           #    timestamps, which a "changed-since-the-last-run" scan would silently miss.
           #    Exclusions are only reinstallable caches, the work/ tree, the opencode
           #    binary, server logs and secrets.
-          rm -rf /tmp/envdl && mkdir -p /tmp/envdl
           # ROUND 35（降级读取策略）：包可能按「1..N 页 + meta.json」上传（现默认 1500m ⇒ 大包也只占一页），
           # 也可能是旧的 90 MiB 多页、甚至无 manifest 的旧包。读侧分三层：
           #   ① 页集合按 `sort -V` 定序（`.aa/.ab` 与 `.000/.001` 都能排对）；
           #   ② 若有 meta.json，先比对拼接字节数；**不一致就拒绝应用**（半套 $HOME 比不还原本更糟）
           #      并给出可操作告警；manifest 缺失/不可解析 ⇒ 退回旧行为（不校验直接解 = 降级）；
           #   ③ 压缩格式由**魔数**判定（gzip/xz/zstd/bzip2/未压缩），不再写死 gzip。
-          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'env.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1 \
-             && ls /tmp/envdl/env.tar.gz* >/dev/null 2>&1; then
-            gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir /tmp/envdl --clobber >/dev/null 2>&1 || true
-            ENV_VOLS=$(ls /tmp/envdl/env.tar.gz* 2>/dev/null | sort -V)
-            ENV_PAGES=$(echo "$ENV_VOLS" | wc -l)
-            ENV_BYTES=$(cat $ENV_VOLS 2>/dev/null | wc -c)
-            EXPECT=$(jq -r '.env.bytes // empty' /tmp/envdl/meta.json 2>/dev/null || true)
-            if [ -n "$EXPECT" ] && [ "$ENV_BYTES" != "$EXPECT" ]; then
-              echo "::warning::env package incomplete ($ENV_BYTES of $EXPECT bytes, $ENV_PAGES page(s)); refusing to apply a partial restore"
-            else
-              HDR=$(head -c 6 "$(echo "$ENV_VOLS" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-              case "$HDR" in
-                1f8b*)        TFLAG="-z" ;;
-                fd377a585a00) TFLAG="-J" ;;
-                28b52ffd*)    TFLAG="--zstd" ;;
-                425a68*)      TFLAG="-j" ;;
-                *)            TFLAG="" ;;
-              esac
-              if cat $ENV_VOLS | tar -xf - -C "$HOME" $TFLAG 2>/dev/null; then
-                echo "environment restored from release '$ENV_TAG' ($ENV_PAGES page(s), $ENV_BYTES bytes, tar ${TFLAG:-plain}${EXPECT:+, size-verified})"
-              else
-                echo "::warning::failed to restore environment (tar ${TFLAG:-plain}, $ENV_BYTES bytes)"
-              fi
+          # ROUND 44（防数据丢失，关键）：旧版「先删光资产、再上传」的写侧一旦被取消切在中间，
+          # 就会留下「新卷 + 旧 meta.json」的**撕裂包**；此时旧读侧只告警然后 bootstrap **空环境**
+          # ⇒ 会话库/桥聊天整体丢失（实测：run 39097256929 被取消 → run 39103651786 读到撕裂包 →
+          # 空 DB → 会话 ses_eb626522 消失）。现在：主包 'env' 不可用 ⇒ 改从**保险 tag** 'env-safe'
+          # 还原；两者都不可用才 bootstrap。env-safe 由运营者的 env-backup.sh 维护为「最近一次完好代」。
+          FALLBACK_TAG="${SESSIONS_FALLBACK_TAG:-env-safe}"
+          env_try() {
+            local tag="$1" dl="/tmp/envdl-$1" vols pages bytes expect hdr tflag
+            rm -rf "$dl" && mkdir -p "$dl"
+            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'env.tar.gz*' --dir "$dl" --clobber >/dev/null 2>&1 || return 1
+            ls "$dl"/env.tar.gz* >/dev/null 2>&1 || return 1
+            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
+            vols=$(ls "$dl"/env.tar.gz* 2>/dev/null | sort -V)
+            pages=$(echo "$vols" | wc -l)
+            bytes=$(cat $vols 2>/dev/null | wc -c)
+            expect=$(jq -r '.env.bytes // empty' "$dl/meta.json" 2>/dev/null || true)
+            if [ -n "$expect" ] && [ "$bytes" != "$expect" ]; then
+              echo "::warning::$tag package incomplete ($bytes of $expect bytes, $pages page(s)); refusing to apply a partial restore"
+              return 1
             fi
+            hdr=$(head -c 6 "$(echo "$vols" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            case "$hdr" in
+              1f8b*)        tflag="-z" ;;
+              fd377a585a00) tflag="-J" ;;
+              28b52ffd*)    tflag="--zstd" ;;
+              425a68*)      tflag="-j" ;;
+              *)            tflag="" ;;
+            esac
+            if cat $vols | tar -xf - -C "$HOME" $tflag 2>/dev/null; then
+              echo "environment restored from release '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified})"
+              return 0
+            fi
+            echo "::warning::$tag package failed to extract (tar ${tflag:-plain}, $bytes bytes)"
+            return 1
+          }
+          if env_try "$ENV_TAG"; then
+            echo "environment source: $ENV_TAG"
+          elif [ "$FALLBACK_TAG" != "$ENV_TAG" ] && env_try "$FALLBACK_TAG"; then
+            echo "::warning::primary env package '$ENV_TAG' unusable; restored the insurance generation '$FALLBACK_TAG'"
           else
-            echo "no environment release yet; bootstrapping from the repository baseline"
+            echo "no usable environment package; bootstrapping from the repository baseline"
           fi
 
           # 2. The repository is the clean baseline and stays authoritative for the
@@ -345,15 +369,29 @@ jobs:
           if [ -n "$SID" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
             SID_PRESENT=$(python3 -c 'import sqlite3,sys,os;c=sqlite3.connect("file:"+os.path.expanduser("~/.local/share/opencode/opencode.db")+"?mode=ro",uri=True);print("yes" if c.execute("select 1 from session_v2 where id=?",(sys.argv[1],)).fetchone() else "no")' "$SID" 2>/dev/null || echo "err")
           fi
+          # ROUND 44（重启自动恢复加固）：bound 会话**确认为 no**（或压根没有 bound）时，**不要**盲目
+          # `--continue`——数据丢失后 `--continue` 只会打开本轮新建的空会话（实测：撕裂包 → 空 DB →
+          # 新会话 ses_eb24bf12，旧 ses_eb626522 的 1056 条上下文全部掉线）。改为挑 DB 里**消息最多**
+          # 的会话（最富上下文者，通常就是主循环会话）作为恢复目标；探针 err/n-a 仍保持 pin 不动。
+          RECOVER_LINE=""
+          if { [ "$SID_PRESENT" = "no" ] || [ -z "$SID" ]; } && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
+            RECOVER_LINE=$(python3 -c 'import sqlite3,os;c=sqlite3.connect("file:"+os.path.expanduser("~/.local/share/opencode/opencode.db")+"?mode=ro",uri=True);r=c.execute("select session_id,count(*) n from session_message group by session_id order by n desc limit 1").fetchone();print("%s %d"%(r[0],r[1]) if r else "")' 2>/dev/null || true)
+          fi
+          RECOVER="${RECOVER_LINE%% *}"
+          RECOVER_MSGS="${RECOVER_LINE##* }"
           if [ -n "$SID" ] && [ "$SID_PRESENT" != "no" ]; then
             ARGS=(--standalone --session "$SID")
             echo "resuming bound session present_in_db=$SID_PRESENT"
-          elif [ -n "$SID" ]; then
-            ARGS=(--standalone --continue)
-            echo "bound session absent from the restored db ($SID_PRESENT); falling back to --continue"
+          elif [ -n "$RECOVER" ]; then
+            ARGS=(--standalone --session "$RECOVER")
+            echo "recovery: bound=$([ -n "$SID" ] && echo yes || echo none) present_in_db=$SID_PRESENT; pinned the richest restored session (msgs=$RECOVER_MSGS)"
           else
             ARGS=(--standalone --continue)
-            echo "no bound session found; continuing the last session"
+            if [ -n "$SID" ]; then
+              echo "bound session absent from the restored db ($SID_PRESENT); no richer session to recover; falling back to --continue"
+            else
+              echo "no bound session found; continuing the last session"
+            fi
           fi
           TERM=xterm-256color timeout --signal=TERM --kill-after=30s "$BUDGET" \
             opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
