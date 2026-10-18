@@ -384,6 +384,27 @@ jobs:
             cp -a "$ENV_SRC/config/v2lib/." "$HOME/.opencode/v2lib/" 2>/dev/null || true
             rm -rf "$HOME/.opencode/v2lib/v2lib" 2>/dev/null || true
           fi
+          # ROUND 63: prove the repo→runtime code sync actually took effect.
+          # If it silently does not (nested `cp -a`, wrong path, stale extraction),
+          # the plugin boots the **snapshot's** old code and every repo fix looks
+          # like it did nothing — a failure mode that costs whole restart cycles
+          # to diagnose. Compare byte-for-byte and fail loudly instead.
+          for d in "$HOME/.config/opencode/v2lib" "$HOME/.opencode/v2lib"; do
+            [ -f "$ENV_SRC/config/v2lib/auto-continue.ts" ] || break
+            [ -d "$d" ] || continue
+            if [ -d "$d/v2lib" ]; then
+              echo "::error::nested v2lib copy at $d/v2lib — repo code would not be live"
+              exit 1
+            fi
+            if ! cmp -s "$ENV_SRC/config/v2lib/auto-continue.ts" "$d/auto-continue.ts"; then
+              echo "::error::v2lib code sync mismatch at $d/auto-continue.ts (repo != runtime)"
+              exit 1
+            fi
+            if ! cmp -s "$ENV_SRC/config/v2lib/_v2compat.ts" "$d/_v2compat.ts"; then
+              echo "::error::v2lib code sync mismatch at $d/_v2compat.ts (repo != runtime)"
+              exit 1
+            fi
+          done
 
           if [ ! -d "$HOME/.config/opencode/plugins" ]; then
             echo "::warning::bridge plugins missing; continuing without them"
