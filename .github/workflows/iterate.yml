@@ -229,7 +229,10 @@ jobs:
                 git rev-parse --verify HEAD >/dev/null 2>&1 || git checkout "$commit" 2>/dev/null || true
               fi
               git fetch origin '+refs/stash:refs/stash' 2>/dev/null || true
-              if ! workferry apply --dir "$target_dir" "$SESSIONS_DIR/$worktree"; then
+              # R203：`worktree.tar.gz` 缺失是**良性**的（`workferry pack` 对干净仓不产出
+              # 文件）⇒ 路径为空/文件不存在时静默跳过，不再每轮打一条误导告警。
+              if [ -n "$worktree" ] && [ -f "$SESSIONS_DIR/$worktree" ] \
+                && ! workferry apply --dir "$target_dir" "$SESSIONS_DIR/$worktree"; then
                 echo "::warning::workferry apply failed for $dir, untracked files may be lost"
               fi
               if git rev-parse --verify refs/stash >/dev/null 2>&1; then
@@ -619,6 +622,10 @@ jobs:
             if ! workferry pack --dir "$repo_dir" "$snap_dir/worktree.tar.gz"; then
               echo "::warning::workferry pack failed for $name"
             fi
+            # R203：pack 对**无变更**的干净仓不产出文件（打印「没有检测到任何变更」）⇒
+            # index 里把 worktree 记为空，还原步据此静默跳过（消除误导告警）。
+            PACKED_WT="workspace-snapshots/$name/worktree.tar.gz"
+            [ -f "$snap_dir/worktree.tar.gz" ] || PACKED_WT=""
 
             BRANCH=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || true)
             COMMIT=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)
@@ -629,7 +636,7 @@ jobs:
               --arg repo "$REMOTE" \
               --arg dir "$name" \
               --arg bundle "workspace-snapshots/$name/git.bundle" \
-              --arg worktree "workspace-snapshots/$name/worktree.tar.gz" \
+              --arg worktree "$PACKED_WT" \
               --arg branch "$BRANCH" \
               --arg commit "$COMMIT" \
               --arg saved_at "$SAVED_AT" \
