@@ -360,6 +360,14 @@ jobs:
             --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin \
             --exclude-dir=work --exclude-dir=.git 2>/dev/null \
             | while IFS= read -r f; do sed -i -E 's/[0-9]{6,12}:[A-Za-z0-9_-]{30,}/REDACTED/g' "$f" 2>/dev/null; done
+          # ROUND 24 / D3: the $HOME scrub above excludes work/ — and the sessions
+          # repository lives in work/. Yet that tree is (a) packaged by the target tar
+          # below (sessions/state/tasks) and uploaded to the release, and (b) force-pushed
+          # wholesale to git by the "Rebuild repository baseline" step, where a leaked
+          # token becomes permanent history. Scrub the repository tree as well.
+          grep -rlIE '[0-9]{6,12}:[A-Za-z0-9_-]{30,}' "$SESSIONS_DIR" \
+            --exclude-dir=.git 2>/dev/null \
+            | while IFS= read -r f; do sed -i -E 's/[0-9]{6,12}:[A-Za-z0-9_-]{30,}/REDACTED/g' "$f" 2>/dev/null; done
           # Whole-package capture: tar the ENTIRE $HOME in one go - a complete snapshot,
           # not a delta/overlay. This is what guarantees completeness: the agent may drop
           # files anywhere, and files it copies or moves keep their old timestamps, so a
