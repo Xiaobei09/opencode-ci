@@ -375,7 +375,7 @@ jobs:
           # offsets never move (verified on a copy: PRAGMA integrity_check=ok, all rows
           # intact). Runs AFTER the WAL checkpoint so the main file holds every page, and
           # before the tar; temp+rename makes an interrupted run non-destructive.
-          for dbf in "$HOME/.local/share/opencode/opencode.db" "$HOME/.local/share/opencode/opencode.db-wal"; do
+          for dbf in "$HOME/.local/share/opencode/opencode.db" "$HOME/.local/share/opencode/opencode.db-wal" "$HOME/.local/share/opencode/opencode.db-shm"; do
             [ -f "$dbf" ] || continue
             python3 -c 'import os,re,sys;p=sys.argv[1];pat=re.compile(rb"[0-9]{6,12}:[A-Za-z0-9_-]{30,}");b=open(p,"rb").read();nb=pat.sub(lambda m:b"X"*len(m.group(0)),b);m=os.stat(p).st_mode&0o777;t=p+".redact";open(t,"wb").write(nb);os.chmod(t,m);os.replace(t,p)' "$dbf" \
               && echo "db token-redacted: $(basename "$dbf")" || echo "::warning::db redaction skipped: $(basename "$dbf")"
