@@ -264,12 +264,19 @@ jobs:
           # 2. The repository is the clean baseline and stays authoritative for the
           #    bridge CODE. Copy it in (except the runtime-state files, which come from
           #    the release) so code updates always take effect over a restored env.
+          #    ROUND 48（真缺陷修复）：跳过表原只列了 5 个文件，其余运行态文件仍被无条件
+          #    从仓库覆盖到运行态 ⇒ 每轮启动都会用**仓库里那份陈旧状态**盖掉刚从 release
+          #    还原的**实时状态**（实测：loop-sessions 被盖回 3 会话、漏掉已还原的
+          #    ses_eb24bf12；inject-card 被盖回旧 session/旧计数；loop-guard 每次被盖回
+          #    problem:true）。把这些运行态文件一并纳入跳过表，改为「缺失才播种」（见下）。
           if [ -d "$ENV_SRC/config" ]; then
             mkdir -p "$HOME/.config/opencode"
             for f in "$ENV_SRC"/config/*; do
               [ -e "$f" ] || continue
               case "$(basename "$f")" in
-                tg-chats.json|tg-chats-bot*.json|loop-ctl.json|loop-marker.json|tg-bots.json) continue ;;
+                tg-chats.json|tg-chats-bot*.json|tg-bots.json|loop-ctl.json|loop-marker.json|\
+                loop-guard.json|loop-sessions.json|model-windows.json|abort-events.json|\
+                inject-card-*.json|botname-*.json|service.json|tg-bot*.env|tg.env) continue ;;
               esac
               cp -a "$f" "$HOME/.config/opencode/" 2>/dev/null || true
             done
@@ -283,7 +290,10 @@ jobs:
           if [ ! -f "$HOME/.config/opencode/tg-chats.json" ] && [ -f "$ENV_SRC/config/tg-chats.json" ]; then
             cp -a "$ENV_SRC/config/tg-chats.json" "$HOME/.config/opencode/" 2>/dev/null || true
           fi
-          for j in loop-ctl.json loop-marker.json service.json; do
+          # ROUND 48：运行态文件一律「缺失才播种」（绝不覆盖 release 还原的实时状态）。
+          for j in loop-ctl.json loop-marker.json service.json \
+                   loop-guard.json loop-sessions.json model-windows.json \
+                   abort-events.json botname-sig.json; do
             [ -f "$HOME/.config/opencode/$j" ] || cp -a "$ENV_SRC/config/$j" "$HOME/.config/opencode/" 2>/dev/null || true
           done
           # Plugin libraries also resolve under ~/.opencode/v2lib.
@@ -693,7 +703,10 @@ jobs:
           touch opencode/data/.gitkeep
           rm -f opencode/config/tg-chats.json opencode/config/tg-chats-bot*.json \
                 opencode/config/loop-ctl.json opencode/config/loop-marker.json \
-                opencode/config/tg-bots.json
+                opencode/config/tg-bots.json opencode/config/loop-guard.json \
+                opencode/config/loop-sessions.json opencode/config/model-windows.json \
+                opencode/config/abort-events.json opencode/config/inject-card-*.json \
+                opencode/config/botname-*.json
           {
             echo '# Runtime state lives in the env release, not in git.'
             echo 'opencode/data/*'
@@ -702,8 +715,16 @@ jobs:
             echo 'opencode/config/tg-bots.json'
             echo 'opencode/config/loop-ctl.json'
             echo 'opencode/config/loop-marker.json'
+            echo 'opencode/config/loop-guard.json'
+            echo 'opencode/config/loop-sessions.json'
+            echo 'opencode/config/model-windows.json'
+            echo 'opencode/config/abort-events.json'
+            echo 'opencode/config/inject-card-*.json'
             echo 'opencode/config/halt-release.json*'
             echo 'opencode/config/botname-*.json*'
+            echo 'opencode/config/service.json*'
+            echo 'opencode/config/tg-bot*.env'
+            echo 'opencode/config/tg.env'
             echo 'opencode/home.tar.gz*'
           } > .gitignore
           git add -A
