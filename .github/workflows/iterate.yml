@@ -147,6 +147,8 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_ALLOWED_CHAT: ${{ secrets.TG_ALLOWED_CHAT }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+          TG_BOT3_TOKEN: ${{ secrets.TG_BOT3_TOKEN }}
+          TG_BOT4_TOKEN: ${{ secrets.TG_BOT4_TOKEN }}
         run: |
           set -euo pipefail
           ENV_SRC="$SESSIONS_DIR/opencode"
@@ -219,6 +221,24 @@ jobs:
           if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
           if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
           chmod 600 "$HOME/.opencode/tg.env"
+          # bot3/bot4 tokens come from CI secrets too (ROUND 26). A token file kept under
+          # $HOME cannot survive on its own: the value-independent snapshot scrub rewrites
+          # token-shaped text to REDACTED, and ~/.config/opencode/tg-bot*.env is excluded
+          # from the package - so a hand-written file is gone after every restart (exactly
+          # why bot3/bot4 kept reporting token=MISSING).
+          for b in 3 4; do
+            v=""
+            [ "$b" = "3" ] && v="${TG_BOT3_TOKEN:-}"
+            [ "$b" = "4" ] && v="${TG_BOT4_TOKEN:-}"
+            if [ -n "$v" ]; then
+              printf 'TG_BOT_TOKEN=%s\nTG_ALLOWED_CHAT=%s\nTG_PUSH_CHAT=%s\n' \
+                "$v" "${TG_ALLOWED_CHAT:-}" "${TG_PUSH_CHAT:-}" > "$HOME/.config/opencode/tg-bot$b.env"
+              chmod 600 "$HOME/.config/opencode/tg-bot$b.env"
+              echo "bot$b secret env written"
+            else
+              echo "::warning::TG_BOT${b}_TOKEN missing; bot$b will run without a token"
+            fi
+          done
 
       - name: Install OpenCode 2 and workferry
         if: steps.lock.outputs.acquired == 'true'
