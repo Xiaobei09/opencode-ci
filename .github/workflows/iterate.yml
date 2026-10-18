@@ -18,6 +18,11 @@ on:
         type: boolean
         required: false
         default: false
+      split_size:
+        description: Max bytes per release asset when paging the packages (GitHub allows up to 2GiB per asset; e.g. 1500m, 1900m, 512m, 90m)
+        type: string
+        required: false
+        default: "1500m"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -93,10 +98,33 @@ jobs:
           # repo's runtime dirs), not in git, so the repository can stay a clean baseline.
           ENV_TAG="env"
           rm -rf /tmp/tgdl && mkdir -p /tmp/tgdl
+          # ROUND 35（降级读取策略，与 env 包同口径）：页按 `sort -V` 定序；有 meta.json 时先核对
+          # 拼接字节数，不一致则拒绝应用（宁可用克隆里的 git 版本，也不铺半套 targets）；
+          # 压缩格式按魔数判定；manifest 缺失 ⇒ 退回旧的无校验直解。
           if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'targets.tar.gz*' --dir /tmp/tgdl --clobber >/dev/null 2>&1 \
              && ls /tmp/tgdl/targets.tar.gz* >/dev/null 2>&1; then
-            cat /tmp/tgdl/targets.tar.gz* | tar -xzf - -C "$SESSIONS_DIR" 2>/dev/null \
-              || echo "::warning::failed to restore target workspace bundles"
+            gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir /tmp/tgdl --clobber >/dev/null 2>&1 || true
+            TGT_VOLS=$(ls /tmp/tgdl/targets.tar.gz* 2>/dev/null | sort -V)
+            TGT_PAGES=$(echo "$TGT_VOLS" | wc -l)
+            TGT_BYTES=$(cat $TGT_VOLS 2>/dev/null | wc -c)
+            TGT_EXPECT=$(jq -r '.targets.bytes // empty' /tmp/tgdl/meta.json 2>/dev/null || true)
+            if [ -n "$TGT_EXPECT" ] && [ "$TGT_BYTES" != "$TGT_EXPECT" ]; then
+              echo "::warning::targets package incomplete ($TGT_BYTES of $TGT_EXPECT bytes, $TGT_PAGES page(s)); refusing to apply a partial restore"
+            else
+              TGT_HDR=$(head -c 6 "$(echo "$TGT_VOLS" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+              case "$TGT_HDR" in
+                1f8b*)        TGT_FLAG="-z" ;;
+                fd377a585a00) TGT_FLAG="-J" ;;
+                28b52ffd*)    TGT_FLAG="--zstd" ;;
+                425a68*)      TGT_FLAG="-j" ;;
+                *)            TGT_FLAG="" ;;
+              esac
+              if cat $TGT_VOLS | tar -xf - -C "$SESSIONS_DIR" $TGT_FLAG 2>/dev/null; then
+                echo "target workspace package restored ($TGT_PAGES page(s), $TGT_BYTES bytes, tar ${TGT_FLAG:-plain}${TGT_EXPECT:+, size-verified})"
+              else
+                echo "::warning::failed to restore target workspace bundles (tar ${TGT_FLAG:-plain}, $TGT_BYTES bytes)"
+              fi
+            fi
           fi
           # ROUND 34 (D6): the target-workspace package is built at the END of a run, so right
           # after an aborted/cancelled run it is OLDER than the fresh clone of the sessions repo.
@@ -173,11 +201,36 @@ jobs:
           #    Exclusions are only reinstallable caches, the work/ tree, the opencode
           #    binary, server logs and secrets.
           rm -rf /tmp/envdl && mkdir -p /tmp/envdl
+          # ROUND 35（降级读取策略）：包可能按「1..N 页 + meta.json」上传（现默认 1500m ⇒ 大包也只占一页），
+          # 也可能是旧的 90 MiB 多页、甚至无 manifest 的旧包。读侧分三层：
+          #   ① 页集合按 `sort -V` 定序（`.aa/.ab` 与 `.000/.001` 都能排对）；
+          #   ② 若有 meta.json，先比对拼接字节数；**不一致就拒绝应用**（半套 $HOME 比不还原本更糟）
+          #      并给出可操作告警；manifest 缺失/不可解析 ⇒ 退回旧行为（不校验直接解 = 降级）；
+          #   ③ 压缩格式由**魔数**判定（gzip/xz/zstd/bzip2/未压缩），不再写死 gzip。
           if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'env.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1 \
              && ls /tmp/envdl/env.tar.gz* >/dev/null 2>&1; then
-            echo "environment restored from release '$ENV_TAG'"
-            cat /tmp/envdl/env.tar.gz* | tar -xzf - -C "$HOME" 2>/dev/null \
-              || echo "::warning::failed to restore environment"
+            gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir /tmp/envdl --clobber >/dev/null 2>&1 || true
+            ENV_VOLS=$(ls /tmp/envdl/env.tar.gz* 2>/dev/null | sort -V)
+            ENV_PAGES=$(echo "$ENV_VOLS" | wc -l)
+            ENV_BYTES=$(cat $ENV_VOLS 2>/dev/null | wc -c)
+            EXPECT=$(jq -r '.env.bytes // empty' /tmp/envdl/meta.json 2>/dev/null || true)
+            if [ -n "$EXPECT" ] && [ "$ENV_BYTES" != "$EXPECT" ]; then
+              echo "::warning::env package incomplete ($ENV_BYTES of $EXPECT bytes, $ENV_PAGES page(s)); refusing to apply a partial restore"
+            else
+              HDR=$(head -c 6 "$(echo "$ENV_VOLS" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+              case "$HDR" in
+                1f8b*)        TFLAG="-z" ;;
+                fd377a585a00) TFLAG="-J" ;;
+                28b52ffd*)    TFLAG="--zstd" ;;
+                425a68*)      TFLAG="-j" ;;
+                *)            TFLAG="" ;;
+              esac
+              if cat $ENV_VOLS | tar -xf - -C "$HOME" $TFLAG 2>/dev/null; then
+                echo "environment restored from release '$ENV_TAG' ($ENV_PAGES page(s), $ENV_BYTES bytes, tar ${TFLAG:-plain}${EXPECT:+, size-verified})"
+              else
+                echo "::warning::failed to restore environment (tar ${TFLAG:-plain}, $ENV_BYTES bytes)"
+              fi
+            fi
           else
             echo "no environment release yet; bootstrapping from the repository baseline"
           fi
@@ -371,6 +424,7 @@ jobs:
         if: always() && steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
           set +e
           ENV_SRC="$SESSIONS_DIR/opencode"
@@ -407,6 +461,11 @@ jobs:
           # persisted elsewhere and the latter would recurse), the opencode binary,
           # server logs and secrets.
           ENV_TAG="env"
+          # ROUND 35（运营者指令）：分页大小改为**按「支持的单个资产上限」取大**。
+          # GitHub 每个 release 资产上限 2 GiB，旧值 90 MiB 会把 815 MB 的包切成 9 页
+          # （9 次上传/下载请求 + 9 次校验）；默认 1500m 让同样的包只占 1 页，仍明显低于上限。
+          # 可用 dispatch 输入 `split_size` 覆盖（relay 只传 resume ⇒ 用默认值）。
+          SPLIT_SIZE="${SPLIT_SIZE:-1500m}"
           # Checkpoint the SQLite sessions DB first so the packaged copy is consistent.
           if command -v python3 >/dev/null 2>&1 && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
             python3 -c 'import sqlite3;c=sqlite3.connect("'"$HOME"'/.local/share/opencode/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
@@ -446,27 +505,52 @@ jobs:
             --exclude='./.rustup' \
             --exclude='./.dotnet' \
             --exclude='./.opencode/.v2lib-live' \
-            . 2>/dev/null | split -b 90m - "$OUT/env.tar.gz." \
+            . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." \
             || echo "::warning::environment package failed"
           # Package the repo's runtime dirs (target workspace bundles etc.) as a whole tar
           # too, so the repository itself can stay a clean baseline.
           ( cd "$SESSIONS_DIR" && tar -czf - workspace-snapshots state tasks sessions 2>/dev/null ) \
-            | split -b 90m - "$OUT/targets.tar.gz." \
+            | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
             || echo "::warning::target workspace package failed"
-          if [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+          SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
+          TZ=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c)
+          ENV_N=$(ls "$OUT"/env.tar.gz.* 2>/dev/null | wc -l)
+          TGT_N=$(ls "$OUT"/targets.tar.gz.* 2>/dev/null | wc -l)
+          ENV_SHA=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
+          TGT_SHA=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
+          # ROUND 35：只有当 **env 页真的存在** 时才进入「删旧资产 + 上传」分支。否则打包失败
+          # 会把上一代好包删掉（manifest 本身也会让目录非空，所以这里不能用"目录非空"当判据）。
+          if ls "$OUT"/env.tar.gz.* >/dev/null 2>&1; then
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
               || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
                    --notes "Whole-\$HOME environment + target workspace packages; replaced every run." >/dev/null 2>&1
-            # Delete every previous volume (old 'home.*' and new names) so only the latest
-            # environment survives.
+            # Delete every previous volume AND the previous manifest (old 'home.*' and new
+            # names) so only the latest generation survives.
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-              | grep -E '^(env|home|targets)\.tar\.gz(\.|$)' \
+              | grep -E '^(env|home|targets)\.tar\.gz(\.|$)|^meta\.json$' \
               | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
             if gh release upload "$ENV_TAG" "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-              SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
-              TZ=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c)
-              echo "environment package uploaded: $(ls "$OUT"/env.tar.gz.* | wc -l) volume(s), $SZ bytes"
-              echo "target workspace package uploaded: $(ls "$OUT"/targets.tar.gz.* | wc -l) volume(s), $TZ bytes"
+              # ROUND 35：manifest（体积/页数/sha256）。只在**页上传成功之后**才写并上传 ⇒
+              # 它的存在即代表页是完整的；读侧据它检测"下载不全"并拒绝半套应用。它缺失时读侧
+              # 退回旧的无校验直解（降级读），所以旧包/漏传都不会把流程堵死。
+              jq -n --arg tag "$ENV_TAG" --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
+                    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
+                    --argjson env_bytes "${SZ:-0}" --argjson targets_bytes "${TZ:-0}" \
+                    --argjson env_volumes "${ENV_N:-0}" --argjson targets_volumes "${TGT_N:-0}" \
+                    --arg env_sha "$ENV_SHA" --arg targets_sha "$TGT_SHA" \
+                    '{version:2, tag:$tag, run_id:$run, commit:$commit, created_at:$at, split_size:$split,
+                      env:{volumes:$env_volumes, bytes:$env_bytes, sha256:$env_sha},
+                      targets:{volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha}}' \
+                    > "$OUT/meta.json" 2>/dev/null
+              if [ -s "$OUT/meta.json" ]; then
+                gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
+                  || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
+              else
+                echo "::warning::failed to build meta.json (readers will fall back to unverified extract)"
+              fi
+              echo "environment package uploaded: $ENV_N volume(s), $SZ bytes"
+              echo "target workspace package uploaded: $TGT_N volume(s), $TZ bytes"
+              echo "package manifest: split=$SPLIT_SIZE env=$ENV_N vol targets=$TGT_N vol"
             else
               echo "::warning::failed to upload packages to release"
             fi
