@@ -421,6 +421,7 @@ jobs:
             --exclude='./.cache' \
             --exclude='./.opencode/bin' \
             --exclude='./.opencode/tg.env' \
+            --exclude='./.opencode/tg-bot*.env' \
             --exclude='./.config/opencode/tg.env' \
             --exclude='./.config/opencode/tg-bot*.env' \
             --exclude='./.ssh' \
