@@ -533,7 +533,9 @@ jobs:
           for pat in "pinject delivered" "pinject failed" "inject failed" "getUpdates failed" "loop stopped" "sendMessage chunked ok" "free tier" "instance registered" "turnActuallyIdle" "loop skip" "loopskip"; do
             echo "diag '$pat' = $(grep -c -- "$pat" "$RUN_LOG" 2>/dev/null || echo 0)"
           done
-          if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+          # R213：143（SIGTERM 收尾，插件端 endRunNow 的 TERM 路径）同样视为“已受控结束=成功”，
+          # 与 124/137 一并白名单，确保 END-ROUND-CI 一定能走到 relay；真崩溃（其他非零）仍不接力。
+          if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ] || [ "$RC" -eq 143 ]; then
             echo "opencode hit the time budget; treated as success so the loop continues."
             exit 0
           fi
