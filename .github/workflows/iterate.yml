@@ -53,14 +53,21 @@ jobs:
       - name: Install GitHub CLI and configure git
         run: |
           set -euo pipefail
-          sudo mkdir -p -m 755 /etc/apt/keyrings
-          key=$(mktemp)
-          wget -nv -O"$key" https://cli.github.com/packages/githubcli-archive-keyring.gpg
-          sudo install -m 0644 "$key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
-          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-          sudo apt-get update -y
-          sudo apt-get install -y gh
+          # R341: ubuntu-latest ships gh (measured 2.102.0); the apt dance below only
+          # exists for images without it. Measured cost when needlessly run: ~8s of
+          # `apt-get update` on every boot. Keep the installer as the fallback path.
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo mkdir -p -m 755 /etc/apt/keyrings
+            key=$(mktemp)
+            wget -nv -O"$key" https://cli.github.com/packages/githubcli-archive-keyring.gpg
+            sudo install -m 0644 "$key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+          else
+            echo "gh already installed: $(gh --version | head -1)"
+          fi
           gh auth setup-git
           git config --global user.name "opencode-ci"
           git config --global user.email "opencode-ci@users.noreply.github.com"
@@ -106,7 +113,9 @@ jobs:
           tgt_try() {
             local tag="$1" dl="/tmp/tgdl-$1" vols pages bytes expect hdr tflag
             rm -rf "$dl" && mkdir -p "$dl"
-            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'targets.tar.gz*' --dir "$dl" --clobber >/dev/null 2>&1 || return 1
+            # R341: parallel multi-range fetch; the helper itself falls back to
+            # plain single-stream `gh release download` on any internal failure.
+            bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'targets.tar.gz*' "$dl" || return 1
             ls "$dl"/targets.tar.gz* >/dev/null 2>&1 || return 1
             gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
             vols=$(ls "$dl"/targets.tar.gz* 2>/dev/null | sort -V)
@@ -137,7 +146,7 @@ jobs:
           tgt_try_staged() {
             local tag="$1" dl="/tmp/tgdl-$1-staged" vols pages bytes expect hdr tflag
             rm -rf "$dl" && mkdir -p "$dl"
-            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-targets.tar.gz*' --dir "$dl" --clobber >/dev/null 2>&1 || return 1
+            bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'stage-targets.tar.gz*' "$dl" || return 1
             ls "$dl"/stage-targets.tar.gz* >/dev/null 2>&1 || return 1
             gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
             expect=$(jq -r '.targets.bytes // empty' "$dl/stage-meta.json" 2>/dev/null || true)
@@ -282,7 +291,7 @@ jobs:
           env_try() {
             local tag="$1" dl="/tmp/envdl-$1" vols pages bytes expect hdr tflag
             rm -rf "$dl" && mkdir -p "$dl"
-            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'env.tar.gz*' --dir "$dl" --clobber >/dev/null 2>&1 || return 1
+            bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'env.tar.gz*' "$dl" || return 1
             ls "$dl"/env.tar.gz* >/dev/null 2>&1 || return 1
             gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
             vols=$(ls "$dl"/env.tar.gz* 2>/dev/null | sort -V)
@@ -316,7 +325,7 @@ jobs:
           env_try_staged() {
             local tag="$1" dl="/tmp/envdl-$1-staged" vols pages bytes expect hdr tflag
             rm -rf "$dl" && mkdir -p "$dl"
-            gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-env.tar.gz*' --dir "$dl" --clobber >/dev/null 2>&1 || return 1
+            bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'stage-env.tar.gz*' "$dl" || return 1
             ls "$dl"/stage-env.tar.gz* >/dev/null 2>&1 || return 1
             gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
             expect=$(jq -r '.env.bytes // empty' "$dl/stage-meta.json" 2>/dev/null || true)
@@ -784,6 +793,15 @@ jobs:
           done
           OUT=/tmp/envsnap
           rm -rf "$OUT" && mkdir -p "$OUT"
+          # R341 (non-agent time): pack with parallel gzip when available. pigz output
+          # is a standard multi-member gzip stream, so every reader (this workflow's
+          # magic-detection + `tar -xz`) stays dependency-free; fall back to gzip -6.
+          # Measured on a 1.4GB target package: gzip 31.3s -> pigz -p4 12.4s.
+          if command -v pigz >/dev/null 2>&1; then
+            TAR_COMP=(tar -I 'pigz -p4' -cf -)
+          else
+            TAR_COMP=(tar -czf -)
+          fi
           # ROUND 278（「快照优化」— save 侧）：run-end env-sync 把**终态**推到 env-sync
           # 分支；成功且能取到旧 meta（其 env 段仍与保留的 release env 卷吻合）时跳过全量
           # env 打包（本次最大单项 ~1m45s）。失败/取不到旧 meta 一律回退全量打包（保守）。
@@ -815,7 +833,7 @@ jobs:
             fi
           fi
           if [ "$SKIP_ENV_PACK" != 1 ]; then
-          tar -czf - -C "$HOME" \
+          "${TAR_COMP[@]}" -C "$HOME" \
             --exclude='./work' \
             --exclude='./.cache' \
             --exclude='./.opencode/bin' \
@@ -842,7 +860,7 @@ jobs:
           # ROUND 69: include loop-state.md — it is the canonical round history and lives
           # at the repo root (env excludes ./work, targets packed only the 4 dirs), so it
           # was the one record NOT backed up in the release. A repo reset would lose it.
-          ( cd "$SESSIONS_DIR" && tar -czf - workspace-snapshots state tasks sessions loop-state.md 2>/dev/null ) \
+          ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" workspace-snapshots state tasks sessions loop-state.md 2>/dev/null ) \
             | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
             || echo "::warning::target workspace package failed"
           SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
