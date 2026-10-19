@@ -201,6 +201,42 @@ jobs:
           fi
           INDEX="$SESSIONS_DIR/workspace-snapshots/index.json"
           [ -f "$INDEX" ] || exit 0
+          # R342（Stage C：目录直存快照）：targets 包现在直接携带目标工作区**整目录**
+          # （tar 根下 <name>，含 .git），解包后落在 $SESSIONS_DIR/<name>；同文件系统
+          # mv 瞬时完成。旧格式（bundle 克隆）实测 1.4GB 包 CPU 密集约 72s，是本步最大
+          # 单项；目录直存恢复实测约 11s，且还原度更高（含未跟踪/被忽略文件、stash ref）。
+          while IFS= read -r snap_name; do
+            [ -n "$snap_name" ] || continue
+            if [ -d "$SESSIONS_DIR/$snap_name/.git" ] && [ ! -e "$TARGETS_DIR/$snap_name" ]; then
+              mv "$SESSIONS_DIR/$snap_name" "$TARGETS_DIR/$snap_name" \
+                && echo "target workspace $snap_name restored from its directory snapshot"
+            fi
+          done < <(jq -r '.snapshots[]? | select(.mode == "dirtar") | .dir // empty' "$INDEX" 2>/dev/null)
+          # R342（records 独立资产，每轮刷新）：targets 包内嵌一份 records（兼容旧读侧），
+          # 另有独立 records 资产——targets 内容未变时会被原样沿用，records 却必须每轮
+          # 更新。这里优先覆盖为独立资产的最新副本：先解到临时目录并验证完整，再替换；
+          # 任何失败都保留包内嵌副本，绝不半途清空记录。
+          RDL=/tmp/rec-dl; rm -rf "$RDL"; mkdir -p "$RDL"
+          if bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$ENV_TAG" 'records.tar.gz*' "$RDL" 2>/dev/null \
+             && ls "$RDL"/records.tar.gz* >/dev/null 2>&1; then
+            gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$RDL" --clobber >/dev/null 2>&1 || true
+            REXP=$(jq -r '.records.bytes // empty' "$RDL/meta.json" 2>/dev/null || true)
+            RVOLS=$(ls "$RDL"/records.tar.gz* 2>/dev/null | sort -V)
+            RBYTES=$(cat $RVOLS 2>/dev/null | wc -c)
+            if [ -n "$REXP" ] && [ "$RBYTES" = "$REXP" ]; then
+              RX=/tmp/rec-x; rm -rf "$RX"; mkdir -p "$RX"
+              if cat $RVOLS | tar -xzf - -C "$RX" 2>/dev/null \
+                 && [ -d "$RX/state" ] && [ -d "$RX/tasks" ] && [ -d "$RX/sessions" ]; then
+                rm -rf "$SESSIONS_DIR/state" "$SESSIONS_DIR/tasks" "$SESSIONS_DIR/sessions" "$SESSIONS_DIR/loop-state.md"
+                cp -a "$RX"/. "$SESSIONS_DIR"/ 2>/dev/null
+                echo "records overlaid from the standalone records asset ($RBYTES bytes)"
+              else
+                echo "::warning::records asset incomplete (state/tasks/sessions missing); keeping the embedded copy"
+              fi
+            else
+              echo "::warning::records asset unverified (bytes=$RBYTES expect=${REXP:-none}); keeping the embedded copy"
+            fi
+          fi
           COUNT=$(jq '.snapshots | length' "$INDEX")
           for i in $(seq 0 $((COUNT - 1))); do
             dir=$(jq -r ".snapshots[$i].dir // empty" "$INDEX")
@@ -664,60 +700,58 @@ jobs:
           mkdir -p "$SNAP"
           INDEX="$SNAP/index.json"
           [ -f "$INDEX" ] || echo '{"snapshots": []}' > "$INDEX"
+          # R342：清掉旧格式（bundle/worktree）解包残留——新格式的 workspace-snapshots/
+          # 只应有 index.json；任何子目录都是上一代旧包的遗留物，必须删掉以免被打进新包。
+          find "$SNAP" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
           shopt -s nullglob
           for target_dir in "$TARGETS_DIR"/*/; do
             repo_dir="${target_dir%/}"
             [ -d "$repo_dir/.git" ] || continue
             name=$(basename "$repo_dir")
             snap_dir="$SNAP/$name"
+            # R342（Stage C）：目标工作区不再转 bundle，而是整目录留在原地、由 Snapshot
+            # 步直接打进 targets 包（解包=还原，实测 11s vs bundle 克隆 72s）。这里只做：
+            # 清掉旧代解包残留的 bundle 目录、把未提交状态固化成 stash、写 index 元数据
+            # （含内容指纹 fp，供「未变则沿用」判定）。旧格式残留必须删除，否则会被打包。
             rm -rf "$snap_dir"
-            mkdir -p "$snap_dir"
 
             STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
             if [ -n "$STASH_HASH" ]; then
               git -C "$repo_dir" stash store -m "snapshot" "$STASH_HASH" 2>/dev/null || true
             fi
 
-            # R203（D6）：shallow 仓（`--depth N` 克隆出来的目标工作区）先把历史补全，否则
-            # `git bundle create` 造出的包**无法独立克隆**（缺前置对象）。best-effort：
-            # 远端不可达就保持原样（还原步已有远端兜底）。只动对象库，不碰工作区/分支。
+            # R203（D6）：shallow 仓先把历史补全（保持历来行为；目录快照本身不要求可独立
+            # 克隆，但补全后各代还原的工作区历史一致）。best-effort：远端不可达就保持原样。
             if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
               git -C "$repo_dir" fetch --unshallow --tags >/dev/null 2>&1 \
-                || echo "::warning::unshallow failed for $name (snapshot bundle may not be standalone-cloneable)"
+                || echo "::warning::unshallow failed for $name (the directory snapshot keeps the shallow history)"
             fi
 
-            BUNDLE_ARGS="--branches --tags HEAD"
-            if git -C "$repo_dir" rev-parse --verify refs/stash >/dev/null 2>&1; then
-              BUNDLE_ARGS="$BUNDLE_ARGS refs/stash"
-            fi
-            if ! git -C "$repo_dir" bundle create "$snap_dir/git.bundle" $BUNDLE_ARGS; then
-              echo "::warning::bundle create failed for $name"
-              rm -rf "$snap_dir"
-              continue
-            fi
-
-            if ! workferry pack --dir "$repo_dir" "$snap_dir/worktree.tar.gz"; then
-              echo "::warning::workferry pack failed for $name"
-            fi
-            # R203：pack 对**无变更**的干净仓不产出文件（打印「没有检测到任何变更」）⇒
-            # index 里把 worktree 记为空，还原步据此静默跳过（消除误导告警）。
-            PACKED_WT="workspace-snapshots/$name/worktree.tar.gz"
-            [ -f "$snap_dir/worktree.tar.gz" ] || PACKED_WT=""
+            # R342（内容指纹）：「未变则沿用 targets」的判据 = HEAD/分支/全部 refs/worktree
+            # 文件内容。实测 proxyip（7373 文件，~0.3GB 工作树）0.36s。刻意排除 .git 内部
+            # 细节（reflog/pack 布局，属过程产物）与 refs/stash（每次 save 都会新生成）。
+            FP=$( {
+              printf 'head=%s\n' "$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null)"
+              printf 'branch=%s\n' "$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null)"
+              printf 'refs=%s\n' "$(git -C "$repo_dir" for-each-ref --format='%(refname) %(objectname)' 2>/dev/null | sort | sha256sum | cut -d' ' -f1)"
+              printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
+            } | sha256sum | cut -d' ' -f1 )
 
             BRANCH=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || true)
             COMMIT=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)
             REMOTE=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
             SAVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+            # bundle/worktree 留空仅为旧读侧兼容（旧读侧 clone 空路径失败后会走远端克隆兜底）。
             ENTRY=$(jq -n \
               --arg repo "$REMOTE" \
               --arg dir "$name" \
-              --arg bundle "workspace-snapshots/$name/git.bundle" \
-              --arg worktree "$PACKED_WT" \
+              --arg mode "dirtar" \
+              --arg fp "$FP" \
               --arg branch "$BRANCH" \
               --arg commit "$COMMIT" \
               --arg saved_at "$SAVED_AT" \
-              '{repo: $repo, dir: $dir, bundle: $bundle, worktree: $worktree, branch: $branch, commit: $commit, saved_at: $saved_at}')
+              '{repo: $repo, dir: $dir, mode: $mode, fp: $fp, bundle: "", worktree: "", branch: $branch, commit: $commit, saved_at: $saved_at}')
 
             tmp=$(mktemp)
             jq --arg dir "$name" '.snapshots |= map(select(.dir != $dir))' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
@@ -855,20 +889,63 @@ jobs:
             . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." \
             || echo "::warning::environment package failed"
           fi
-          # Package the repo's runtime dirs (target workspace bundles etc.) as a whole tar
-          # too, so the repository itself can stay a clean baseline.
-          # ROUND 69: include loop-state.md — it is the canonical round history and lives
-          # at the repo root (env excludes ./work, targets packed only the 4 dirs), so it
-          # was the one record NOT backed up in the release. A repo reset would lose it.
-          ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" workspace-snapshots state tasks sessions loop-state.md 2>/dev/null ) \
-            | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
-            || echo "::warning::target workspace package failed"
+          # R342（records 独立资产，Stage B）：records 很小但每轮都变；targets 很大但内容
+          # 可以不变。独立打包 records ⇒ targets 未变时只换 records（~2MB），跳过 ~1.4GB
+          # 的暂存+正式双上传。targets 包内仍内嵌一份 records（兼容旧读侧；未变轮次里它
+          # 可能略旧，新读侧会用独立资产覆盖）。
+          REC_OK=0
+          ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" state tasks sessions loop-state.md 2>/dev/null ) \
+            | split -b "$SPLIT_SIZE" - "$OUT/records.tar.gz." \
+            && ls "$OUT"/records.tar.gz.* >/dev/null 2>&1 && REC_OK=1 \
+            || echo "::warning::records package failed; readers will use the copy embedded in the targets package"
+          # R342：聚合内容指纹（来自 Save 步写入的 index.json）——只有全部快照都是新格式
+          # 且带指纹时才允许「未变沿用」，否则一律重传（保守）。
+          TGT_FP=""; TGT_MODE=""
+          IDX="$SESSIONS_DIR/workspace-snapshots/index.json"
+          if [ -s "$IDX" ]; then
+            _tn=$(jq -r '[.snapshots[]?] | length' "$IDX" 2>/dev/null || echo 0)
+            _bad=$(jq -r '[.snapshots[]? | select((.mode // "") != "dirtar" or ((.fp // "") | length) == 0)] | length' "$IDX" 2>/dev/null || echo 1)
+            if [ "${_tn:-0}" -gt 0 ] 2>/dev/null && [ "${_bad:-1}" = "0" ]; then
+              TGT_MODE="dirtar"
+              TGT_FP=$(jq -r '[.snapshots[] | .dir + "=" + .fp] | sort | join("\n")' "$IDX" | sha256sum | cut -d' ' -f1)
+            fi
+          fi
+          # R342（未变沿用判定）：上一代 meta 与 release 现状都要自洽才可信——格式/指纹
+          # 一致、records 包已生成、且 release 里的 targets 页数与上一代 meta 相符。
+          CARRY=0
+          if [ "$SKIP_ENV_PACK" = 1 ] && [ "$REC_OK" = 1 ] && [ -n "$TGT_FP" ] && [ -f "$OUT/meta.env-carry.json" ] \
+            && [ "$(jq -r '.targets.mode // empty' "$OUT/meta.env-carry.json" 2>/dev/null)" = "dirtar" ] \
+            && [ "$(jq -r '.targets.fp // empty' "$OUT/meta.env-carry.json" 2>/dev/null)" = "$TGT_FP" ]; then
+            _prev_n=$(jq -r '.targets.volumes // 0' "$OUT/meta.env-carry.json" 2>/dev/null || echo 0)
+            _have_n=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '[.assets[].name | select(test("^targets\\.tar\\.gz"))] | length' 2>/dev/null || echo 0)
+            if [ "${_prev_n:-0}" -gt 0 ] 2>/dev/null && [ "${_prev_n:-0}" = "${_have_n:-0}" ]; then
+              CARRY=1
+              echo "targets unchanged (fingerprint match, $_have_n page(s)); carrying the previous targets package"
+            else
+              echo "::warning::targets fingerprint matches but the release has ${_have_n:-0} of ${_prev_n:-0} page(s); re-uploading targets"
+            fi
+          fi
+          # R342（Stage C）：目标工作区以目录直存随 targets 包同行（tar 根下 <name>，排除
+          # 运行态文件锁）；只打包真正的 git 工作区（跳过 data/.github 等辅助目录）。
+          # 沿用轮次（CARRY=1）跳过打包，省 ~15s。
+          if [ "$CARRY" != 1 ]; then
+            TGT_DIRS=()
+            for d in "$TARGETS_DIR"/*/; do
+              [ -d "${d%/}/.git" ] && TGT_DIRS+=("$(basename "$d")")
+            done
+            ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
+              | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
+              || echo "::warning::target workspace package failed"
+          fi
           SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
           TZ=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c)
           ENV_N=$(ls "$OUT"/env.tar.gz.* 2>/dev/null | wc -l)
           TGT_N=$(ls "$OUT"/targets.tar.gz.* 2>/dev/null | wc -l)
           ENV_SHA=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
           TGT_SHA=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
+          REC_SZ=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c)
+          REC_N=$(ls "$OUT"/records.tar.gz.* 2>/dev/null | wc -l)
+          REC_SHA=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
           # ROUND 35：只有当 **env 页真的存在** 时才进入「删旧资产 + 上传」分支。否则打包失败
           # 会把上一代好包删掉（manifest 本身也会让目录非空，所以这里不能用"目录非空"当判据）。
           if ls "$OUT"/env.tar.gz.* >/dev/null 2>&1; then
@@ -888,12 +965,16 @@ jobs:
                   --argjson env_bytes "${SZ:-0}" --argjson targets_bytes "${TZ:-0}" \
                   --argjson env_volumes "${ENV_N:-0}" --argjson targets_volumes "${TGT_N:-0}" \
                   --arg env_sha "$ENV_SHA" --arg targets_sha "$TGT_SHA" \
+                  --argjson records_bytes "${REC_SZ:-0}" --argjson records_volumes "${REC_N:-0}" \
+                  --arg records_sha "$REC_SHA" --argjson rec_ok "${REC_OK:-0}" \
+                  --arg tgt_mode "$TGT_MODE" --arg tgt_fp "$TGT_FP" \
                   '{version:2, tag:$tag, run_id:$run, commit:$commit, created_at:$at, split_size:$split,
                     env:{volumes:$env_volumes, bytes:$env_bytes, sha256:$env_sha},
-                    targets:{volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha}}' \
+                    targets:{volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha, mode:$tgt_mode, fp:$tgt_fp}}
+                   | (if $rec_ok==1 then .records={volumes:$records_volumes, bytes:$records_bytes, sha256:$records_sha} else . end)' \
                   > "$OUT/meta.json" 2>/dev/null
             mkdir -p "$OUT/stage"
-            for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT/meta.json"; do
+            for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.* "$OUT/meta.json"; do
               [ -f "$f" ] || continue
               cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
             done
@@ -916,9 +997,13 @@ jobs:
             if [ "$stage_ok" -eq 1 ]; then
               # 旧代删除（正则与读侧 glob 都不匹配 stage-*，故暂存副本安全）
               gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-                | grep -E '^(env|home|targets)\.tar\.gz(\.|$)|^meta\.json$' \
+                | grep -E '^(env|home|targets|records)\.tar\.gz(\.|$)|^meta\.json$' \
                 | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
-              if gh release upload "$ENV_TAG" "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+              UPF=()
+              for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.*; do
+                [ -f "$f" ] && UPF+=("$f")
+              done
+              if gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
                 # ROUND 35：manifest 最后上传 ⇒ 它的存在即代表页是完整的；读侧据它检测
                 # "下载不全"并拒绝半套应用；缺失时读侧退回无校验直解（降级读）。
                 if [ -s "$OUT/meta.json" ]; then
@@ -938,27 +1023,39 @@ jobs:
                   && echo "staged copy removed: $(basename "$f")"
               done
             fi
-          elif [ "$SKIP_ENV_PACK" = 1 ] && ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; then
+          elif [ "$SKIP_ENV_PACK" = 1 ] \
+            && { [ "${CARRY:-0}" = 1 ] || ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; }; then
             # ROUND 278：env 由 env-sync 分支承担 ⇒ 本次**仅**原子换装 targets 包；
             # release 里的旧 env 卷**保留**为回退源（env_try 仍按其尺寸校验）。新 meta
             # 沿用旧 meta 的 env 段并打 .env.carried=true（读侧据此让位给分支）。
+            # R342：records（每轮必新）+ targets（内容未变则沿用，跳过 ~1.4GB 双上传）。
             if [ -f "$OUT/meta.env-carry.json" ] \
               && jq --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
                  --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
                  --argjson targets_bytes "${TZ:-0}" --argjson targets_volumes "${TGT_N:-0}" \
                  --arg targets_sha "$TGT_SHA" \
+                 --argjson carry "${CARRY:-0}" --arg tgt_mode "$TGT_MODE" --arg tgt_fp "$TGT_FP" \
+                 --argjson rec_ok "${REC_OK:-0}" --argjson records_bytes "${REC_SZ:-0}" \
+                 --argjson records_volumes "${REC_N:-0}" --arg records_sha "$REC_SHA" \
                  '.env.packed_at=(.env.packed_at // .env.carried_at // .created_at) |
                   .env.carried_at=$at |
                   .env.carried=true |
                   .created_at=$at | .run_id=$run | .commit=$commit | .split_size=$split |
-                  .targets={volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha}' \
+                  .targets=(if $carry==1 then (.targets + {carried_at:$at, carried:true}) else {volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha, mode:$tgt_mode, fp:$tgt_fp} end) |
+                  (if $rec_ok==1 then .records={volumes:$records_volumes, bytes:$records_bytes, sha256:$records_sha} else del(.records) end)' \
                  "$OUT/meta.env-carry.json" > "$OUT/meta.json" 2>/dev/null \
               && [ -s "$OUT/meta.json" ] && jq -e '(.env.bytes // 0) > 0' "$OUT/meta.json" >/dev/null 2>&1; then
               mkdir -p "$OUT/stage"
-              for f in "$OUT"/targets.tar.gz.* "$OUT/meta.json"; do
+              for f in "$OUT"/records.tar.gz.* "$OUT/meta.json"; do
                 [ -f "$f" ] || continue
                 cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
               done
+              if [ "${CARRY:-0}" != 1 ]; then
+                for f in "$OUT"/targets.tar.gz.*; do
+                  [ -f "$f" ] || continue
+                  cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
+                done
+              fi
               stage_ok=0
               if gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
                 stage_ok=1
@@ -976,18 +1073,38 @@ jobs:
                 echo "::warning::staged upload failed; the previous packages are left untouched"
               fi
               if [ "$stage_ok" -eq 1 ]; then
+                if [ "${CARRY:-0}" = 1 ]; then
+                  DELPAT='^records\.tar\.gz(\.|$)|^meta\.json$'
+                else
+                  DELPAT='^records\.tar\.gz(\.|$)|^targets\.tar\.gz(\.|$)|^meta\.json$'
+                fi
                 gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-                  | grep -E '^targets\.tar\.gz(\.|$)|^meta\.json$' \
+                  | grep -E "$DELPAT" \
                   | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
-                if gh release upload "$ENV_TAG" "$OUT"/targets.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+                UPF=()
+                for f in "$OUT"/records.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
+                if [ "${CARRY:-0}" != 1 ]; then
+                  for f in "$OUT"/targets.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
+                fi
+                up_ok=1
+                if [ "${#UPF[@]}" -gt 0 ]; then
+                  gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 || up_ok=0
+                else
+                  up_ok=0
+                fi
+                if [ "$up_ok" = 1 ]; then
                   if [ -s "$OUT/meta.json" ]; then
                     gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
                       || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
                   fi
-                  echo "target workspace package updated (env from env-sync branch; retained release env kept as fallback)"
-                  echo "package manifest: split=$SPLIT_SIZE env=carried targets=$TGT_N vol"
+                  if [ "${CARRY:-0}" = 1 ]; then
+                    echo "target workspace package carried (unchanged); records refreshed"
+                  else
+                    echo "target workspace package updated (env from env-sync branch; retained release env kept as fallback)"
+                  fi
+                  echo "package manifest: split=$SPLIT_SIZE env=carried targets=$TGT_N vol carry=${CARRY:-0} records=$REC_N vol"
                 else
-                  echo "::warning::failed to upload targets package to release"
+                  echo "::warning::failed to upload targets/records packages to release"
                 fi
                 for f in "$OUT"/stage/stage-*; do
                   gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
