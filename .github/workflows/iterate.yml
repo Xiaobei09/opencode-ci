@@ -19,10 +19,10 @@ on:
         required: false
         default: false
       split_size:
-        description: Max bytes per release asset when paging the packages (GitHub allows up to 2GiB per asset; e.g. 1500m, 1900m, 512m, 90m)
+        description: Max bytes per release asset when paging the packages (GitHub allows up to 2GiB per asset; smaller pages upload in parallel — default 256m, e.g. 1500m for single-stream)
         type: string
         required: false
-        default: "1500m"
+        default: "256m"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -802,11 +802,12 @@ jobs:
           # persisted elsewhere and the latter would recurse), the opencode binary,
           # server logs and secrets.
           ENV_TAG="env"
-          # ROUND 35（运营者指令）：分页大小改为**按「支持的单个资产上限」取大**。
-          # GitHub 每个 release 资产上限 2 GiB，旧值 90 MiB 会把 815 MB 的包切成 9 页
-          # （9 次上传/下载请求 + 9 次校验）；默认 1500m 让同样的包只占 1 页，仍明显低于上限。
+          # ROUND 35：分页大小按「支持的单个资产上限」取大（90m→1500m）曾把上传压成**单流**。
+          # R428 Stage D 基准（本 runner→GitHub release）：单流 27–33 MB/s、4 流 65 MB/s、
+          # 8 流 82 MB/s ⇒ 改为**小页 + 相位内并行**：默认 256m（targets ≈6 页），stage/真名
+          # 两相内各页并行（SNAP_UP_PAR 默认 8）。序列不变量（stage→校验→删旧→真名→meta→删stage）不变。
           # 可用 dispatch 输入 `split_size` 覆盖（relay 只传 resume ⇒ 用默认值）。
-          SPLIT_SIZE="${SPLIT_SIZE:-1500m}"
+          SPLIT_SIZE="${SPLIT_SIZE:-256m}"
           # Checkpoint the SQLite sessions DB first so the packaged copy is consistent.
           if command -v python3 >/dev/null 2>&1 && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
             python3 -c 'import sqlite3;c=sqlite3.connect("'"$HOME"'/.local/share/opencode/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
@@ -946,6 +947,21 @@ jobs:
           REC_SZ=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c)
           REC_N=$(ls "$OUT"/records.tar.gz.* 2>/dev/null | wc -l)
           REC_SHA=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
+          # ── R428 / Stage D：分页并行上传助手（有界并发）────────────────────────
+          # 依据：2026-10-19 基准（本 runner→GitHub release，256 MiB 定字节）：
+          #   单流 27–33 MB/s；4 流 65 MB/s；8 流 82 MB/s（≈2.5–3×）。
+          # 因此在**相位内**把分页资产并行上传；相位序不变：stage→校验→删旧→真名→meta→删stage。
+          # 每页一个 `gh release upload`（内部单流），并发 N ⇒ 聚合吞吐上台阶。
+          # 失败语义沿用原版：任一页失败 ⇒ 本相失败（stage 失败不动旧包；真名失败写 warning）；
+          # 每个调用点都保留单次全量 `gh release upload` 作为回退（并行助手失败时回落，仍是正确序）。
+          SNAP_UP_PAR="${SNAP_UP_PAR:-8}"
+          upload_par() {
+            local fail=0
+            [ "$#" -gt 0 ] || return 1
+            printf '%s\0' "$@" | xargs -0 -n1 -P"$SNAP_UP_PAR" bash -c \
+              'gh release upload "$0" "$3" --repo "$2" --clobber >/dev/null 2>&1' "$ENV_TAG" _ "$SESSIONS_REPO" || fail=1
+            return "$fail"
+          }
           # ROUND 35：只有当 **env 页真的存在** 时才进入「删旧资产 + 上传」分支。否则打包失败
           # 会把上一代好包删掉（manifest 本身也会让目录非空，所以这里不能用"目录非空"当判据）。
           if ls "$OUT"/env.tar.gz.* >/dev/null 2>&1; then
@@ -979,7 +995,7 @@ jobs:
               cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
             done
             stage_ok=0
-            if gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+            if upload_par "$OUT"/stage/* || gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
               stage_ok=1
               for f in "$OUT"/stage/stage-*; do
                 n=$(basename "$f"); l=$(stat -c%s "$f")
@@ -995,15 +1011,18 @@ jobs:
               echo "::warning::staged upload failed; the previous package is left untouched"
             fi
             if [ "$stage_ok" -eq 1 ]; then
-              # 旧代删除（正则与读侧 glob 都不匹配 stage-*，故暂存副本安全）
-              gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-                | grep -E '^(env|home|targets|records)\.tar\.gz(\.|$)|^meta\.json$' \
-                | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
+              # 旧代删除（正则与读侧 glob 都不匹配 stage-*，故暂存副本安全）；逐资产后台并行、wait 收口
+              mapfile -t DELOLD < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
+                | grep -E '^(env|home|targets|records)\.tar\.gz(\.|$)|^meta\.json$' || true)
+              for a in ${DELOLD[@]+"${DELOLD[@]}"}; do
+                gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 &
+              done
+              wait
               UPF=()
               for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.*; do
                 [ -f "$f" ] && UPF+=("$f")
               done
-              if gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+              if upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
                 # ROUND 35：manifest 最后上传 ⇒ 它的存在即代表页是完整的；读侧据它检测
                 # "下载不全"并拒绝半套应用；缺失时读侧退回无校验直解（降级读）。
                 if [ -s "$OUT/meta.json" ]; then
@@ -1020,8 +1039,9 @@ jobs:
               fi
               for f in "$OUT"/stage/stage-*; do
                 gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
-                  && echo "staged copy removed: $(basename "$f")"
+                  && echo "staged copy removed: $(basename "$f")" &
               done
+              wait
             fi
           elif [ "$SKIP_ENV_PACK" = 1 ] \
             && { [ "${CARRY:-0}" = 1 ] || ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; }; then
@@ -1057,7 +1077,7 @@ jobs:
                 done
               fi
               stage_ok=0
-              if gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+              if upload_par "$OUT"/stage/* || gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
                 stage_ok=1
                 for f in "$OUT"/stage/stage-*; do
                   n=$(basename "$f"); l=$(stat -c%s "$f")
@@ -1078,9 +1098,12 @@ jobs:
                 else
                   DELPAT='^records\.tar\.gz(\.|$)|^targets\.tar\.gz(\.|$)|^meta\.json$'
                 fi
-                gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-                  | grep -E "$DELPAT" \
-                  | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
+                mapfile -t DELOLD < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
+                  | grep -E "$DELPAT" || true)
+                for a in ${DELOLD[@]+"${DELOLD[@]}"}; do
+                  gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 &
+                done
+                wait
                 UPF=()
                 for f in "$OUT"/records.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
                 if [ "${CARRY:-0}" != 1 ]; then
@@ -1088,7 +1111,7 @@ jobs:
                 fi
                 up_ok=1
                 if [ "${#UPF[@]}" -gt 0 ]; then
-                  gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 || up_ok=0
+                  upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 || up_ok=0
                 else
                   up_ok=0
                 fi
@@ -1108,8 +1131,9 @@ jobs:
                 fi
                 for f in "$OUT"/stage/stage-*; do
                   gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
-                    && echo "staged copy removed: $(basename "$f")"
+                    && echo "staged copy removed: $(basename "$f")" &
                 done
+                wait
               fi
             else
               echo "::warning::meta rewrite failed; leaving the release untouched (targets stay previous generation)"
