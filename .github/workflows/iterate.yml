@@ -346,7 +346,73 @@ jobs:
             echo "::warning::$tag staged generation failed to extract ($pages page(s), $bytes bytes)"
             return 1
           }
-          if env_try "$ENV_TAG"; then
+          # ROUND 278（运营者「快照优化」— restore 侧）：env-sync 分支是**首选** env 源。
+          # 运行中插件每 5 分钟 + 保存步 run-end 推终态；校验「克隆/manifest/硬上限
+          # ENV_SYNC_MAX_AGE_MIN（默认 24h）/db 字节数」全过才应用，并与 release 比新鲜：
+          # release 的**实际打包时刻**（未携带⇒created_at；携带⇒env.packed_at）若晚于
+          # 分支 tip 则让位 release；否则取分支（两者中较新者）。任一不满足即整体回落
+          # 原 release 三层链（env → stage-env → env-safe → bootstrap），语义不变。
+          ENV_SYNC_MAX_AGE_MIN="${ENV_SYNC_MAX_AGE_MIN:-1440}"
+          env_sync_try() {
+            local repo="${SESSIONS_REPO:-Xiaobei09/opencode-sessions}"
+            local d="/tmp/envsync-restore" json epoch age dbfmt dbexp dbsz
+            local carried rel_at rel_epoch
+            rm -rf "$d" 2>/dev/null
+            if ! git clone --depth 1 --single-branch --branch env-sync \
+                  "https://github.com/$repo.git" "$d" >/dev/null 2>&1; then
+              echo "::warning::env-sync branch not available; using release packages"
+              return 1
+            fi
+            json="$d/env-sync.json"
+            if [ ! -s "$json" ] || [ ! -d "$d/payload/.config/opencode" ]; then
+              echo "::warning::env-sync payload missing or incomplete; using release packages"
+              return 1
+            fi
+            epoch=$(jq -r '.epoch // empty' "$json" 2>/dev/null || true)
+            case "$epoch" in (*[!0-9]*|'') echo "::warning::env-sync manifest epoch invalid; using release packages"; return 1;; esac
+            age=$(( ( $(date +%s) - epoch ) / 60 ))
+            if [ "$age" -gt "$ENV_SYNC_MAX_AGE_MIN" ]; then
+              echo "::warning::env-sync branch too old (${age}min > ${ENV_SYNC_MAX_AGE_MIN}min cap); using release packages"
+              return 1
+            fi
+            gh release download "$ENV_TAG" --repo "$repo" --pattern 'meta.json' --dir "$d" --clobber >/dev/null 2>&1 || true
+            if [ -s "$d/meta.json" ]; then
+              carried=$(jq -r '.env.carried // false' "$d/meta.json" 2>/dev/null || echo false)
+              if [ "$carried" = "true" ]; then
+                rel_at=$(jq -r '.env.packed_at // empty' "$d/meta.json" 2>/dev/null || true)
+              else
+                rel_at=$(jq -r '.created_at // empty' "$d/meta.json" 2>/dev/null || true)
+              fi
+              rel_epoch=$(date -u -d "$rel_at" +%s 2>/dev/null || true)
+              if [ -n "$rel_epoch" ] && [ "$rel_epoch" -gt "$epoch" ]; then
+                echo "::warning::release env (packed ${rel_at}) is newer than the branch tip; using release packages"
+                return 1
+              fi
+            fi
+            dbfmt=$(jq -r '.db_format // "raw"' "$json" 2>/dev/null || echo raw)
+            dbexp=$(jq -r '.db_bytes // 0' "$json" 2>/dev/null || echo 0)
+            case "$dbexp" in (*[!0-9]*) dbexp=0;; esac
+            if [ "$dbfmt" = "chunks" ]; then
+              cat "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
+                > "$d"/payload/.local/share/opencode/opencode.db 2>/dev/null || return 1
+              rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part 2>/dev/null
+            fi
+            dbsz=$(stat -c%s "$d/payload/.local/share/opencode/opencode.db" 2>/dev/null || echo 0)
+            if [ "${dbexp:-0}" -gt 0 ] && [ "$dbsz" != "$dbexp" ]; then
+              echo "::warning::env-sync db size mismatch (${dbsz} vs ${dbexp}); using release packages"
+              return 1
+            fi
+            if ! rsync -a "$d"/payload/ "$HOME"/ 2>/dev/null; then
+              echo "::warning::env-sync payload apply failed; using release packages"
+              return 1
+            fi
+            rm -rf "$d" 2>/dev/null
+            echo "environment restored from env-sync branch (age=${age}min, db=${dbfmt} ${dbsz} bytes)"
+            return 0
+          }
+          if env_sync_try; then
+            echo "environment source: env-sync"
+          elif env_try "$ENV_TAG"; then
             echo "environment source: $ENV_TAG"
           elif env_try_staged "$ENV_TAG"; then
             echo "::warning::primary env was mid-swap; restored the verified staged generation (skipped the stale env-safe)"
@@ -718,6 +784,37 @@ jobs:
           done
           OUT=/tmp/envsnap
           rm -rf "$OUT" && mkdir -p "$OUT"
+          # ROUND 278（「快照优化」— save 侧）：run-end env-sync 把**终态**推到 env-sync
+          # 分支；成功且能取到旧 meta（其 env 段仍与保留的 release env 卷吻合）时跳过全量
+          # env 打包（本次最大单项 ~1m45s）。失败/取不到旧 meta 一律回退全量打包（保守）。
+          # 两次尝试 + 20s 间隔，化解与插件 tick 的锁竞争。分支即 B 侧首选还原源；
+          # release env 卷保留为 size-verified 回退（不再每代刷新，由 .env.carried 标记）。
+          SKIP_ENV_PACK=0
+          if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
+            SYNC_OK=0
+            for a in 1 2; do
+              if ENV_SYNC_WHY=run-end ENV_SYNC_TIMEOUT=180 \
+                   timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >/dev/null 2>&1; then
+                SYNC_OK=1; break
+              fi
+              echo "::warning::run-end env-sync attempt $a did not complete; retrying"
+              sleep 20
+            done
+            if [ "$SYNC_OK" = 1 ]; then
+              echo "run-end env-sync pushed; the env-sync branch now holds the final state"
+              gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$OUT" --clobber >/dev/null 2>&1 || true
+              if [ -s "$OUT/meta.json" ] && jq -e '(.env.bytes // 0) > 0' "$OUT/meta.json" >/dev/null 2>&1; then
+                cp -f "$OUT/meta.json" "$OUT/meta.env-carry.json"
+                SKIP_ENV_PACK=1
+                echo "env pack skipped: carried the release env section; the branch is the primary env source"
+              else
+                echo "::warning::no usable previous meta.json to carry the env section; packing env anyway"
+              fi
+            else
+              echo "::warning::run-end env-sync failed; packing the env release as before"
+            fi
+          fi
+          if [ "$SKIP_ENV_PACK" != 1 ]; then
           tar -czf - -C "$HOME" \
             --exclude='./work' \
             --exclude='./.cache' \
@@ -739,6 +836,7 @@ jobs:
             --exclude='./.opencode/.v2lib-live' \
             . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." \
             || echo "::warning::environment package failed"
+          fi
           # Package the repo's runtime dirs (target workspace bundles etc.) as a whole tar
           # too, so the repository itself can stay a clean baseline.
           # ROUND 69: include loop-state.md — it is the canonical round history and lives
@@ -821,6 +919,65 @@ jobs:
                 gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
                   && echo "staged copy removed: $(basename "$f")"
               done
+            fi
+          elif [ "$SKIP_ENV_PACK" = 1 ] && ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; then
+            # ROUND 278：env 由 env-sync 分支承担 ⇒ 本次**仅**原子换装 targets 包；
+            # release 里的旧 env 卷**保留**为回退源（env_try 仍按其尺寸校验）。新 meta
+            # 沿用旧 meta 的 env 段并打 .env.carried=true（读侧据此让位给分支）。
+            if [ -f "$OUT/meta.env-carry.json" ] \
+              && jq --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
+                 --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
+                 --argjson targets_bytes "${TZ:-0}" --argjson targets_volumes "${TGT_N:-0}" \
+                 --arg targets_sha "$TGT_SHA" \
+                 '.env.packed_at=(.env.packed_at // .env.carried_at // .created_at) |
+                  .env.carried_at=$at |
+                  .env.carried=true |
+                  .created_at=$at | .run_id=$run | .commit=$commit | .split_size=$split |
+                  .targets={volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha}' \
+                 "$OUT/meta.env-carry.json" > "$OUT/meta.json" 2>/dev/null \
+              && [ -s "$OUT/meta.json" ] && jq -e '(.env.bytes // 0) > 0' "$OUT/meta.json" >/dev/null 2>&1; then
+              mkdir -p "$OUT/stage"
+              for f in "$OUT"/targets.tar.gz.* "$OUT/meta.json"; do
+                [ -f "$f" ] || continue
+                cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
+              done
+              stage_ok=0
+              if gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+                stage_ok=1
+                for f in "$OUT"/stage/stage-*; do
+                  n=$(basename "$f"); l=$(stat -c%s "$f")
+                  r=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq ".assets[] | select(.name==\"$n\") | .size")
+                  if [ "$l" = "$r" ]; then
+                    echo "staged ok $n = $l bytes"
+                  else
+                    stage_ok=0
+                    echo "::warning::staged size mismatch $n ($l vs $r)"
+                  fi
+                done
+              else
+                echo "::warning::staged upload failed; the previous packages are left untouched"
+              fi
+              if [ "$stage_ok" -eq 1 ]; then
+                gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
+                  | grep -E '^targets\.tar\.gz(\.|$)|^meta\.json$' \
+                  | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
+                if gh release upload "$ENV_TAG" "$OUT"/targets.tar.gz.* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+                  if [ -s "$OUT/meta.json" ]; then
+                    gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
+                      || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
+                  fi
+                  echo "target workspace package updated (env from env-sync branch; retained release env kept as fallback)"
+                  echo "package manifest: split=$SPLIT_SIZE env=carried targets=$TGT_N vol"
+                else
+                  echo "::warning::failed to upload targets package to release"
+                fi
+                for f in "$OUT"/stage/stage-*; do
+                  gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
+                    && echo "staged copy removed: $(basename "$f")"
+                done
+              fi
+            else
+              echo "::warning::meta rewrite failed; leaving the release untouched (targets stay previous generation)"
             fi
           else
             echo "::warning::environment package is empty"
