@@ -417,8 +417,10 @@ jobs:
           # is a standard multi-member gzip stream, so every reader (this workflow's
           # magic-detection + `tar -xz`) stays dependency-free; fall back to gzip -6.
           # Measured on a 1.4GB target package: gzip 31.3s -> pigz -p4 12.4s.
+          # R736: level 1 is still a normal gzip stream; local 460MB targets measured
+          # 1.9s/126MB vs level 6 2.56s/111MB (page-cached), so prefer speed here.
           if command -v pigz >/dev/null 2>&1; then
-            TAR_COMP=(tar -I 'pigz -p4' -cf -)
+            TAR_COMP=(tar -I 'pigz -1 -p4' -cf -)
           else
             TAR_COMP=(tar -czf -)
           fi
@@ -519,6 +521,7 @@ jobs:
           # 运行态文件锁）；只打包真正的 git 工作区（跳过 data/.github 等辅助目录）。
           # 沿用轮次（CARRY=1）跳过打包，省 ~15s。
           if [ "$CARRY" != 1 ]; then
+            TGT_PACK_T0=$(date +%s)
             TGT_DIRS=()
             SLIM_EXCLUDES=()
             for d in "$TARGETS_DIR"/*/; do
@@ -534,6 +537,8 @@ jobs:
             ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
               | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
               || echo "::warning::target workspace package failed"
+            # R736: sub-step timing makes the next run's <60s target auditable.
+            echo "snapshot timing: targets pack $(( $(date +%s) - TGT_PACK_T0 ))s, $(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c) bytes"
           fi
           SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
           TZ=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c)
