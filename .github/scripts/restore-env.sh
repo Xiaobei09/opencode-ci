@@ -278,4 +278,14 @@ for b in 3 4; do
     echo "::warning::TG_BOT${b}_TOKEN missing; bot$b will run without a token"
   fi
 done
-
+# R648：tar 不保留空目录，snapshot gitdir 的 refs/ 会在跨 run 还原时丢失；
+# 随后 native snapshot 把 gitdir 判成 unreadable，产生 rebuilding/failed capture 风暴。
+# 只给看起来像 gitdir 的二级目录补 refs/，不动对象/索引。
+snap_root="$HOME/.local/share/opencode/snapshot"
+if [ -d "$snap_root" ]; then
+  find "$snap_root" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | while IFS= read -r d; do
+    if [ -f "$d/HEAD" ] && [ -d "$d/objects" ]; then
+      mkdir -p "$d/refs"
+    fi
+  done
+fi
