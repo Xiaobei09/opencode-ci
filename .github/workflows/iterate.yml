@@ -77,7 +77,12 @@ jobs:
           set -euo pipefail
           if [ ! -d "$SESSIONS_DIR/.git" ]; then
             mkdir -p "$(dirname "$SESSIONS_DIR")"
-            gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR"
+            # R574（⑧）：只取 main 的最新一版（脚本/配置；记录由 records release 覆盖）。
+            # env-sync 分支由 restore-env 自己 `git clone --depth 1 --single-branch
+            # --branch env-sync` 拉，boot 阶段不需要整仓克隆。旧 `gh repo clone` 会把
+            # 214MB payload 工作树 + 34 个历史提交一起拉：K 代 3s → L 代 30s（链增长）。
+            # 实测 main 浅克隆 1.4s/576KB，pre 阶段省 ~28s。
+            gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR" -- --depth 1 --single-branch --branch main
           fi
           mkdir -p "$SESSIONS_DIR/state" "$SESSIONS_DIR/tasks" "$SESSIONS_DIR/sessions" "$SESSIONS_DIR/workspace-snapshots"
           [ -f "$SESSIONS_DIR/workspace-snapshots/index.json" ] || echo '{"snapshots": []}' > "$SESSIONS_DIR/workspace-snapshots/index.json"
