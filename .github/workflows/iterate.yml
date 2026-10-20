@@ -207,11 +207,55 @@ jobs:
           # 单项；目录直存恢复实测约 11s，且还原度更高（含未跟踪/被忽略文件、stash ref）。
           while IFS= read -r snap_name; do
             [ -n "$snap_name" ] || continue
-            if [ -d "$SESSIONS_DIR/$snap_name/.git" ] && [ ! -e "$TARGETS_DIR/$snap_name" ]; then
+            if [ -d "$SESSIONS_DIR/$snap_name" ] && [ ! -e "$TARGETS_DIR/$snap_name" ]; then
               mv "$SESSIONS_DIR/$snap_name" "$TARGETS_DIR/$snap_name" \
                 && echo "target workspace $snap_name restored from its directory snapshot"
             fi
-          done < <(jq -r '.snapshots[]? | select(.mode == "dirtar") | .dir // empty' "$INDEX" 2>/dev/null)
+          done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | .dir // empty' "$INDEX" 2>/dev/null)
+          # R573（slim targets 恢复）：包内只有工作树、没有 .git。按 index 的 repo/commit
+          # 做 depth-1 fetch（实测 proxyip 7.2s / PCB 1.3s，替代 1.58GB 历史包下载），
+          # 再 update-ref + reset --mixed：索引指向快照 commit，工作树文件保持原样
+          # （未提交修改直接是 unstaged），并创建 origin/<branch> 供下一代 slim 判定。
+          while IFS=$'\t' read -r snap_name snap_repo snap_branch snap_commit; do
+            [ -n "$snap_name" ] || continue
+            target_dir="$TARGETS_DIR/$snap_name"
+            [ -d "$target_dir" ] || continue
+            [ -e "$target_dir/.git" ] && continue
+            (
+              set +e
+              cd "$target_dir" || exit 0
+              git init -q 2>/dev/null || exit 0
+              git remote add origin "$snap_repo" 2>/dev/null \
+                || git remote set-url origin "$snap_repo" 2>/dev/null
+              ok=0
+              if [ -n "$snap_commit" ]; then
+                git fetch -q --depth=1 origin "$snap_commit" 2>/dev/null && ok=1
+              fi
+              if [ "$ok" != 1 ] && [ -n "$snap_branch" ]; then
+                git fetch -q --depth=1 origin "$snap_branch" 2>/dev/null \
+                  && git cat-file -e "$snap_commit^{commit}" 2>/dev/null && ok=1
+              fi
+              if [ "$ok" = 1 ]; then
+                if [ -n "$snap_branch" ]; then
+                  git update-ref "refs/heads/$snap_branch" "$snap_commit" 2>/dev/null
+                  git symbolic-ref HEAD "refs/heads/$snap_branch" 2>/dev/null
+                  git update-ref "refs/remotes/origin/$snap_branch" "$snap_commit" 2>/dev/null
+                else
+                  git update-ref --no-deref HEAD "$snap_commit" 2>/dev/null
+                fi
+                git reset -q --mixed 2>/dev/null
+                echo "target workspace $snap_name restored (slim worktree + depth-1 git at ${snap_commit:0:12})"
+              else
+                # 远端不可达时不能把工作区留成「无 .git」——下一代 Save 会因缺少
+                # TGT_DIRS 条目而把它漏出包。本地提交一次保住工作树，并让下一代
+                # 自动回退全量模式（HEAD 不在远端 ⇒ MODE=dirtar）。
+                git add -A 2>/dev/null
+                git -c user.name=opencode-ci -c user.email=opencode-ci@users.noreply.github.com \
+                  commit -q -m "slim restore fallback: remote fetch failed" 2>/dev/null
+                echo "::warning::slim target $snap_name remote fetch failed; kept worktree as a local commit (next snapshots use full mode)"
+              fi
+            )
+          done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | [.dir, .repo, .branch, .commit] | @tsv' "$INDEX" 2>/dev/null)
           # R342（records 独立资产，每轮刷新）：targets 包内嵌一份 records（兼容旧读侧），
           # 另有独立 records 资产——targets 内容未变时会被原样沿用，records 却必须每轮
           # 更新。这里优先覆盖为独立资产的最新副本：先解到临时目录并验证完整，再替换；
@@ -711,42 +755,56 @@ jobs:
             snap_dir="$SNAP/$name"
             # R342（Stage C）：目标工作区不再转 bundle，而是整目录留在原地、由 Snapshot
             # 步直接打进 targets 包（解包=还原，实测 11s vs bundle 克隆 72s）。这里只做：
-            # 清掉旧代解包残留的 bundle 目录、把未提交状态固化成 stash、写 index 元数据
-            # （含内容指纹 fp，供「未变则沿用」判定）。旧格式残留必须删除，否则会被打包。
+            # 清掉旧代解包残留的 bundle 目录、写 index 元数据（含内容指纹 fp，供「未变
+            # 则沿用」判定）。旧格式残留必须删除，否则会被打包。
             rm -rf "$snap_dir"
-
-            STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
-            if [ -n "$STASH_HASH" ]; then
-              git -C "$repo_dir" stash store -m "snapshot" "$STASH_HASH" 2>/dev/null || true
-            fi
-
-            # R203（D6）：shallow 仓先把历史补全（保持历来行为；目录快照本身不要求可独立
-            # 克隆，但补全后各代还原的工作区历史一致）。best-effort：远端不可达就保持原样。
-            if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
-              git -C "$repo_dir" fetch --unshallow --tags >/dev/null 2>&1 \
-                || echo "::warning::unshallow failed for $name (the directory snapshot keeps the shallow history)"
-            fi
-
-            # R342（内容指纹）：「未变则沿用 targets」的判据 = HEAD/分支/全部 refs/worktree
-            # 文件内容。实测 proxyip（7373 文件，~0.3GB 工作树）0.36s。刻意排除 .git 内部
-            # 细节（reflog/pack 布局，属过程产物）与 refs/stash（每次 save 都会新生成）。
-            FP=$( {
-              printf 'head=%s\n' "$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null)"
-              printf 'branch=%s\n' "$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null)"
-              printf 'refs=%s\n' "$(git -C "$repo_dir" for-each-ref --format='%(refname) %(objectname)' 2>/dev/null | sort | sha256sum | cut -d' ' -f1)"
-              printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
-            } | sha256sum | cut -d' ' -f1 )
 
             BRANCH=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || true)
             COMMIT=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)
             REMOTE=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
             SAVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+            # R573（slim targets）：HEAD 可从远端分支到达、无子模块、无未合并索引时，
+            # targets 包只携带工作树（不含 .git 历史），恢复侧按 commit 做 depth-1 fetch
+            # 重建 git 元数据。实测 proxyip .git=1.5GB 而工作树压缩包仅 33MB；这是
+            # 「每轮非 opencode 时间 <1 分钟」的最大单项（旧包 1.58GB，打包+双上传 38s）。
+            # 本地未推送提交/冲突/子模块一律回退全量 .git，避免丢状态。
+            MODE="dirtar"
+            if [ -n "$COMMIT" ] && [ -n "$BRANCH" ] && [ ! -f "$repo_dir/.gitmodules" ] \
+               && ! git -C "$repo_dir" ls-files -u 2>/dev/null | grep -q . \
+               && git -C "$repo_dir" branch -r --contains "$COMMIT" 2>/dev/null | grep -q .; then
+              MODE="dirtar-slim"
+            fi
+
+            # 全量模式保留旧行为：把未提交状态固化成 stash（.git 随包携带）。slim 不建
+            # stash：包内无 .git，stash 恢复时必然丢失；未提交内容已由工作树完整携带。
+            if [ "$MODE" = "dirtar" ]; then
+              STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
+              if [ -n "$STASH_HASH" ]; then
+                git -C "$repo_dir" stash store -m "snapshot" "$STASH_HASH" 2>/dev/null || true
+              fi
+            fi
+
+            # R573：不再 unshallow。slim 恢复的是 shallow 仓，若每代 Save 都补全历史，
+            # 1.5GB 会重新下载并回到包里，slim 优化即失效。需要历史时由代理按需
+            # `git fetch --deepen/--unshallow`；远端始终保有完整历史。
+
+            # R342/R573（内容指纹）：「未变则沿用 targets」只认 HEAD/分支/工作树文件内容。
+            # 刻意排除 .git 内部细节与**全部 refs**：refs/stash 每代 stash 必变，
+            # refs/remotes 随 fetch 漂移，tags 不影响工作树——旧实现把 refs 算进 fp，
+            # 导致每代都判定「已变」并重传 1.58GB（实测 K 代 Snapshot 65s 的主因）。
+            # 工作树哈希含未跟踪/被忽略文件，与 slim 包内容一一对应，跨恢复稳定。
+            FP=$( {
+              printf 'head=%s\n' "$COMMIT"
+              printf 'branch=%s\n' "$BRANCH"
+              printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
+            } | sha256sum | cut -d' ' -f1 )
+
             # bundle/worktree 留空仅为旧读侧兼容（旧读侧 clone 空路径失败后会走远端克隆兜底）。
             ENTRY=$(jq -n \
               --arg repo "$REMOTE" \
               --arg dir "$name" \
-              --arg mode "dirtar" \
+              --arg mode "$MODE" \
               --arg fp "$FP" \
               --arg branch "$BRANCH" \
               --arg commit "$COMMIT" \
@@ -905,9 +963,13 @@ jobs:
           IDX="$SESSIONS_DIR/workspace-snapshots/index.json"
           if [ -s "$IDX" ]; then
             _tn=$(jq -r '[.snapshots[]?] | length' "$IDX" 2>/dev/null || echo 0)
-            _bad=$(jq -r '[.snapshots[]? | select((.mode // "") != "dirtar" or ((.fp // "") | length) == 0)] | length' "$IDX" 2>/dev/null || echo 1)
+            _bad=$(jq -r '[.snapshots[]? | select((((.mode // "") | test("^dirtar")) | not) or ((.fp // "") | length) == 0)] | length' "$IDX" 2>/dev/null || echo 1)
             if [ "${_tn:-0}" -gt 0 ] 2>/dev/null && [ "${_bad:-1}" = "0" ]; then
-              TGT_MODE="dirtar"
+              _slim=$(jq -r '[.snapshots[]? | select(.mode == "dirtar-slim")] | length' "$IDX" 2>/dev/null || echo 0)
+              _full=$(jq -r '[.snapshots[]? | select(.mode == "dirtar")] | length' "$IDX" 2>/dev/null || echo 0)
+              if [ "${_slim:-0}" = "${_tn}" ]; then TGT_MODE="dirtar-slim"
+              elif [ "${_full:-0}" = "${_tn}" ]; then TGT_MODE="dirtar"
+              else TGT_MODE="mixed"; fi
               TGT_FP=$(jq -r '[.snapshots[] | .dir + "=" + .fp] | sort | join("\n")' "$IDX" | sha256sum | cut -d' ' -f1)
             fi
           fi
@@ -915,7 +977,7 @@ jobs:
           # 一致、records 包已生成、且 release 里的 targets 页数与上一代 meta 相符。
           CARRY=0
           if [ "$SKIP_ENV_PACK" = 1 ] && [ "$REC_OK" = 1 ] && [ -n "$TGT_FP" ] && [ -f "$OUT/meta.env-carry.json" ] \
-            && [ "$(jq -r '.targets.mode // empty' "$OUT/meta.env-carry.json" 2>/dev/null)" = "dirtar" ] \
+            && jq -e '(.targets.mode // "") | test("^(dirtar|mixed)")' "$OUT/meta.env-carry.json" >/dev/null 2>&1 \
             && [ "$(jq -r '.targets.fp // empty' "$OUT/meta.env-carry.json" 2>/dev/null)" = "$TGT_FP" ]; then
             _prev_n=$(jq -r '.targets.volumes // 0' "$OUT/meta.env-carry.json" 2>/dev/null || echo 0)
             _have_n=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '[.assets[].name | select(test("^targets\\.tar\\.gz"))] | length' 2>/dev/null || echo 0)
@@ -931,10 +993,18 @@ jobs:
           # 沿用轮次（CARRY=1）跳过打包，省 ~15s。
           if [ "$CARRY" != 1 ]; then
             TGT_DIRS=()
+            SLIM_EXCLUDES=()
             for d in "$TARGETS_DIR"/*/; do
               [ -d "${d%/}/.git" ] && TGT_DIRS+=("$(basename "$d")")
             done
-            ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
+            # R573: slim 目标不把 .git 历史打进包（proxyip 实测 1.5GB → 0）。排除项按
+            # index 逐目录生成；全量模式目录不受影响。
+            if [ -s "$IDX" ]; then
+              while IFS= read -r sd; do
+                [ -n "$sd" ] && SLIM_EXCLUDES+=("--exclude=$sd/.git" "--exclude=$sd/.git/*")
+              done < <(jq -r '.snapshots[]? | select(.mode == "dirtar-slim") | .dir // empty' "$IDX" 2>/dev/null)
+            fi
+            ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
               | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
               || echo "::warning::target workspace package failed"
           fi
