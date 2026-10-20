@@ -291,6 +291,12 @@ jobs:
             # 「每轮非 opencode 时间 <1 分钟」的最大单项（旧包 1.58GB，打包+双上传 38s）。
             # 本地未推送提交/冲突/子模块一律回退全量 .git，避免丢状态。
             MODE="dirtar"
+            # R618：本地 refs/remotes/origin/* 可能是上次恢复时的旧值；先拉目标分支
+            # 的最新远端对象，再判断 HEAD 是否真正可从远端到达。fetch 失败/超时则
+            # 保持全量包，绝不因陈旧 ref 误判 slim 而丢可恢复性。
+            if [ -n "$REMOTE" ] && [ -n "$BRANCH" ]; then
+              timeout 20 git -C "$repo_dir" fetch --quiet --no-tags origin "$BRANCH" 2>/dev/null || true
+            fi
             if [ -n "$COMMIT" ] && [ -n "$BRANCH" ] && [ ! -f "$repo_dir/.gitmodules" ] \
                && ! git -C "$repo_dir" ls-files -u 2>/dev/null | grep -q . \
                && git -C "$repo_dir" branch -r --contains "$COMMIT" 2>/dev/null | grep -q .; then
