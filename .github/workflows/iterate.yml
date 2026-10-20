@@ -137,6 +137,7 @@ jobs:
                    "$HOME/.config/opencode/service.json" \
                    "$HOME/.local/state/opencode/service.json" \
                    "$HOME/.config/opencode"/loop-*.json \
+                   "$HOME/.opencode/tg.env" \
                    "$HOME/.config/opencode"/*.env; do
             [ -f "$p" ] && chmod 600 "$p" 2>/dev/null || true
           done
