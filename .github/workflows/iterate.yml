@@ -130,6 +130,16 @@ jobs:
             echo "::error::restore failed (targets rc=$rc_t env rc=$rc_e)"
             exit 1
           fi
+          # R743: env-sync tar restore can widen secret files to 0644. Normalize
+          # before OpenCode starts; the bridge repeats this for service.json,
+          # which the host creates later.
+          for p in "$HOME/.config/opencode/tg-bots.json" \
+                   "$HOME/.config/opencode/service.json" \
+                   "$HOME/.local/state/opencode/service.json" \
+                   "$HOME/.config/opencode"/loop-*.json \
+                   "$HOME/.config/opencode"/*.env; do
+            [ -f "$p" ] && chmod 600 "$p" 2>/dev/null || true
+          done
           echo "targets and environment restored in parallel"
 
       - name: Install OpenCode 2 and workferry
