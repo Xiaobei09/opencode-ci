@@ -147,6 +147,8 @@ env_sync_try() {
       return 1
     fi
     rm -f "$d"/payload/.local/share/opencode/opencode.db.gz 2>/dev/null
+    # R579：gzip 形态下若 payload 仍残留旧 chunks（格式切换拍），一并清掉，避免 rsync 进 $HOME
+    rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part 2>/dev/null
   elif [ "$dbfmt" = "chunks" ]; then
     cat "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
       > "$d"/payload/.local/share/opencode/opencode.db 2>/dev/null || return 1
