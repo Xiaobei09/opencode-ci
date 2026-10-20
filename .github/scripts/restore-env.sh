@@ -136,7 +136,18 @@ env_sync_try() {
   dbfmt=$(jq -r '.db_format // "raw"' "$json" 2>/dev/null || echo raw)
   dbexp=$(jq -r '.db_bytes // 0' "$json" 2>/dev/null || echo 0)
   case "$dbexp" in (*[!0-9]*) dbexp=0;; esac
-  if [ "$dbfmt" = "chunks" ]; then
+  if [ "$dbfmt" = "gzip" ]; then
+    if [ ! -f "$d/payload/.local/share/opencode/opencode.db.gz" ]; then
+      echo "::warning::env-sync gzip db missing; using release packages"
+      return 1
+    fi
+    if ! gzip -dc "$d/payload/.local/share/opencode/opencode.db.gz" \
+          > "$d/payload/.local/share/opencode/opencode.db" 2>/dev/null; then
+      echo "::warning::env-sync gzip db decompress failed; using release packages"
+      return 1
+    fi
+    rm -f "$d"/payload/.local/share/opencode/opencode.db.gz 2>/dev/null
+  elif [ "$dbfmt" = "chunks" ]; then
     cat "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
       > "$d"/payload/.local/share/opencode/opencode.db 2>/dev/null || return 1
     rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part 2>/dev/null
