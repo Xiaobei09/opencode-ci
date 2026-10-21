@@ -250,10 +250,20 @@ jobs:
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
           relayed=0
           for attempt in 1 2 3; do
-            if gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"; then
+            # R921：run 39533234819 实测 relay 连续三次 422「Cannot trigger a workflow_dispatch
+            # on a disabled workflow」→ 无后继、循环停摆。只在**明确是 disabled workflow** 时
+            # 尝试 enable 一次再重试；鉴权/网络等其它错误不碰 workflow 状态。
+            out=$(gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}" 2>&1)
+            rc=$?
+            if [ "$rc" = "0" ]; then
               echo "relayed next run on attempt $attempt"
               relayed=1
               break
+            fi
+            echo "$out"
+            if printf '%s' "$out" | grep -q "disabled workflow"; then
+              echo "::warning::workflow is disabled; re-enabling iterate.yml and retrying"
+              gh workflow enable iterate.yml --repo "${{ github.repository }}" || true
             fi
             echo "::warning::relay attempt $attempt failed; retrying"
             sleep 5
