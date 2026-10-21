@@ -151,6 +151,28 @@ jobs:
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           npm install -g workferry
 
+      - name: Force-resolve provider via proxyip good IP
+        id: force_resolve
+        if: steps.lock.outputs.acquired == 'true'
+        env:
+          SESSIONS_DIR: /home/runner/work/sessions
+          TARGETS_DIR: /home/runner/work/targets
+          FORCE_RESOLVE_MAX_SWITCHES: "5"
+        run: |
+          set +e
+          # R923（用户指令）：从 proxyip 的 good 清单选一个 IPv4 反代 IP，验证
+          # opencode.ai / api.opencode.ai 的 TLS+HTTP 可达后写入 /etc/hosts。
+          # 失败时脚本自行回滚托管块，本步只告警、不阻断 CI。
+          bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --switch
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "FORCE_RESOLVE_ENABLED=1" >> "$GITHUB_ENV"
+            echo "force-resolve enabled (first good IP verified)"
+          else
+            echo "::warning::force-resolve unavailable (rc=$rc); provider DNS left untouched"
+          fi
+          bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --status || true
+
       - name: Run OpenCode
         id: run_opencode
         if: steps.lock.outputs.acquired == 'true'
@@ -230,6 +252,17 @@ jobs:
             echo "opencode exited with $RC; this run will not relay."
           fi
           exit "$RC"
+
+      - name: Reset force-resolve hosts
+        if: always()
+        env:
+          SESSIONS_DIR: /home/runner/work/sessions
+          TARGETS_DIR: /home/runner/work/targets
+          FORCE_RESOLVE_MAX_SWITCHES: "5"
+        run: |
+          set +e
+          # 清理 /etc/hosts 托管块，避免强制解析状态泄漏到快照/后续步骤。
+          bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --reset || true
 
       - name: Relay next run
         # ROUND 42（取消也要接力，运营者第 2 项要求）：运营者要用**一系列取消**验证无缝，
