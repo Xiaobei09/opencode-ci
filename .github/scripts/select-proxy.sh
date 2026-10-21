@@ -39,10 +39,10 @@ ENV_FILE="$RUNNER_TEMP/exit-proxy.env"
 STATE_FILE="$HOME/.config/opencode/exit-proxy.json"
 PROBE_URL="${EXIT_PROXY_PROBE_URL:-https://opencode.ai/zen/v1/models}"
 IP_URL="${EXIT_PROXY_IP_URL:-https://api.ipify.org}"
-MAX_CANDIDATES="${EXIT_PROXY_MAX_CANDIDATES:-150}"
-PROBE_TIMEOUT="${EXIT_PROXY_PROBE_TIMEOUT:-7}"
-BUDGET_SECONDS="${EXIT_PROXY_BUDGET_SECONDS:-240}"
-PARALLEL="${EXIT_PROXY_PARALLEL:-16}"
+MAX_CANDIDATES="${EXIT_PROXY_MAX_CANDIDATES:-200}"
+PROBE_TIMEOUT="${EXIT_PROXY_PROBE_TIMEOUT:-9}"
+BUDGET_SECONDS="${EXIT_PROXY_BUDGET_SECONDS:-200}"
+PARALLEL="${EXIT_PROXY_PARALLEL:-24}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -75,25 +75,35 @@ SOURCES=(
   "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"
 )
 : > "$WORK/pool.txt"
+SRC_FILES=()
+i=0
 for url in "${SOURCES[@]}"; do
-  f="$WORK/$(printf '%s' "$url" | md5sum | cut -c1-12).txt"
-  if curl -fsSL -m 25 "$url" -o "$f" 2>/dev/null; then
-    n=$(tr -d '\r' < "$f" | sed 's/#.*//' | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' | sort -u | wc -l)
+  f="$WORK/src_$i.txt"
+  i=$((i + 1))
+  if curl -fsSL -m 25 "$url" -o "$f.raw" 2>/dev/null; then
+    tr -d '\r' < "$f.raw" | sed 's/#.*//' \
+      | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' | sort -u > "$f"
+    n=$(wc -l < "$f")
     log "source $n entries ${url}"
-    tr -d '\r' < "$f" | sed 's/#.*//' \
-      | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' | sort -u >> "$WORK/pool.txt"
+    [ "$n" -gt 0 ] && SRC_FILES+=("$f")
   else
     log "source unavailable: ${url}"
   fi
 done
 
-sort -u "$WORK/pool.txt" | grep -v "^${PREV:-__none__}$" > "$WORK/pool_u.txt"
-if command -v shuf >/dev/null 2>&1; then
-  shuf "$WORK/pool_u.txt" > "$WORK/pool_shuf.txt"
-else
-  sort -R "$WORK/pool_u.txt" > "$WORK/pool_shuf.txt" 2>/dev/null || cp "$WORK/pool_u.txt" "$WORK/pool_shuf.txt"
-fi
-head -"$MAX_CANDIDATES" "$WORK/pool_shuf.txt" > "$WORK/cands.txt"
+# Candidate order matters: the first source is the one that actually works
+# (measured 12/100 reachable vs ~1/100 for the others), so it is probed first
+# and in full; the rest only fill the remaining budget.
+: > "$WORK/pool_u.txt"
+for f in ${SRC_FILES[@]+"${SRC_FILES[@]}"}; do
+  if command -v shuf >/dev/null 2>&1; then
+    shuf "$f" >> "$WORK/pool_u.txt"
+  else
+    sort -R "$f" >> "$WORK/pool_u.txt" 2>/dev/null || cat "$f" >> "$WORK/pool_u.txt"
+  fi
+done
+awk '!seen[$0]++' "$WORK/pool_u.txt" | grep -v "^${PREV:-__none__}$" > "$WORK/pool_u2.txt"
+head -"$MAX_CANDIDATES" "$WORK/pool_u2.txt" > "$WORK/cands.txt"
 log "candidates: $(wc -l < "$WORK/cands.txt") (cap $MAX_CANDIDATES)"
 
 # --- 3. probe: a working CONNECT tunnel to the provider endpoint ------------
@@ -119,10 +129,30 @@ log "reachable proxies: $(wc -l < "$WORK/probe.txt")"
 # --- 4. pick: lowest latency whose egress IP really differs ----------------
 SELECTED=""; LATENCY=""; EGRESS=""
 if [ -s "$WORK/probe.txt" ]; then
-  sort -k2 -n "$WORK/probe.txt" | cut -d' ' -f1,3 > "$WORK/probe_sorted.txt"
+  # probe.txt lines are "<host> <http_code> <seconds>": sort by the latency (field 3).
+  sort -k3 -n "$WORK/probe.txt" | cut -d' ' -f1,3 > "$WORK/probe_sorted.txt"
+  # The egress IP is only used to prove that the quota identity really changes
+  # (and to avoid the previous run's proxy). Public proxies often serve the
+  # provider but block the "what is my IP" services, so an unreadable egress is
+  # NOT a reason to drop a working proxy - it is only a reason to not know it.
+  egress_of() {
+    hp="$1"
+    for u in "$IP_URL" "https://ifconfig.me/ip" "https://icanhazip.com"; do
+      e=$(curl -x "http://$hp" -m 15 -s "$u" 2>/dev/null | tr -dc '0-9a-fA-F.:' | head -c 64)
+      if [ -n "$e" ]; then
+        echo "$e"
+        return 0
+      fi
+    done
+    return 1
+  }
   while read -r hp lat; do
-    eip=$(curl -x "http://$hp" -m 12 -s "$IP_URL" 2>/dev/null | tr -dc '0-9a-fA-F.:' | head -c 64)
-    [ -z "$eip" ] && continue
+    eip=$(egress_of "$hp" || true)
+    if [ -z "$eip" ]; then
+      log "egress ip unreadable through $hp; taking it anyway (it reached the provider)"
+      SELECTED="$hp"; LATENCY="$lat"; EGRESS=""
+      break
+    fi
     [ -n "$DIRECT_IP" ] && [ "$eip" = "$DIRECT_IP" ] && continue
     [ -n "$PREV_EGRESS" ] && [ "$eip" = "$PREV_EGRESS" ] && continue
     SELECTED="$hp"; LATENCY="$lat"; EGRESS="$eip"
@@ -132,6 +162,7 @@ fi
 
 # --- 5. export --------------------------------------------------------------
 NO_PROXY_LIST="localhost,127.0.0.1,::1,api.telegram.org,github.com,api.github.com,objects.githubusercontent.com,raw.githubusercontent.com,codeload.github.com,registry.npmjs.org"
+[ -z "$EGRESS" ] && EGRESS="unknown"
 
 if [ -n "$SELECTED" ]; then
   {
