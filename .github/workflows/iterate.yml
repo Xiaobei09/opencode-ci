@@ -158,8 +158,14 @@ jobs:
           SESSIONS_DIR: /home/runner/work/sessions
           TARGETS_DIR: /home/runner/work/targets
           FORCE_RESOLVE_MAX_SWITCHES: "5"
+          FORCE_RESOLVE_429_COOLDOWN_SEC: "43200"
         run: |
           set +e
+          # R941（用户指令）：先记录 CI 原始出口 IP，供 429 冷却同时覆盖「CI 原本的 IP」。
+          # 失败不阻断；插件侧 --record-429 会同时记录当前强制 IP 与这个原始 IP。
+          orig="$(bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --capture-original 2>/dev/null || true)"
+          echo "original egress ip=${orig:-unknown}"
+          if [ -n "$orig" ]; then echo "FORCE_RESOLVE_ORIGINAL_IP=$orig" >> "$GITHUB_ENV"; fi
           # R923（用户指令）：从 proxyip 的 good 清单选一个 IPv4 反代 IP，验证
           # opencode.ai / api.opencode.ai 的 TLS+HTTP 可达后写入 /etc/hosts。
           # 失败时脚本自行回滚托管块，本步只告警、不阻断 CI。
