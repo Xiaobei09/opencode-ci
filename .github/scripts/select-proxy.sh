@@ -161,7 +161,12 @@ if [ -s "$WORK/probe.txt" ]; then
 fi
 
 # --- 5. export --------------------------------------------------------------
-NO_PROXY_LIST="localhost,127.0.0.1,::1,api.telegram.org,github.com,api.github.com,objects.githubusercontent.com,raw.githubusercontent.com,codeload.github.com,registry.npmjs.org"
+# R941 (D5): release-assets.githubusercontent.com is the host that actually
+# serves release asset downloads. It was missing here, so `gh release download`
+# run from inside the opencode process went through the public proxy and failed
+# ("Too many open connections", observed 2026-10-21 while fetching the loop's
+# own state). GitHub hosts must always stay off the provider proxy.
+NO_PROXY_LIST="localhost,127.0.0.1,::1,api.telegram.org,github.com,api.github.com,objects.githubusercontent.com,release-assets.githubusercontent.com,raw.githubusercontent.com,codeload.github.com,registry.npmjs.org"
 [ -z "$EGRESS" ] && EGRESS="unknown"
 
 if [ -n "$SELECTED" ]; then

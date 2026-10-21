@@ -133,12 +133,16 @@ jobs:
           # R743: env-sync tar restore can widen secret files to 0644. Normalize
           # before OpenCode starts; the bridge repeats this for service.json,
           # which the host creates later.
-          for p in "$HOME/.config/opencode/tg-bots.json" \
-                   "$HOME/.config/opencode/service.json" \
+          # R941 (D3): the old hand-written list kept missing runtime files - after
+          # the 2026-10-21 factory reset, tg-chats.json came back 0644 (only the
+          # bridge's first state save narrowed it) and inject-card-*.json stayed
+          # 0644. Normalize every runtime json/env under the config dir with globs
+          # so the list cannot fall behind the set of runtime-state files again
+          # (all of them are mode 600 by design; nothing else reads them).
+          for p in "$HOME/.config/opencode"/*.json \
+                   "$HOME/.config/opencode"/*.env \
                    "$HOME/.local/state/opencode/service.json" \
-                   "$HOME/.config/opencode"/loop-*.json \
-                   "$HOME/.opencode/tg.env" \
-                   "$HOME/.config/opencode"/*.env; do
+                   "$HOME/.opencode"/*.env; do
             [ -f "$p" ] && chmod 600 "$p" 2>/dev/null || true
           done
           echo "targets and environment restored in parallel"
