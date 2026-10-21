@@ -163,13 +163,14 @@ jobs:
           # R923（用户指令）：从 proxyip 的 good 清单选一个 IPv4 反代 IP，验证
           # opencode.ai / api.opencode.ai 的 TLS+HTTP 可达后写入 /etc/hosts。
           # 失败时脚本自行回滚托管块，本步只告警、不阻断 CI。
-          bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --switch
+          out="$(bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --switch)"
           rc=$?
-          if [ "$rc" -eq 0 ]; then
+          echo "$out"
+          if [ "$rc" -eq 0 ] && [ "${out#switched:}" != "$out" ]; then
             echo "FORCE_RESOLVE_ENABLED=1" >> "$GITHUB_ENV"
             echo "force-resolve enabled (first good IP verified)"
           else
-            echo "::warning::force-resolve unavailable (rc=$rc); provider DNS left untouched"
+            echo "::warning::force-resolve unavailable (rc=$rc out=$out); provider DNS left untouched"
           fi
           bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --status || true
 
