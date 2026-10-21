@@ -18,11 +18,6 @@ on:
         type: boolean
         required: false
         default: false
-      split_size:
-        description: Max bytes per release asset when paging the packages (GitHub allows up to 2GiB per asset; smaller pages upload in parallel — default 256m, e.g. 1500m for single-stream)
-        type: string
-        required: false
-        default: "256m"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -53,21 +48,14 @@ jobs:
       - name: Install GitHub CLI and configure git
         run: |
           set -euo pipefail
-          # R341: ubuntu-latest ships gh (measured 2.102.0); the apt dance below only
-          # exists for images without it. Measured cost when needlessly run: ~8s of
-          # `apt-get update` on every boot. Keep the installer as the fallback path.
-          if ! command -v gh >/dev/null 2>&1; then
-            sudo mkdir -p -m 755 /etc/apt/keyrings
-            key=$(mktemp)
-            wget -nv -O"$key" https://cli.github.com/packages/githubcli-archive-keyring.gpg
-            sudo install -m 0644 "$key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
-            sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-            sudo apt-get update -y
-            sudo apt-get install -y gh
-          else
-            echo "gh already installed: $(gh --version | head -1)"
-          fi
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          key=$(mktemp)
+          wget -nv -O"$key" https://cli.github.com/packages/githubcli-archive-keyring.gpg
+          sudo install -m 0644 "$key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y gh
           gh auth setup-git
           git config --global user.name "opencode-ci"
           git config --global user.email "opencode-ci@users.noreply.github.com"
@@ -77,12 +65,7 @@ jobs:
           set -euo pipefail
           if [ ! -d "$SESSIONS_DIR/.git" ]; then
             mkdir -p "$(dirname "$SESSIONS_DIR")"
-            # R574（⑧）：只取 main 的最新一版（脚本/配置；记录由 records release 覆盖）。
-            # env-sync 分支由 restore-env 自己 `git clone --depth 1 --single-branch
-            # --branch env-sync` 拉，boot 阶段不需要整仓克隆。旧 `gh repo clone` 会把
-            # 214MB payload 工作树 + 34 个历史提交一起拉：K 代 3s → L 代 30s（链增长）。
-            # 实测 main 浅克隆 1.4s/576KB，pre 阶段省 ~28s。
-            gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR" -- --depth 1 --single-branch --branch main
+            gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR"
           fi
           mkdir -p "$SESSIONS_DIR/state" "$SESSIONS_DIR/tasks" "$SESSIONS_DIR/sessions" "$SESSIONS_DIR/workspace-snapshots"
           [ -f "$SESSIONS_DIR/workspace-snapshots/index.json" ] || echo '{"snapshots": []}' > "$SESSIONS_DIR/workspace-snapshots/index.json"
@@ -102,46 +85,141 @@ jobs:
           set -euo pipefail
           mkdir -p "$TARGETS_DIR"
 
-      - name: Restore workspace snapshots and environment (parallel)
-        id: restore_ws
+      - name: Restore workspace snapshots
+        if: steps.lock.outputs.acquired == 'true'
+        run: |
+          set +e
+          # Target workspace bundles also live in the release now (a whole tar of the
+          # repo's runtime dirs), not in git, so the repository can stay a clean baseline.
+          ENV_TAG="env"
+          rm -rf /tmp/tgdl && mkdir -p /tmp/tgdl
+          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'targets.tar.gz*' --dir /tmp/tgdl --clobber >/dev/null 2>&1; then
+            if [ -f /tmp/tgdl/targets.tar.gz ]; then
+              tar -xzf /tmp/tgdl/targets.tar.gz -C "$SESSIONS_DIR" 2>/dev/null || echo "::warning::failed to restore target workspace bundles"
+            elif ls /tmp/tgdl/targets.tar.gz.* >/dev/null 2>&1; then
+              cat /tmp/tgdl/targets.tar.gz.* | tar -xzf - -C "$SESSIONS_DIR" 2>/dev/null || echo "::warning::failed to restore target workspace bundles"
+            fi
+          fi
+          INDEX="$SESSIONS_DIR/workspace-snapshots/index.json"
+          [ -f "$INDEX" ] || exit 0
+          COUNT=$(jq '.snapshots | length' "$INDEX")
+          for i in $(seq 0 $((COUNT - 1))); do
+            dir=$(jq -r ".snapshots[$i].dir // empty" "$INDEX")
+            bundle=$(jq -r ".snapshots[$i].bundle // empty" "$INDEX")
+            worktree=$(jq -r ".snapshots[$i].worktree // empty" "$INDEX")
+            branch=$(jq -r ".snapshots[$i].branch // empty" "$INDEX")
+            commit=$(jq -r ".snapshots[$i].commit // empty" "$INDEX")
+            repo=$(jq -r ".snapshots[$i].repo // empty" "$INDEX")
+            [ -n "$dir" ] || continue
+            target_dir="$TARGETS_DIR/$dir"
+            [ -e "$target_dir" ] && continue
+            if ! git clone "$SESSIONS_DIR/$bundle" "$target_dir"; then
+              echo "::warning::clone failed for $dir, skipping"
+              continue
+            fi
+            (
+              set +e
+              cd "$target_dir" || exit 0
+              if [ -n "$branch" ]; then
+                git checkout "$branch" 2>/dev/null \
+                  || git checkout -b "$branch" "origin/$branch" 2>/dev/null \
+                  || echo "::warning::branch $branch missing for $dir, staying on default"
+              fi
+              if [ -n "$commit" ]; then
+                git rev-parse --verify HEAD >/dev/null 2>&1 || git checkout "$commit" 2>/dev/null || true
+              fi
+              git fetch origin '+refs/stash:refs/stash' 2>/dev/null || true
+              if ! workferry apply --dir "$target_dir" "$SESSIONS_DIR/$worktree"; then
+                echo "::warning::workferry apply failed for $dir, untracked files may be lost"
+              fi
+              if git rev-parse --verify refs/stash >/dev/null 2>&1; then
+                STASH_SHA=$(git rev-parse refs/stash)
+                git stash apply --index "$STASH_SHA" 2>/dev/null \
+                  || echo "::warning::stash apply failed for $dir, staged state may be incomplete"
+              fi
+              if [ -n "$repo" ]; then
+                git remote set-url origin "$repo"
+              fi
+            )
+          done
+
+      - name: Restore environment and install bridge from sessions repository
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_ALLOWED_CHAT: ${{ secrets.TG_ALLOWED_CHAT }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
-          TG_BOT3_TOKEN: ${{ secrets.TG_BOT3_TOKEN }}
-          TG_BOT4_TOKEN: ${{ secrets.TG_BOT4_TOKEN }}
         run: |
-          set +e
-          # R573: targets restore (~12s) and env restore (~17s) are independent; run them
-          # in parallel and wait for both. Both are children of this step, so `wait` is
-          # reliable (no cross-step background process). Failure of either fails the step.
-          bash "$GITHUB_WORKSPACE/.github/scripts/restore-targets.sh" > /tmp/restore-targets.log 2>&1 &
-          p_t=$!
-          bash "$GITHUB_WORKSPACE/.github/scripts/restore-env.sh" > /tmp/restore-env.log 2>&1 &
-          p_e=$!
-          wait "$p_t"; rc_t=$?
-          wait "$p_e"; rc_e=$?
-          echo "== restore-targets.log =="
-          cat /tmp/restore-targets.log 2>/dev/null
-          echo "== restore-env.log =="
-          cat /tmp/restore-env.log 2>/dev/null
-          if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ]; then
-            echo "::error::restore failed (targets rc=$rc_t env rc=$rc_e)"
-            exit 1
+          set -euo pipefail
+          ENV_SRC="$SESSIONS_DIR/opencode"
+          mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/.opencode"
+          ENV_TAG="env"
+
+          # 1. Restore the WHOLE persisted environment from the release. It is a full
+          #    package of $HOME (a complete tar, not a delta/overlay), so files the agent
+          #    put ANYWHERE come back - including files copied or moved with old
+          #    timestamps, which a "changed-since-the-last-run" scan would silently miss.
+          #    Exclusions are only reinstallable caches, the work/ tree, the opencode
+          #    binary, server logs and secrets.
+          rm -rf /tmp/envdl && mkdir -p /tmp/envdl
+          if gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'env.tar.gz*' --dir /tmp/envdl --clobber >/dev/null 2>&1; then
+            if [ -f /tmp/envdl/env.tar.gz ]; then
+              echo "environment restored from release '$ENV_TAG'"
+              tar -xzf /tmp/envdl/env.tar.gz -C "$HOME" 2>/dev/null || echo "::warning::failed to restore environment"
+            elif ls /tmp/envdl/env.tar.gz.* >/dev/null 2>&1; then
+              echo "environment restored from release '$ENV_TAG' (split)"
+              cat /tmp/envdl/env.tar.gz.* | tar -xzf - -C "$HOME" 2>/dev/null || echo "::warning::failed to restore environment"
+            else
+              echo "no environment release yet; bootstrapping from the repository baseline"
+            fi
+          else
+            echo "no environment release yet; bootstrapping from the repository baseline"
           fi
-          # R743: env-sync tar restore can widen secret files to 0644. Normalize
-          # before OpenCode starts; the bridge repeats this for service.json,
-          # which the host creates later.
-          for p in "$HOME/.config/opencode/tg-bots.json" \
-                   "$HOME/.config/opencode/service.json" \
-                   "$HOME/.local/state/opencode/service.json" \
-                   "$HOME/.config/opencode"/loop-*.json \
-                   "$HOME/.opencode/tg.env" \
-                   "$HOME/.config/opencode"/*.env; do
-            [ -f "$p" ] && chmod 600 "$p" 2>/dev/null || true
+
+          # 2. The repository is the clean baseline and stays authoritative for the
+          #    bridge CODE. Copy it in (except the runtime-state files, which come from
+          #    the release) so code updates always take effect over a restored env.
+          if [ -d "$ENV_SRC/config" ]; then
+            mkdir -p "$HOME/.config/opencode"
+            for f in "$ENV_SRC"/config/*; do
+              [ -e "$f" ] || continue
+              case "$(basename "$f")" in
+                tg-chats.json|tg-chats-bot*.json|loop-ctl.json|loop-marker.json|tg-bots.json) continue ;;
+              esac
+              cp -a "$f" "$HOME/.config/opencode/" 2>/dev/null || true
+            done
+          fi
+          # First run only (no release yet): seed runtime state from the repo so the
+          # existing sessions are not dropped while migrating to release storage.
+          if [ ! -e "$HOME/.local/share/opencode/opencode.db" ] && [ -d "$ENV_SRC/data" ]; then
+            mkdir -p "$HOME/.local/share/opencode"
+            cp -a "$ENV_SRC/data/." "$HOME/.local/share/opencode/" 2>/dev/null || true
+          fi
+          if [ ! -f "$HOME/.config/opencode/tg-chats.json" ] && [ -f "$ENV_SRC/config/tg-chats.json" ]; then
+            cp -a "$ENV_SRC/config/tg-chats.json" "$HOME/.config/opencode/" 2>/dev/null || true
+          fi
+          for j in loop-ctl.json loop-marker.json service.json; do
+            [ -f "$HOME/.config/opencode/$j" ] || cp -a "$ENV_SRC/config/$j" "$HOME/.config/opencode/" 2>/dev/null || true
           done
-          echo "targets and environment restored in parallel"
+          # Plugin libraries also resolve under ~/.opencode/v2lib.
+          mkdir -p "$HOME/.opencode"
+          if [ -d "$ENV_SRC/config/v2lib" ]; then
+            cp -a "$ENV_SRC/config/v2lib" "$HOME/.opencode/v2lib" 2>/dev/null || true
+          fi
+
+          if [ ! -d "$HOME/.config/opencode/plugins" ]; then
+            echo "::warning::bridge plugins missing; continuing without them"
+            exit 0
+          fi
+          # 3. Derived registry plus the secret env file, both kept outside the repo.
+          if [ -f "$ENV_SRC/templates/tg-bots.json" ]; then
+            sed "s#__HOME__#$HOME#g" "$ENV_SRC/templates/tg-bots.json" > "$HOME/.config/opencode/tg-bots.json"
+          fi
+          : > "$HOME/.opencode/tg.env"
+          if [ -n "${TG_BOT_TOKEN:-}" ]; then printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.opencode/tg.env"; fi
+          if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
+          if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
+          chmod 600 "$HOME/.opencode/tg.env"
 
       - name: Install OpenCode 2 and workferry
         if: steps.lock.outputs.acquired == 'true'
@@ -150,35 +228,6 @@ jobs:
           curl -fsSL https://opencode.ai/v2/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           npm install -g workferry
-
-      - name: Force-resolve provider via proxyip good IP
-        id: force_resolve
-        if: steps.lock.outputs.acquired == 'true'
-        env:
-          SESSIONS_DIR: /home/runner/work/sessions
-          TARGETS_DIR: /home/runner/work/targets
-          FORCE_RESOLVE_MAX_SWITCHES: "5"
-          FORCE_RESOLVE_429_COOLDOWN_SEC: "43200"
-        run: |
-          set +e
-          # R941（用户指令）：先记录 CI 原始出口 IP，供 429 冷却同时覆盖「CI 原本的 IP」。
-          # 失败不阻断；插件侧 --record-429 会同时记录当前强制 IP 与这个原始 IP。
-          orig="$(bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --capture-original 2>/dev/null || true)"
-          echo "original egress ip=${orig:-unknown}"
-          if [ -n "$orig" ]; then echo "FORCE_RESOLVE_ORIGINAL_IP=$orig" >> "$GITHUB_ENV"; fi
-          # R923（用户指令）：从 proxyip 的 good 清单选一个 IPv4 反代 IP，验证
-          # opencode.ai / api.opencode.ai 的 TLS+HTTP 可达后写入 /etc/hosts。
-          # 失败时脚本自行回滚托管块，本步只告警、不阻断 CI。
-          out="$(bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --switch)"
-          rc=$?
-          echo "$out"
-          if [ "$rc" -eq 0 ] && [ "${out#switched:}" != "$out" ]; then
-            echo "FORCE_RESOLVE_ENABLED=1" >> "$GITHUB_ENV"
-            echo "force-resolve enabled (first good IP verified)"
-          else
-            echo "::warning::force-resolve unavailable (rc=$rc out=$out); provider DNS left untouched"
-          fi
-          bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --status || true
 
       - name: Run OpenCode
         id: run_opencode
@@ -199,43 +248,16 @@ jobs:
           # the plugins and stays up for the whole budget. No prompt is injected and no
           # new session is created; the bridge feeds operator Telegram messages into
           # this same session and pushes the replies.
-          # ROUND 42（重启自动恢复的加固，运营者第 3 项要求）：pin 来自**随包还原**的
-          # tg-chats.json.front，但"文件在"不等于"会话在" —— 若会话 DB 缺失/被换成旧代，
-          # `--session <sid>` 会开一个**空的**新会话，看起来"恢复了"其实上下文全丢。
-          # 故先查 DB 里是否真有该会话：确认为 "no" 才退回 `--continue`（恢复最近一次会话）；
-          # DB 读不出（err/n-a）时**保持 pin**（pin 是已验证路径，不因探针抖动而改写）。
-          # 诊断只打计数/是否，绝不打会话内容。
           SID=""
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
           fi
-          SID_PRESENT="n/a"
-          if [ -n "$SID" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-            SID_PRESENT=$(python3 -c 'import sqlite3,sys,os;c=sqlite3.connect("file:"+os.path.expanduser("~/.local/share/opencode/opencode.db")+"?mode=ro",uri=True);print("yes" if c.execute("select 1 from session_v2 where id=?",(sys.argv[1],)).fetchone() else "no")' "$SID" 2>/dev/null || echo "err")
-          fi
-          # ROUND 44（重启自动恢复加固）：bound 会话**确认为 no**（或压根没有 bound）时，**不要**盲目
-          # `--continue`——数据丢失后 `--continue` 只会打开本轮新建的空会话（实测：撕裂包 → 空 DB →
-          # 新会话 ses_eb24bf12，旧 ses_eb626522 的 1056 条上下文全部掉线）。改为挑 DB 里**消息最多**
-          # 的会话（最富上下文者，通常就是主循环会话）作为恢复目标；探针 err/n-a 仍保持 pin 不动。
-          RECOVER_LINE=""
-          if { [ "$SID_PRESENT" = "no" ] || [ -z "$SID" ]; } && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-            RECOVER_LINE=$(python3 -c 'import sqlite3,os;c=sqlite3.connect("file:"+os.path.expanduser("~/.local/share/opencode/opencode.db")+"?mode=ro",uri=True);r=c.execute("select session_id,count(*) n from session_message group by session_id order by n desc limit 1").fetchone();print("%s %d"%(r[0],r[1]) if r else "")' 2>/dev/null || true)
-          fi
-          RECOVER="${RECOVER_LINE%% *}"
-          RECOVER_MSGS="${RECOVER_LINE##* }"
-          if [ -n "$SID" ] && [ "$SID_PRESENT" != "no" ]; then
+          if [ -n "$SID" ]; then
             ARGS=(--standalone --session "$SID")
-            echo "resuming bound session present_in_db=$SID_PRESENT"
-          elif [ -n "$RECOVER" ]; then
-            ARGS=(--standalone --session "$RECOVER")
-            echo "recovery: bound=$([ -n "$SID" ] && echo yes || echo none) present_in_db=$SID_PRESENT; pinned the richest restored session (msgs=$RECOVER_MSGS)"
+            echo "resuming bound session $SID"
           else
             ARGS=(--standalone --continue)
-            if [ -n "$SID" ]; then
-              echo "bound session absent from the restored db ($SID_PRESENT); no richer session to recover; falling back to --continue"
-            else
-              echo "no bound session found; continuing the last session"
-            fi
+            echo "no bound session found; continuing the last session"
           fi
           TERM=xterm-256color timeout --signal=TERM --kill-after=30s "$BUDGET" \
             opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
@@ -249,9 +271,7 @@ jobs:
           for pat in "pinject delivered" "pinject failed" "inject failed" "getUpdates failed" "loop stopped" "sendMessage chunked ok" "free tier" "instance registered" "turnActuallyIdle" "loop skip" "loopskip"; do
             echo "diag '$pat' = $(grep -c -- "$pat" "$RUN_LOG" 2>/dev/null || echo 0)"
           done
-          # R213：143（SIGTERM 收尾，插件端 endRunNow 的 TERM 路径）同样视为“已受控结束=成功”，
-          # 与 124/137 一并白名单，确保 END-ROUND-CI 一定能走到 relay；真崩溃（其他非零）仍不接力。
-          if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ] || [ "$RC" -eq 143 ]; then
+          if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
             echo "opencode hit the time budget; treated as success so the loop continues."
             exit 0
           fi
@@ -260,144 +280,56 @@ jobs:
           fi
           exit "$RC"
 
-      - name: Reset force-resolve hosts
-        if: always()
-        env:
-          SESSIONS_DIR: /home/runner/work/sessions
-          TARGETS_DIR: /home/runner/work/targets
-          FORCE_RESOLVE_MAX_SWITCHES: "5"
-        run: |
-          set +e
-          # 清理 /etc/hosts 托管块，避免强制解析状态泄漏到快照/后续步骤。
-          bash "$SESSIONS_DIR/opencode/config/scripts/force-resolve.sh" --reset || true
-
-      - name: Relay next run
-        # ROUND 42（取消也要接力，运营者第 2 项要求）：运营者要用**一系列取消**验证无缝，
-        # 而原先 `outcome == 'success'` 使取消的 run 不接力 ⇒ 没有后继 run，循环只能等
-        # 6 小时 cron。实证：run 39090552818 的第 11/12 步（两个 always() 快照步）都
-        # completed/success，唯独第 14 步 Relay 被 skipped。故：success **或 cancelled**
-        # 都接力；failure 仍不接力（避免失败快循环）。
-        # 位置也前移到快照步**之前**：接力只是 `gh workflow run` 排队（concurrency
-        # cancel-in-progress:false ⇒ 后继必然等本轮结束），所以即使随后的快照步被取消
-        # 信号打断，后继也已经排上——无缝性不再依赖"重活能不能跑完"。带 3 次重试。
-        # ROUND 46：条件由 `steps.run_opencode.outcome == 'cancelled'` 改为 run 级 `cancelled()`。
-        # 旧写法只在「取消发生在 Run OpenCode 步」时接力；若运营者在**还原/安装期间**就取消
-        # （此时 run_opencode 是 skipped、不是 cancelled）⇒ 不接力 ⇒ 只能等 6 小时 cron，
-        # 运营者观感＝「循环没启动」。用 `cancelled()` 覆盖任意时刻的取消（lock 已获得即可）。
-        if: always() && steps.lock.outputs.acquired == 'true' && (steps.run_opencode.outcome == 'success' || cancelled())
-        run: |
-          set +e
-          echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
-          relayed=0
-          for attempt in 1 2 3; do
-            # R921：run 39533234819 实测 relay 连续三次 422「Cannot trigger a workflow_dispatch
-            # on a disabled workflow」→ 无后继、循环停摆。只在**明确是 disabled workflow** 时
-            # 尝试 enable 一次再重试；鉴权/网络等其它错误不碰 workflow 状态。
-            out=$(gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}" 2>&1)
-            rc=$?
-            if [ "$rc" = "0" ]; then
-              echo "relayed next run on attempt $attempt"
-              relayed=1
-              break
-            fi
-            echo "$out"
-            if printf '%s' "$out" | grep -q "disabled workflow"; then
-              echo "::warning::workflow is disabled; re-enabling iterate.yml and retrying"
-              gh workflow enable iterate.yml --repo "${{ github.repository }}" || true
-            fi
-            echo "::warning::relay attempt $attempt failed; retrying"
-            sleep 5
-          done
-          # ROUND 51：三次都失败时**原先静默成功** ⇒ 无后继、无告警，循环只能等 6h cron，
-          # 运营者观感又是「循环停了」。改为显式失败（红 run/通知），快照步仍因 always() 照常执行。
-          if [ "$relayed" != "1" ]; then
-            echo "::error::relay failed after 3 attempts; no successor queued (falls back to the 6h cron)."
-            exit 1
-          fi
-
       - name: Save workspace snapshots
-        # ROUND 46（防数据丢失）：只有 workspace 还原步**成功**才允许快照；若本轮在还原期间被取消
-        # （outcome=cancelled）或根本没跑到（skipped），$HOME/targets 是半套/空壳，快照它会把
-        # 「半套世界」固化进 release。跳过 ⇒ 保留上一代完好包。
-        if: always() && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
+        if: always() && steps.lock.outputs.acquired == 'true'
         run: |
           set +e
           SNAP="$SESSIONS_DIR/workspace-snapshots"
           mkdir -p "$SNAP"
           INDEX="$SNAP/index.json"
           [ -f "$INDEX" ] || echo '{"snapshots": []}' > "$INDEX"
-          # R342：清掉旧格式（bundle/worktree）解包残留——新格式的 workspace-snapshots/
-          # 只应有 index.json；任何子目录都是上一代旧包的遗留物，必须删掉以免被打进新包。
-          find "$SNAP" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
           shopt -s nullglob
           for target_dir in "$TARGETS_DIR"/*/; do
             repo_dir="${target_dir%/}"
             [ -d "$repo_dir/.git" ] || continue
             name=$(basename "$repo_dir")
             snap_dir="$SNAP/$name"
-            # R342（Stage C）：目标工作区不再转 bundle，而是整目录留在原地、由 Snapshot
-            # 步直接打进 targets 包（解包=还原，实测 11s vs bundle 克隆 72s）。这里只做：
-            # 清掉旧代解包残留的 bundle 目录、写 index 元数据（含内容指纹 fp，供「未变
-            # 则沿用」判定）。旧格式残留必须删除，否则会被打包。
             rm -rf "$snap_dir"
+            mkdir -p "$snap_dir"
+
+            STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
+            if [ -n "$STASH_HASH" ]; then
+              git -C "$repo_dir" stash store -m "snapshot" "$STASH_HASH" 2>/dev/null || true
+            fi
+
+            BUNDLE_ARGS="--branches --tags HEAD"
+            if git -C "$repo_dir" rev-parse --verify refs/stash >/dev/null 2>&1; then
+              BUNDLE_ARGS="$BUNDLE_ARGS refs/stash"
+            fi
+            if ! git -C "$repo_dir" bundle create "$snap_dir/git.bundle" $BUNDLE_ARGS; then
+              echo "::warning::bundle create failed for $name"
+              rm -rf "$snap_dir"
+              continue
+            fi
+
+            if ! workferry pack --dir "$repo_dir" "$snap_dir/worktree.tar.gz"; then
+              echo "::warning::workferry pack failed for $name"
+            fi
 
             BRANCH=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || true)
             COMMIT=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)
             REMOTE=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
             SAVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-            # R573（slim targets）：HEAD 可从远端分支到达、无子模块、无未合并索引时，
-            # targets 包只携带工作树（不含 .git 历史），恢复侧按 commit 做 depth-1 fetch
-            # 重建 git 元数据。实测 proxyip .git=1.5GB 而工作树压缩包仅 33MB；这是
-            # 「每轮非 opencode 时间 <1 分钟」的最大单项（旧包 1.58GB，打包+双上传 38s）。
-            # 本地未推送提交/冲突/子模块一律回退全量 .git，避免丢状态。
-            MODE="dirtar"
-            # R618：本地 refs/remotes/origin/* 可能是上次恢复时的旧值；先拉目标分支
-            # 的最新远端对象，再判断 HEAD 是否真正可从远端到达。fetch 失败/超时则
-            # 保持全量包，绝不因陈旧 ref 误判 slim 而丢可恢复性。
-            if [ -n "$REMOTE" ] && [ -n "$BRANCH" ]; then
-              timeout 20 git -C "$repo_dir" fetch --quiet --no-tags origin "$BRANCH" 2>/dev/null || true
-            fi
-            if [ -n "$COMMIT" ] && [ -n "$BRANCH" ] && [ ! -f "$repo_dir/.gitmodules" ] \
-               && ! git -C "$repo_dir" ls-files -u 2>/dev/null | grep -q . \
-               && git -C "$repo_dir" branch -r --contains "$COMMIT" 2>/dev/null | grep -q .; then
-              MODE="dirtar-slim"
-            fi
-
-            # 全量模式保留旧行为：把未提交状态固化成 stash（.git 随包携带）。slim 不建
-            # stash：包内无 .git，stash 恢复时必然丢失；未提交内容已由工作树完整携带。
-            if [ "$MODE" = "dirtar" ]; then
-              STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
-              if [ -n "$STASH_HASH" ]; then
-                git -C "$repo_dir" stash store -m "snapshot" "$STASH_HASH" 2>/dev/null || true
-              fi
-            fi
-
-            # R573：不再 unshallow。slim 恢复的是 shallow 仓，若每代 Save 都补全历史，
-            # 1.5GB 会重新下载并回到包里，slim 优化即失效。需要历史时由代理按需
-            # `git fetch --deepen/--unshallow`；远端始终保有完整历史。
-
-            # R342/R573（内容指纹）：「未变则沿用 targets」只认 HEAD/分支/工作树文件内容。
-            # 刻意排除 .git 内部细节与**全部 refs**：refs/stash 每代 stash 必变，
-            # refs/remotes 随 fetch 漂移，tags 不影响工作树——旧实现把 refs 算进 fp，
-            # 导致每代都判定「已变」并重传 1.58GB（实测 K 代 Snapshot 65s 的主因）。
-            # 工作树哈希含未跟踪/被忽略文件，与 slim 包内容一一对应，跨恢复稳定。
-            FP=$( {
-              printf 'head=%s\n' "$COMMIT"
-              printf 'branch=%s\n' "$BRANCH"
-              printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
-            } | sha256sum | cut -d' ' -f1 )
-
-            # bundle/worktree 留空仅为旧读侧兼容（旧读侧 clone 空路径失败后会走远端克隆兜底）。
             ENTRY=$(jq -n \
               --arg repo "$REMOTE" \
               --arg dir "$name" \
-              --arg mode "$MODE" \
-              --arg fp "$FP" \
+              --arg bundle "workspace-snapshots/$name/git.bundle" \
+              --arg worktree "workspace-snapshots/$name/worktree.tar.gz" \
               --arg branch "$BRANCH" \
               --arg commit "$COMMIT" \
               --arg saved_at "$SAVED_AT" \
-              '{repo: $repo, dir: $dir, mode: $mode, fp: $fp, bundle: "", worktree: "", branch: $branch, commit: $commit, saved_at: $saved_at}')
+              '{repo: $repo, dir: $dir, bundle: $bundle, worktree: $worktree, branch: $branch, commit: $commit, saved_at: $saved_at}')
 
             tmp=$(mktemp)
             jq --arg dir "$name" '.snapshots |= map(select(.dir != $dir))' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
@@ -406,12 +338,9 @@ jobs:
           done
 
       - name: Snapshot environment to sessions repository
-        # ROUND 46（防数据丢失）：同 workspace —— 只有 env 还原步**成功**才允许快照，避免把
-        # 「取消在还原途中」留下的半套/空 $HOME 固化进 release（那正是 R44 那轮丢失的成因）。
-        if: always() && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
+        if: always() && steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
           set +e
           ENV_SRC="$SESSIONS_DIR/opencode"
@@ -423,23 +352,6 @@ jobs:
               --exclude-dir=work --exclude-dir=.git 2>/dev/null \
               | while IFS= read -r f; do sed -i "s/${TG_BOT_TOKEN}/REDACTED/g" "$f" 2>/dev/null; done
           fi
-          # Value-independent scrub (ROUND 10 / D3): telegram bot tokens have a fixed
-          # shape (<6-12 digits>:<30+ base64url chars>). This also covers the per-bot
-          # tokens (tg-bot3 / tg-bot4) which are NOT present as CI secrets, so the
-          # value-only scrub above silently misses them. Text files only (-I skips the
-          # binary sqlite session db, which is excluded from the package separately).
-          grep -rlIE '[0-9]{6,12}:[A-Za-z0-9_-]{30,}' "$HOME" \
-            --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=.bun --exclude-dir=bin \
-            --exclude-dir=work --exclude-dir=.git 2>/dev/null \
-            | while IFS= read -r f; do sed -i -E 's/[0-9]{6,12}:[A-Za-z0-9_-]{30,}/REDACTED/g' "$f" 2>/dev/null; done
-          # ROUND 24 / D3: the $HOME scrub above excludes work/ — and the sessions
-          # repository lives in work/. Yet that tree is (a) packaged by the target tar
-          # below (sessions/state/tasks) and uploaded to the release, and (b) force-pushed
-          # wholesale to git by the "Rebuild repository baseline" step, where a leaked
-          # token becomes permanent history. Scrub the repository tree as well.
-          grep -rlIE '[0-9]{6,12}:[A-Za-z0-9_-]{30,}' "$SESSIONS_DIR" \
-            --exclude-dir=.git 2>/dev/null \
-            | while IFS= read -r f; do sed -i -E 's/[0-9]{6,12}:[A-Za-z0-9_-]{30,}/REDACTED/g' "$f" 2>/dev/null; done
           # Whole-package capture: tar the ENTIRE $HOME in one go - a complete snapshot,
           # not a delta/overlay. This is what guarantees completeness: the agent may drop
           # files anywhere, and files it copies or moves keep their old timestamps, so a
@@ -448,82 +360,18 @@ jobs:
           # persisted elsewhere and the latter would recurse), the opencode binary,
           # server logs and secrets.
           ENV_TAG="env"
-          # ROUND 35：分页大小按「支持的单个资产上限」取大（90m→1500m）曾把上传压成**单流**。
-          # R428 Stage D 基准（本 runner→GitHub release）：单流 27–33 MB/s、4 流 65 MB/s、
-          # 8 流 82 MB/s ⇒ 改为**小页 + 相位内并行**：默认 256m（targets ≈6 页），stage/真名
-          # 两相内各页并行（SNAP_UP_PAR 默认 8）。序列不变量（stage→校验→删旧→真名→meta→删stage）不变。
-          # 可用 dispatch 输入 `split_size` 覆盖（relay 只传 resume ⇒ 用默认值）。
-          SPLIT_SIZE="${SPLIT_SIZE:-256m}"
           # Checkpoint the SQLite sessions DB first so the packaged copy is consistent.
           if command -v python3 >/dev/null 2>&1 && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
             python3 -c 'import sqlite3;c=sqlite3.connect("'"$HOME"'/.local/share/opencode/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
               && echo "sqlite WAL checkpointed" || echo "::warning::sqlite WAL checkpoint skipped"
           fi
-          # Binary DB redaction (ROUND 14 / D3). The text scrub above uses `grep -I`, so it
-          # SKIPS the binary sqlite session DB - which therefore carried bot tokens straight
-          # into every env package (measured: 62 hits, two distinct tokens). The DB cannot
-          # be sed-edited, but a telegram token is ASCII and lives only inside string
-          # values, so a LENGTH-PRESERVING byte replacement is safe for sqlite: page
-          # offsets never move (verified on a copy: PRAGMA integrity_check=ok, all rows
-          # intact). Runs AFTER the WAL checkpoint so the main file holds every page, and
-          # before the tar; temp+rename makes an interrupted run non-destructive.
-          for dbf in "$HOME/.local/share/opencode/opencode.db" "$HOME/.local/share/opencode/opencode.db-wal" "$HOME/.local/share/opencode/opencode.db-shm"; do
-            [ -f "$dbf" ] || continue
-            python3 -c 'import os,re,sys;p=sys.argv[1];pat=re.compile(rb"[0-9]{6,12}:[A-Za-z0-9_-]{30,}");b=open(p,"rb").read();nb=pat.sub(lambda m:b"X"*len(m.group(0)),b);m=os.stat(p).st_mode&0o777;t=p+".redact";open(t,"wb").write(nb);os.chmod(t,m);os.replace(t,p)' "$dbf" \
-              && echo "db token-redacted: $(basename "$dbf")" || echo "::warning::db redaction skipped: $(basename "$dbf")"
-          done
           OUT=/tmp/envsnap
           rm -rf "$OUT" && mkdir -p "$OUT"
-          # R341 (non-agent time): pack with parallel gzip when available. pigz output
-          # is a standard multi-member gzip stream, so every reader (this workflow's
-          # magic-detection + `tar -xz`) stays dependency-free; fall back to gzip -6.
-          # Measured on a 1.4GB target package: gzip 31.3s -> pigz -p4 12.4s.
-          # R736: level 1 is still a normal gzip stream; local 460MB targets measured
-          # 1.9s/126MB vs level 6 2.56s/111MB (page-cached), so prefer speed here.
-          if command -v pigz >/dev/null 2>&1; then
-            TAR_COMP=(tar -I 'pigz -1 -p4' -cf -)
-          else
-            TAR_COMP=(tar -czf -)
-          fi
-          # ROUND 278（「快照优化」— save 侧）：run-end env-sync 把**终态**推到 env-sync
-          # 分支；成功且能取到旧 meta（其 env 段仍与保留的 release env 卷吻合）时跳过全量
-          # env 打包（本次最大单项 ~1m45s）。失败/取不到旧 meta 一律回退全量打包（保守）。
-          # 两次尝试 + 20s 间隔，化解与插件 tick 的锁竞争。分支即 B 侧首选还原源；
-          # release env 卷保留为 size-verified 回退（不再每代刷新，由 .env.carried 标记）。
-          SKIP_ENV_PACK=0
-          if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
-            SYNC_OK=0
-            for a in 1 2; do
-              if ENV_SYNC_WHY=run-end ENV_SYNC_TIMEOUT=180 \
-                   timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >/dev/null 2>&1; then
-                SYNC_OK=1; break
-              fi
-              echo "::warning::run-end env-sync attempt $a did not complete; retrying"
-              sleep 20
-            done
-            if [ "$SYNC_OK" = 1 ]; then
-              echo "run-end env-sync pushed; the env-sync branch now holds the final state"
-              gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$OUT" --clobber >/dev/null 2>&1 || true
-              if [ -s "$OUT/meta.json" ] && jq -e '(.env.bytes // 0) > 0' "$OUT/meta.json" >/dev/null 2>&1; then
-                cp -f "$OUT/meta.json" "$OUT/meta.env-carry.json"
-                SKIP_ENV_PACK=1
-                echo "env pack skipped: carried the release env section; the branch is the primary env source"
-              else
-                echo "::warning::no usable previous meta.json to carry the env section; packing env anyway"
-              fi
-            else
-              echo "::warning::run-end env-sync failed; packing the env release as before"
-            fi
-          fi
-          if [ "$SKIP_ENV_PACK" != 1 ]; then
-          "${TAR_COMP[@]}" -C "$HOME" \
+          tar -czf "$OUT/env.tar.gz" -C "$HOME" \
             --exclude='./work' \
             --exclude='./.cache' \
             --exclude='./.opencode/bin' \
             --exclude='./.opencode/tg.env' \
-            --exclude='./.opencode/tg-bot*.env' \
-            --exclude='./.config/opencode/tg.env' \
-            --exclude='./.config/opencode/tg-bot*.env' \
             --exclude='./.ssh' \
             --exclude='./.config/gh' \
             --exclude='./.gitconfig' \
@@ -531,275 +379,28 @@ jobs:
             --exclude='./.local/share/opencode/log' \
             --exclude='./.npm/_cacache' \
             --exclude='./.bun/install/cache' \
-            --exclude='./actions-runner' \
-            --exclude='./.rustup' \
-            --exclude='./.dotnet' \
-            --exclude='./.opencode/.v2lib-live' \
-            . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." \
-            || echo "::warning::environment package failed"
-          fi
-          # R342（records 独立资产，Stage B）：records 很小但每轮都变；targets 很大但内容
-          # 可以不变。独立打包 records ⇒ targets 未变时只换 records（~2MB），跳过 ~1.4GB
-          # 的暂存+正式双上传。targets 包内仍内嵌一份 records（兼容旧读侧；未变轮次里它
-          # 可能略旧，新读侧会用独立资产覆盖）。
-          REC_OK=0
-          ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" state tasks sessions loop-state.md 2>/dev/null ) \
-            | split -b "$SPLIT_SIZE" - "$OUT/records.tar.gz." \
-            && ls "$OUT"/records.tar.gz.* >/dev/null 2>&1 && REC_OK=1 \
-            || echo "::warning::records package failed; readers will use the copy embedded in the targets package"
-          # R342：聚合内容指纹（来自 Save 步写入的 index.json）——只有全部快照都是新格式
-          # 且带指纹时才允许「未变沿用」，否则一律重传（保守）。
-          TGT_FP=""; TGT_MODE=""
-          IDX="$SESSIONS_DIR/workspace-snapshots/index.json"
-          if [ -s "$IDX" ]; then
-            _tn=$(jq -r '[.snapshots[]?] | length' "$IDX" 2>/dev/null || echo 0)
-            _bad=$(jq -r '[.snapshots[]? | select((((.mode // "") | test("^dirtar")) | not) or ((.fp // "") | length) == 0)] | length' "$IDX" 2>/dev/null || echo 1)
-            if [ "${_tn:-0}" -gt 0 ] 2>/dev/null && [ "${_bad:-1}" = "0" ]; then
-              _slim=$(jq -r '[.snapshots[]? | select(.mode == "dirtar-slim")] | length' "$IDX" 2>/dev/null || echo 0)
-              _full=$(jq -r '[.snapshots[]? | select(.mode == "dirtar")] | length' "$IDX" 2>/dev/null || echo 0)
-              if [ "${_slim:-0}" = "${_tn}" ]; then TGT_MODE="dirtar-slim"
-              elif [ "${_full:-0}" = "${_tn}" ]; then TGT_MODE="dirtar"
-              else TGT_MODE="mixed"; fi
-              TGT_FP=$(jq -r '[.snapshots[] | .dir + "=" + .fp] | sort | join("\n")' "$IDX" | sha256sum | cut -d' ' -f1)
-            fi
-          fi
-          # R342（未变沿用判定）：上一代 meta 与 release 现状都要自洽才可信——格式/指纹
-          # 一致、records 包已生成、且 release 里的 targets 页数与上一代 meta 相符。
-          CARRY=0
-          if [ "$SKIP_ENV_PACK" = 1 ] && [ "$REC_OK" = 1 ] && [ -n "$TGT_FP" ] && [ -f "$OUT/meta.env-carry.json" ] \
-            && jq -e '(.targets.mode // "") | test("^(dirtar|mixed)")' "$OUT/meta.env-carry.json" >/dev/null 2>&1 \
-            && [ "$(jq -r '.targets.fp // empty' "$OUT/meta.env-carry.json" 2>/dev/null)" = "$TGT_FP" ]; then
-            _prev_n=$(jq -r '.targets.volumes // 0' "$OUT/meta.env-carry.json" 2>/dev/null || echo 0)
-            _have_n=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '[.assets[].name | select(test("^targets\\.tar\\.gz"))] | length' 2>/dev/null || echo 0)
-            if [ "${_prev_n:-0}" -gt 0 ] 2>/dev/null && [ "${_prev_n:-0}" = "${_have_n:-0}" ]; then
-              CARRY=1
-              echo "targets unchanged (fingerprint match, $_have_n page(s)); carrying the previous targets package"
-            else
-              echo "::warning::targets fingerprint matches but the release has ${_have_n:-0} of ${_prev_n:-0} page(s); re-uploading targets"
-            fi
-          fi
-          # R342（Stage C）：目标工作区以目录直存随 targets 包同行（tar 根下 <name>，排除
-          # 运行态文件锁）；只打包真正的 git 工作区（跳过 data/.github 等辅助目录）。
-          # 沿用轮次（CARRY=1）跳过打包，省 ~15s。
-          if [ "$CARRY" != 1 ]; then
-            TGT_PACK_T0=$(date +%s)
-            TGT_DIRS=()
-            SLIM_EXCLUDES=()
-            for d in "$TARGETS_DIR"/*/; do
-              [ -d "${d%/}/.git" ] && TGT_DIRS+=("$(basename "$d")")
-            done
-            # R573: slim 目标不把 .git 历史打进包（proxyip 实测 1.5GB → 0）。排除项按
-            # index 逐目录生成；全量模式目录不受影响。
-            if [ -s "$IDX" ]; then
-              while IFS= read -r sd; do
-                [ -n "$sd" ] && SLIM_EXCLUDES+=("--exclude=$sd/.git" "--exclude=$sd/.git/*")
-              done < <(jq -r '.snapshots[]? | select(.mode == "dirtar-slim") | .dir // empty' "$IDX" 2>/dev/null)
-            fi
-            ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
-              | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
-              || echo "::warning::target workspace package failed"
-            # R736: sub-step timing makes the next run's <60s target auditable.
-            echo "snapshot timing: targets pack $(( $(date +%s) - TGT_PACK_T0 ))s, $(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c) bytes"
-          fi
-          SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
-          TZ=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c)
-          ENV_N=$(ls "$OUT"/env.tar.gz.* 2>/dev/null | wc -l)
-          TGT_N=$(ls "$OUT"/targets.tar.gz.* 2>/dev/null | wc -l)
-          ENV_SHA=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
-          TGT_SHA=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
-          REC_SZ=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c)
-          REC_N=$(ls "$OUT"/records.tar.gz.* 2>/dev/null | wc -l)
-          REC_SHA=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
-          # ── R428 / Stage D：分页并行上传助手（有界并发）────────────────────────
-          # 依据：2026-10-19 基准（本 runner→GitHub release，256 MiB 定字节）：
-          #   单流 27–33 MB/s；4 流 65 MB/s；8 流 82 MB/s（≈2.5–3×）。
-          # 因此在**相位内**把分页资产并行上传；相位序不变：stage→校验→删旧→真名→meta→删stage。
-          # 每页一个 `gh release upload`（内部单流），并发 N ⇒ 聚合吞吐上台阶。
-          # 失败语义沿用原版：任一页失败 ⇒ 本相失败（stage 失败不动旧包；真名失败写 warning）；
-          # 每个调用点都保留单次全量 `gh release upload` 作为回退（并行助手失败时回落，仍是正确序）。
-          SNAP_UP_PAR="${SNAP_UP_PAR:-8}"
-          upload_par() {
-            local fail=0
-            [ "$#" -gt 0 ] || return 1
-            printf '%s\0' "$@" | xargs -0 -n1 -P"$SNAP_UP_PAR" bash -c \
-              'gh release upload "$0" "$3" --repo "$2" --clobber >/dev/null 2>&1' "$ENV_TAG" _ "$SESSIONS_REPO" || fail=1
-            return "$fail"
-          }
-          # ROUND 35：只有当 **env 页真的存在** 时才进入「删旧资产 + 上传」分支。否则打包失败
-          # 会把上一代好包删掉（manifest 本身也会让目录非空，所以这里不能用"目录非空"当判据）。
-          if ls "$OUT"/env.tar.gz.* >/dev/null 2>&1; then
+            . 2>/dev/null || echo "::warning::environment package failed"
+          # Package the repo's runtime dirs (target workspace bundles etc.) as a whole tar
+          # too, so the repository itself can stay a clean baseline.
+          ( cd "$SESSIONS_DIR" && tar -czf "$OUT/targets.tar.gz" workspace-snapshots state tasks sessions 2>/dev/null ) \
+            || echo "::warning::target workspace package failed"
+          if [ -s "$OUT/env.tar.gz" ] || [ -s "$OUT/targets.tar.gz" ]; then
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
               || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
                    --notes "Whole-\$HOME environment + target workspace packages; replaced every run." >/dev/null 2>&1
-            # ROUND 42（取消安全换装，关键）：旧序是「先删光旧卷、再上传」——取消若切在中间，
-            # release 会**没有包或只剩残包**，下一轮就还原不出环境。运营者现在会**故意**做
-            # 一系列取消来验证无缝，故改成与 `env-backup.sh swap` 同款的原子序：
-            #   ① 先建好 manifest（本地）
-            #   ② 新代以 STAGE 名上传（读侧 glob `env.tar.gz*` 与删除正则都不匹配 stage-*）
-            #   ③ 远程逐个比对 STAGE 尺寸
-            #   ④ 删旧代  ⑤ 真名上传（manifest 最后）  ⑥ 远程校验真名  ⑦ 删 STAGE 副本
-            # 任何中断都退化成「上一代完整包仍在」，永不出现混杂/空缺。
-            jq -n --arg tag "$ENV_TAG" --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
-                  --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
-                  --argjson env_bytes "${SZ:-0}" --argjson targets_bytes "${TZ:-0}" \
-                  --argjson env_volumes "${ENV_N:-0}" --argjson targets_volumes "${TGT_N:-0}" \
-                  --arg env_sha "$ENV_SHA" --arg targets_sha "$TGT_SHA" \
-                  --argjson records_bytes "${REC_SZ:-0}" --argjson records_volumes "${REC_N:-0}" \
-                  --arg records_sha "$REC_SHA" --argjson rec_ok "${REC_OK:-0}" \
-                  --arg tgt_mode "$TGT_MODE" --arg tgt_fp "$TGT_FP" \
-                  '{version:2, tag:$tag, run_id:$run, commit:$commit, created_at:$at, split_size:$split,
-                    env:{volumes:$env_volumes, bytes:$env_bytes, sha256:$env_sha},
-                    targets:{volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha, mode:$tgt_mode, fp:$tgt_fp}}
-                   | (if $rec_ok==1 then .records={volumes:$records_volumes, bytes:$records_bytes, sha256:$records_sha} else . end)' \
-                  > "$OUT/meta.json" 2>/dev/null
-            mkdir -p "$OUT/stage"
-            for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.* "$OUT/meta.json"; do
-              [ -f "$f" ] || continue
-              cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
-            done
-            stage_ok=0
-            if upload_par "$OUT"/stage/* || gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-              stage_ok=1
-              for f in "$OUT"/stage/stage-*; do
-                n=$(basename "$f"); l=$(stat -c%s "$f")
-                r=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq ".assets[] | select(.name==\"$n\") | .size")
-                if [ "$l" = "$r" ]; then
-                  echo "staged ok $n = $l bytes"
-                else
-                  stage_ok=0
-                  echo "::warning::staged size mismatch $n ($l vs $r)"
-                fi
-              done
+            # Delete every previous volume (old 'home.*' and new names) so only the latest
+            # environment survives.
+            gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
+              | grep -E '^(env|home|targets)\.tar\.gz(\.|$)' \
+              | while IFS= read -r a; do gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1; done
+            UPLOADS=()
+            [ -s "$OUT/env.tar.gz" ] && UPLOADS+=("$OUT/env.tar.gz")
+            [ -s "$OUT/targets.tar.gz" ] && UPLOADS+=("$OUT/targets.tar.gz")
+            if [ ${#UPLOADS[@]} -gt 0 ] && gh release upload "$ENV_TAG" "${UPLOADS[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
+              [ -s "$OUT/env.tar.gz" ] && SZ=$(stat -c%s "$OUT/env.tar.gz" 2>/dev/null || echo 0) && echo "environment package uploaded: 1 file, $SZ bytes"
+              [ -s "$OUT/targets.tar.gz" ] && TZ=$(stat -c%s "$OUT/targets.tar.gz" 2>/dev/null || echo 0) && echo "target workspace package uploaded: 1 file, $TZ bytes"
             else
-              echo "::warning::staged upload failed; the previous package is left untouched"
-            fi
-            if [ "$stage_ok" -eq 1 ]; then
-              # 旧代删除（正则与读侧 glob 都不匹配 stage-*，故暂存副本安全）；逐资产后台并行、wait 收口
-              mapfile -t DELOLD < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-                | grep -E '^(env|home|targets|records)\.tar\.gz(\.|$)|^meta\.json$' || true)
-              for a in ${DELOLD[@]+"${DELOLD[@]}"}; do
-                gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 &
-              done
-              wait
-              UPF=()
-              for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.*; do
-                [ -f "$f" ] && UPF+=("$f")
-              done
-              if upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-                # ROUND 35：manifest 最后上传 ⇒ 它的存在即代表页是完整的；读侧据它检测
-                # "下载不全"并拒绝半套应用；缺失时读侧退回无校验直解（降级读）。
-                if [ -s "$OUT/meta.json" ]; then
-                  gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
-                    || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
-                else
-                  echo "::warning::failed to build meta.json (readers will fall back to unverified extract)"
-                fi
-                echo "environment package uploaded: $ENV_N volume(s), $SZ bytes"
-                echo "target workspace package uploaded: $TGT_N volume(s), $TZ bytes"
-                echo "package manifest: split=$SPLIT_SIZE env=$ENV_N vol targets=$TGT_N vol"
-              else
-                echo "::warning::failed to upload packages to release"
-              fi
-              for f in "$OUT"/stage/stage-*; do
-                gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
-                  && echo "staged copy removed: $(basename "$f")" &
-              done
-              wait
-            fi
-          elif [ "$SKIP_ENV_PACK" = 1 ] \
-            && { [ "${CARRY:-0}" = 1 ] || ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; }; then
-            # ROUND 278：env 由 env-sync 分支承担 ⇒ 本次**仅**原子换装 targets 包；
-            # release 里的旧 env 卷**保留**为回退源（env_try 仍按其尺寸校验）。新 meta
-            # 沿用旧 meta 的 env 段并打 .env.carried=true（读侧据此让位给分支）。
-            # R342：records（每轮必新）+ targets（内容未变则沿用，跳过 ~1.4GB 双上传）。
-            if [ -f "$OUT/meta.env-carry.json" ] \
-              && jq --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
-                 --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
-                 --argjson targets_bytes "${TZ:-0}" --argjson targets_volumes "${TGT_N:-0}" \
-                 --arg targets_sha "$TGT_SHA" \
-                 --argjson carry "${CARRY:-0}" --arg tgt_mode "$TGT_MODE" --arg tgt_fp "$TGT_FP" \
-                 --argjson rec_ok "${REC_OK:-0}" --argjson records_bytes "${REC_SZ:-0}" \
-                 --argjson records_volumes "${REC_N:-0}" --arg records_sha "$REC_SHA" \
-                 '.env.packed_at=(.env.packed_at // .env.carried_at // .created_at) |
-                  .env.carried_at=$at |
-                  .env.carried=true |
-                  .created_at=$at | .run_id=$run | .commit=$commit | .split_size=$split |
-                  .targets=(if $carry==1 then (.targets + {carried_at:$at, carried:true}) else {volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha, mode:$tgt_mode, fp:$tgt_fp} end) |
-                  (if $rec_ok==1 then .records={volumes:$records_volumes, bytes:$records_bytes, sha256:$records_sha} else del(.records) end)' \
-                 "$OUT/meta.env-carry.json" > "$OUT/meta.json" 2>/dev/null \
-              && [ -s "$OUT/meta.json" ] && jq -e '(.env.bytes // 0) > 0' "$OUT/meta.json" >/dev/null 2>&1; then
-              mkdir -p "$OUT/stage"
-              for f in "$OUT"/records.tar.gz.* "$OUT/meta.json"; do
-                [ -f "$f" ] || continue
-                cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
-              done
-              if [ "${CARRY:-0}" != 1 ]; then
-                for f in "$OUT"/targets.tar.gz.*; do
-                  [ -f "$f" ] || continue
-                  cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
-                done
-              fi
-              stage_ok=0
-              if upload_par "$OUT"/stage/* || gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-                stage_ok=1
-                for f in "$OUT"/stage/stage-*; do
-                  n=$(basename "$f"); l=$(stat -c%s "$f")
-                  r=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq ".assets[] | select(.name==\"$n\") | .size")
-                  if [ "$l" = "$r" ]; then
-                    echo "staged ok $n = $l bytes"
-                  else
-                    stage_ok=0
-                    echo "::warning::staged size mismatch $n ($l vs $r)"
-                  fi
-                done
-              else
-                echo "::warning::staged upload failed; the previous packages are left untouched"
-              fi
-              if [ "$stage_ok" -eq 1 ]; then
-                if [ "${CARRY:-0}" = 1 ]; then
-                  DELPAT='^records\.tar\.gz(\.|$)|^meta\.json$'
-                else
-                  DELPAT='^records\.tar\.gz(\.|$)|^targets\.tar\.gz(\.|$)|^meta\.json$'
-                fi
-                mapfile -t DELOLD < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-                  | grep -E "$DELPAT" || true)
-                for a in ${DELOLD[@]+"${DELOLD[@]}"}; do
-                  gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 &
-                done
-                wait
-                UPF=()
-                for f in "$OUT"/records.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
-                if [ "${CARRY:-0}" != 1 ]; then
-                  for f in "$OUT"/targets.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
-                fi
-                up_ok=1
-                if [ "${#UPF[@]}" -gt 0 ]; then
-                  upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 || up_ok=0
-                else
-                  up_ok=0
-                fi
-                if [ "$up_ok" = 1 ]; then
-                  if [ -s "$OUT/meta.json" ]; then
-                    gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
-                      || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
-                  fi
-                  if [ "${CARRY:-0}" = 1 ]; then
-                    echo "target workspace package carried (unchanged); records refreshed"
-                  else
-                    echo "target workspace package updated (env from env-sync branch; retained release env kept as fallback)"
-                  fi
-                  echo "package manifest: split=$SPLIT_SIZE env=carried targets=$TGT_N vol carry=${CARRY:-0} records=$REC_N vol"
-                else
-                  echo "::warning::failed to upload targets/records packages to release"
-                fi
-                for f in "$OUT"/stage/stage-*; do
-                  gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
-                    && echo "staged copy removed: $(basename "$f")" &
-                done
-                wait
-              fi
-            else
-              echo "::warning::meta rewrite failed; leaving the release untouched (targets stay previous generation)"
+              echo "::warning::failed to upload packages to release"
             fi
           else
             echo "::warning::environment package is empty"
@@ -821,41 +422,17 @@ jobs:
           rm -rf opencode/data
           mkdir -p opencode/data
           touch opencode/data/.gitkeep
-          # 循环记录同样是**运行态**：它活在 env release 的工作树里，绝不进"出厂基线"。
-          # 否则 reset 出来的"干净、开箱即用"环境会带着历史轮次记录（运营者 2026-10-18 指出）。
-          # 注：assets 快照已排除 ./work（见 --exclude='./work'），因此记录**不**会进 env 包；
-          # 若运营者要求"仓库树也永远干净"，需再把记录迁到 $HOME 内被快照的路径（待决策）。
-          rm -rf sessions state tasks workspace-snapshots loop-state.md
           rm -f opencode/config/tg-chats.json opencode/config/tg-chats-bot*.json \
                 opencode/config/loop-ctl.json opencode/config/loop-marker.json \
-                opencode/config/tg-bots.json opencode/config/loop-guard.json \
-                opencode/config/loop-sessions.json opencode/config/model-windows.json \
-                opencode/config/abort-events.json opencode/config/inject-card-*.json \
-                opencode/config/botname-*.json
+                opencode/config/tg-bots.json
           {
             echo '# Runtime state lives in the env release, not in git.'
             echo 'opencode/data/*'
             echo '!opencode/data/.gitkeep'
-            # 循环记录（轮次笔记 / 状态 / 任务 / 快照索引）也不是基线的一部分
-            echo 'sessions/'
-            echo 'state/'
-            echo 'tasks/'
-            echo 'workspace-snapshots/'
-            echo 'loop-state.md'
             echo 'opencode/config/tg-chats*.json'
             echo 'opencode/config/tg-bots.json'
             echo 'opencode/config/loop-ctl.json'
             echo 'opencode/config/loop-marker.json'
-            echo 'opencode/config/loop-guard.json'
-            echo 'opencode/config/loop-sessions.json'
-            echo 'opencode/config/model-windows.json'
-            echo 'opencode/config/abort-events.json'
-            echo 'opencode/config/inject-card-*.json'
-            echo 'opencode/config/halt-release.json*'
-            echo 'opencode/config/botname-*.json*'
-            echo 'opencode/config/service.json*'
-            echo 'opencode/config/tg-bot*.env'
-            echo 'opencode/config/tg.env'
             echo 'opencode/home.tar.gz*'
           } > .gitignore
           git add -A
@@ -880,3 +457,15 @@ jobs:
             echo "::warning::baseline tag push attempt $attempt failed; retrying"
             sleep 4
           done
+
+      - name: Relay next run
+        if: always() && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outcome == 'success'
+        run: |
+          set +e
+          # No checkpoint gate: every run hands off to the next one unconditionally.
+          # Continuity comes from the persisted environment (the whole-$HOME package and
+          # the target workspace bundles in the `env` release). Because opencode resumes
+          # from where it was interrupted, a forced timeout at the end of a run is
+          # seamless on the next run.
+          echo "Relaying next run unconditionally."
+          gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}"
