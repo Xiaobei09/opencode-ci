@@ -151,6 +151,50 @@ jobs:
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           npm install -g workferry
 
+      - name: Select egress proxy
+        # The opencode zen free tier is quota'd per client IP. A long-lived runner burns
+        # through that quota and every later provider call fails with "Free usage limit
+        # reached. Connect a provider or subscribe to OpenCode Go to keep going, or
+        # switch models." The old mitigation rewrote /etc/hosts so opencode.ai resolved
+        # to another Cloudflare edge IP (force-resolve.sh) and switched a mihomo node.
+        # Those are DNS-level tricks: they change which edge answers, not the client IP
+        # the origin sees, so the quota was still exhausted (and the runner needed a
+        # writable /etc/hosts plus a node switcher).
+        # This step picks a real forward proxy from public proxy lists and exports
+        # HTTP_PROXY/HTTPS_PROXY for the opencode process, so the provider traffic
+        # leaves the runner through a different egress IP. opencode v2 is a Bun binary
+        # and its fetch honours http(s)_proxy + no_proxy (verified: provider requests
+        # are tunnelled with CONNECT, NO_PROXY hosts bypass it). The env file is sourced
+        # by the "Run OpenCode" step only - deliberately NOT through $GITHUB_ENV - so
+        # that gh/curl in the snapshot and relay steps keep reaching github.com
+        # directly. The script never fails the step: with no usable proxy the run
+        # continues on a direct connection and says so.
+        if: steps.lock.outputs.acquired == 'true'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+        run: |
+          set +e
+          bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
+          echo "select-proxy rc=${PIPESTATUS[0]}"
+          # Direct notification instead of a bridge message: the bridge lives inside the
+          # proxied opencode process, so a dead proxy would silence the only channel
+          # that could report it. api.telegram.org is in NO_PROXY, but this step runs
+          # before any proxy env is applied anyway.
+          if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
+            if [ -s "$RUNNER_TEMP/exit-proxy.env" ]; then
+              PXY=$(grep -m1 '^HTTPS_PROXY=' "$RUNNER_TEMP/exit-proxy.env" | cut -d= -f2-)
+              EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+              MSG="CI exit proxy: ${PXY} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+            else
+              MSG="CI exit proxy: none (direct connection)"
+            fi
+            curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \
+              >/dev/null 2>&1 || echo "::warning::could not send the exit-proxy notice to telegram"
+          fi
+          exit 0
+
       - name: Run OpenCode
         id: run_opencode
         if: steps.lock.outputs.acquired == 'true'
@@ -161,6 +205,19 @@ jobs:
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
         run: |
           set +e
+          # Egress proxy for the provider traffic, chosen by the "Select egress proxy"
+          # step. Sourced here and only here: the opencode process (CLI + the server it
+          # spawns) inherits it, while the snapshot and relay steps stay direct.
+          # NO_PROXY keeps localhost, telegram and github off the proxy.
+          if [ -f "$RUNNER_TEMP/exit-proxy.env" ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . "$RUNNER_TEMP/exit-proxy.env"
+            set +a
+            echo "egress proxy: ${HTTPS_PROXY:-none}"
+          else
+            echo "egress proxy: none (direct connection)"
+          fi
           RUN_LOG="$RUNNER_TEMP/opencode-run.log"
           BUDGET="${BUDGET_SECONDS:-19800}"
           # Cold-start resume. `opencode run` is one-shot: it loads the plugins, sends
