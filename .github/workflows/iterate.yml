@@ -158,21 +158,26 @@ jobs:
       - name: Select egress proxy
         # The opencode zen free tier is quota'd per client IP. A long-lived runner burns
         # through that quota and every later provider call fails with "Free usage limit
-        # reached. Connect a provider or subscribe to OpenCode Go to keep going, or
-        # switch models." The old mitigation rewrote /etc/hosts so opencode.ai resolved
-        # to another Cloudflare edge IP (force-resolve.sh) and switched a mihomo node.
-        # Those are DNS-level tricks: they change which edge answers, not the client IP
-        # the origin sees, so the quota was still exhausted (and the runner needed a
-        # writable /etc/hosts plus a node switcher).
-        # This step picks a real forward proxy from public proxy lists and exports
-        # HTTP_PROXY/HTTPS_PROXY for the opencode process, so the provider traffic
-        # leaves the runner through a different egress IP. opencode v2 is a Bun binary
-        # and its fetch honours http(s)_proxy + no_proxy (verified: provider requests
-        # are tunnelled with CONNECT, NO_PROXY hosts bypass it). The env file is sourced
-        # by the "Run OpenCode" step only - deliberately NOT through $GITHUB_ENV - so
-        # that gh/curl in the snapshot and relay steps keep reaching github.com
-        # directly. The script never fails the step: with no usable proxy the run
-        # continues on a direct connection and says so.
+        # reached...". DNS edge tricks changed which Cloudflare edge answered, not the
+        # source IP, so the quota stayed exhausted.
+        #
+        # This step builds an ordered candidate list (direct runner IP, proxyip relay
+        # entries, public HTTP CONNECT proxies) and tests each candidate with the real
+        # inference call in scripts/egress-preflight.sh:
+        #   POST https://opencode.ai/inference/v1/chat/completions
+        #   Authorization: Bearer public, User-Agent: opencode/1.18.32
+        # A /zen/v1/models 200 is NOT enough: the inference endpoint can still return
+        # 429 FreeUsageLimitError. Only a 200 with completion data selects/switches an
+        # egress. Failed candidates are written to egress-blacklist.json under
+        # $HOME/.config/opencode (mode 600) with a TTL (6h quota, 30m transport), so
+        # they survive via the whole-$HOME env snapshot and are skipped next run.
+        #
+        # The selected upstream is written to $RUNNER_TEMP/egress/upstream. The Run
+        # step starts a local CONNECT proxy and exports HTTP_PROXY=http://127.0.0.1:8089;
+        # the public proxy/relay is never injected directly into opencode. That lets
+        # egress-watch.sh hot-swap the upstream mid-run (the epoch file closes live
+        # tunnels) without restarting the process. The env file is sourced by the Run
+        # step only, so gh/curl in the snapshot and relay steps stay direct.
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -186,12 +191,13 @@ jobs:
           # that could report it. api.telegram.org is in NO_PROXY, but this step runs
           # before any proxy env is applied anyway.
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
-            if [ -s "$RUNNER_TEMP/exit-proxy.env" ]; then
-              PXY=$(grep -m1 '^HTTPS_PROXY=' "$RUNNER_TEMP/exit-proxy.env" | cut -d= -f2-)
+            if [ -s "$HOME/.config/opencode/exit-proxy.json" ]; then
+              KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+              UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
               EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-              MSG="CI exit proxy: ${PXY} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+              MSG="CI egress: ${KIND} ${UP} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
             else
-              MSG="CI exit proxy: none (direct connection)"
+              MSG="CI egress: state missing (direct connection)"
             fi
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \
@@ -209,20 +215,60 @@ jobs:
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
         run: |
           set +e
-          # Egress proxy for the provider traffic, chosen by the "Select egress proxy"
-          # step. Sourced here and only here: the opencode process (CLI + the server it
-          # spawns) inherits it, while the snapshot and relay steps stay direct.
-          # NO_PROXY keeps localhost, telegram and github off the proxy.
+          # Egress manager: OpenCode only ever sees http://127.0.0.1:8089. The
+          # manager (egress-proxy.py) forwards provider CONNECTs through the
+          # selected direct/relay upstream, and egress-watch.sh can hot-swap that
+          # upstream by bumping the epoch file. TLS stays end-to-end.
+          RUN_LOG="$RUNNER_TEMP/opencode-run.log"
+          EGRESS_DIR="${EGRESS_STATE_DIR:-$RUNNER_TEMP/egress}"
+          export EGRESS_STATE_DIR="$EGRESS_DIR"
+          export EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
+          mkdir -p "$EGRESS_DIR"
+          PROXY_PID=""
+          WATCH_PID=""
+          PROXY_READY=0
+          cleanup_egress() {
+            if [ -n "$WATCH_PID" ]; then
+              kill "$WATCH_PID" 2>/dev/null
+              wait "$WATCH_PID" 2>/dev/null
+            fi
+            if [ -n "$PROXY_PID" ]; then
+              kill "$PROXY_PID" 2>/dev/null
+              wait "$PROXY_PID" 2>/dev/null
+            fi
+          }
+          trap cleanup_egress EXIT
           if [ -f "$RUNNER_TEMP/exit-proxy.env" ]; then
             set -a
             # shellcheck disable=SC1091
             . "$RUNNER_TEMP/exit-proxy.env"
             set +a
-            echo "egress proxy: ${HTTPS_PROXY:-none}"
+            python3 "$GITHUB_WORKSPACE/.github/scripts/egress-proxy.py" \
+              > "$EGRESS_DIR/proxy.log" 2>&1 &
+            PROXY_PID=$!
+            for _ in $(seq 1 50); do
+              if ! kill -0 "$PROXY_PID" 2>/dev/null; then break; fi
+              if curl -sS -m 2 -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
+                   -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+                PROXY_READY=1
+                break
+              fi
+              sleep 0.2
+            done
+            if [ "$PROXY_READY" = 1 ]; then
+              echo "egress proxy: ${HTTPS_PROXY:-none} kind=$(jq -r '.kind // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null) upstream=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?') egress=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+              bash "$GITHUB_WORKSPACE/.github/scripts/egress-watch.sh" "$RUN_LOG" \
+                >> "$EGRESS_DIR/watch.log" 2>&1 &
+              WATCH_PID=$!
+            else
+              echo "::warning::local egress proxy failed to start; falling back to direct"
+              kill "$PROXY_PID" 2>/dev/null
+              PROXY_PID=""
+              unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+            fi
           else
             echo "egress proxy: none (direct connection)"
           fi
-          RUN_LOG="$RUNNER_TEMP/opencode-run.log"
           BUDGET="${BUDGET_SECONDS:-19800}"
           # Cold-start resume. `opencode run` is one-shot: it loads the plugins, sends
           # one message and exits, so the tg-bridge is only alive for that one turn and
@@ -274,6 +320,15 @@ jobs:
           RC=$?
           # Session content must never reach the CI log, so only a non-content summary.
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
+          # Egress audit: which upstreams served provider CONNECTs, and any switch.
+          if [ -f "$EGRESS_DIR/proxy.log" ]; then
+            echo "egress connections:"
+            grep -aE 'target=opencode\.ai|epoch [0-9]+:' "$EGRESS_DIR/proxy.log" | tail -8 || true
+          fi
+          if [ -f "$EGRESS_DIR/watch.log" ]; then
+            echo "egress watch:"
+            tail -8 "$EGRESS_DIR/watch.log" 2>/dev/null || true
+          fi
           # Content-safe bridge diagnostics: counters only, never message text.
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             jq -c '{iocount, paused, selfmute, halted:(.halted|length), qlen:((.queue//[])|length), pqlen:((.pinqueue//[])|length)}' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true
@@ -852,7 +907,8 @@ jobs:
                 opencode/config/tg-bots.json opencode/config/loop-guard.json \
                 opencode/config/loop-sessions.json opencode/config/model-windows.json \
                 opencode/config/abort-events.json opencode/config/inject-card-*.json \
-                opencode/config/botname-*.json
+                opencode/config/botname-*.json opencode/config/egress-blacklist.json \
+                opencode/config/exit-proxy.json
           {
             echo '# Runtime state lives in the env release, not in git.'
             echo 'opencode/data/*'
@@ -874,6 +930,8 @@ jobs:
             echo 'opencode/config/inject-card-*.json'
             echo 'opencode/config/halt-release.json*'
             echo 'opencode/config/botname-*.json*'
+            echo 'opencode/config/egress-blacklist.json*'
+            echo 'opencode/config/exit-proxy.json*'
             echo 'opencode/config/service.json*'
             echo 'opencode/config/tg-bot*.env'
             echo 'opencode/config/tg.env'

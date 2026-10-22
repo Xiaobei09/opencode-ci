@@ -1,206 +1,167 @@
 #!/usr/bin/env bash
-# Select a public forward proxy for the provider traffic of this CI run.
+# Select the initial egress for this CI run and write a local-proxy handoff.
 #
-# Why this exists (replaces the old force-resolve IP switching):
-#   The opencode zen free tier is quota'd per client IP, so a long-lived CI
-#   runner eventually gets "Free usage limit reached. Connect a provider or
-#   subscribe to OpenCode Go to keep going, or switch models.".
-#   The old mechanism rewrote /etc/hosts to point opencode.ai at another
-#   Cloudflare edge IP (force-resolve.sh) and/or switched a mihomo node. That
-#   is DNS-level IP switching: it does not change the client IP the origin
-#   sees, it only changes which edge answers, so the quota was still hit - and
-#   it needed a writable /etc/hosts plus a node switcher inside the bridge.
-#   This script picks a real forward proxy from public proxy lists and exports
-#   HTTP_PROXY/HTTPS_PROXY, so the provider traffic leaves the runner through
-#   that proxy (a different egress IP per run).
+# This replaces the old "probe /zen/v1/models" logic: a 200 from that endpoint
+# does NOT mean the free-tier quota is available. Every candidate is tested
+# with the real inference call (egress-preflight.sh) and only a 200 switches.
 #
-# opencode v2 is a Bun binary. Its fetch honours http_proxy/HTTP_PROXY,
-# https_proxy/HTTPS_PROXY and no_proxy/NO_PROXY (verified locally: a provider
-# request is tunnelled with CONNECT through the proxy, NO_PROXY hosts bypass
-# it). SOCKS is NOT supported by Bun ("UnsupportedProxyProtocol"), so only
-# http:// proxies are considered here. The CLI and the server it spawns both
-# inherit the environment, so exporting the variables in the caller is enough.
-#
-# Contract with the workflow:
-#   * writes $RUNNER_TEMP/exit-proxy.env  (shell-sourceable, consumed by the
-#     step that runs opencode - deliberately NOT $GITHUB_ENV, so that gh/curl
-#     in the snapshot and relay steps keep talking to github.com directly)
-#   * writes $HOME/.config/opencode/exit-proxy.json (state for the TG bridge
-#     and for the next run, which then avoids reusing the same proxy)
-#   * never fails the step: with no usable proxy the run continues on a direct
-#     connection and says so.
+# Outputs:
+#   $RUNNER_TEMP/egress/upstream        direct | relay:ip:port | http:host:port
+#   $RUNNER_TEMP/egress/candidates.tsv  ordered fallbacks for runtime rotation
+#   $RUNNER_TEMP/exit-proxy.env         HTTP_PROXY=http://127.0.0.1:8089
+#   $HOME/.config/opencode/exit-proxy.json
+#   $HOME/.config/opencode/egress-blacklist.json (persisted, 0600)
 set -uo pipefail
 
-# The probe must measure the candidates themselves, not an inherited proxy.
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy 2>/dev/null || true
-
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER_TEMP="${RUNNER_TEMP:-/tmp}"
-ENV_FILE="$RUNNER_TEMP/exit-proxy.env"
-STATE_FILE="$HOME/.config/opencode/exit-proxy.json"
-PROBE_URL="${EXIT_PROXY_PROBE_URL:-https://opencode.ai/zen/v1/models}"
-IP_URL="${EXIT_PROXY_IP_URL:-https://api.ipify.org}"
-MAX_CANDIDATES="${EXIT_PROXY_MAX_CANDIDATES:-200}"
-PROBE_TIMEOUT="${EXIT_PROXY_PROBE_TIMEOUT:-9}"
-BUDGET_SECONDS="${EXIT_PROXY_BUDGET_SECONDS:-200}"
-PARALLEL="${EXIT_PROXY_PARALLEL:-24}"
+EGRESS_STATE_DIR="${EGRESS_STATE_DIR:-$RUNNER_TEMP/egress}"
+export EGRESS_STATE_DIR
+# shellcheck source=egress-lib.sh
+. "$SCRIPT_DIR/egress-lib.sh"
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$EGRESS_STATE_DIR"
+: > "$EGRESS_CANDIDATES_FILE"
+echo 0 > "$EGRESS_EPOCH_FILE"
+egress_bl_init
+egress_bl_prune
 
-log() { echo "[exit-proxy] $*"; }
+SELECT_BUDGET="${EGRESS_SELECT_BUDGET:-240}"
+SELECT_MAX="${EGRESS_SELECT_MAX:-80}"
+START=$(egress_now)
 
-mkdir -p "$(dirname "$STATE_FILE")"
+log() { echo "[egress-select] $*"; }
 
-# --- 0. never reuse the proxy of the previous run ----------------------------
-PREV=""
-PREV_EGRESS=""
-if [ -f "$STATE_FILE" ]; then
-  PREV=$(jq -r '.proxy // empty' "$STATE_FILE" 2>/dev/null || true)
-  PREV_EGRESS=$(jq -r '.egress_ip // empty' "$STATE_FILE" 2>/dev/null || true)
+DIRECT_IP=$(egress_trace_direct)
+DIRECT_COLO=$(curl -sS -m 10 --noproxy '*' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^colo=/{print $2}')
+log "direct egress=${DIRECT_IP:-unknown} colo=${DIRECT_COLO:-?}"
+
+# ---- candidate list -------------------------------------------------------
+# 1) direct (a fresh runner IP is often the best bucket)
+printf 'direct\t-\tdirect\n' >> "$EGRESS_CANDIDATES_FILE"
+
+# 2) proxyip relay entries (non-CF ASN + CF edge ports; --connect-to relays TCP)
+RELAY_SOURCE="${EGRESS_RELAY_SOURCE:-all_rep_verified.txt}"
+RELAY_URL="https://raw.githubusercontent.com/Xiaobei09/proxyip/main/data/valid/$RELAY_SOURCE"
+if curl -fsSL --retry 3 --retry-delay 2 --max-time 90 "$RELAY_URL" -o "$EGRESS_STATE_DIR/relays.txt"; then
+  # all_rep_verified is reputation-ordered. Keep the head; dedupe entries.
+  head -n 220 "$EGRESS_STATE_DIR/relays.txt" \
+    | tr -d '\r' \
+    | sed 's/#.*//' \
+    | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' \
+    | awk '!seen[$0]++' \
+    | while IFS= read -r hp; do printf 'relay\t%s\tproxyip\n' "$hp"; done \
+    >> "$EGRESS_CANDIDATES_FILE"
+  log "relay candidates: $(grep -c '^relay' "$EGRESS_CANDIDATES_FILE" || true) from $RELAY_SOURCE"
+else
+  log "relay source unavailable: $RELAY_URL"
 fi
 
-# --- 1. direct egress IP (the identity whose quota is exhausted) -------------
-DIRECT_IP=$(curl -s -m 12 "$IP_URL" 2>/dev/null | tr -dc '0-9a-fA-F.:' | head -c 64)
-log "direct egress=${DIRECT_IP:-unknown} previous=${PREV:-none}"
-
-# --- 2. candidate pool from public proxy lists ------------------------------
-# Only http:// proxies: Bun cannot use SOCKS. Note that Xiaobei09/proxyip is a
-# Cloudflare edge / relay dataset (it feeds DNS-level --resolve tricks) and
-# contains no usable CONNECT proxies - measured 0/100 reachable - so it is not
-# part of the pool any more.
-SOURCES=(
+# 3) public HTTP CONNECT proxies (fallback; preflight rejects exhausted ones)
+HTTP_SOURCES=(
   "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
   "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt"
   "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"
 )
-: > "$WORK/pool.txt"
-SRC_FILES=()
 i=0
-for url in "${SOURCES[@]}"; do
-  f="$WORK/src_$i.txt"
+for url in "${HTTP_SOURCES[@]}"; do
+  f="$EGRESS_STATE_DIR/http_$i.txt"
   i=$((i + 1))
   if curl -fsSL -m 25 "$url" -o "$f.raw" 2>/dev/null; then
     tr -d '\r' < "$f.raw" | sed 's/#.*//' \
-      | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' | sort -u > "$f"
-    n=$(wc -l < "$f")
-    log "source $n entries ${url}"
-    [ "$n" -gt 0 ] && SRC_FILES+=("$f")
+      | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' | sort -u > "$f"
+    head -n 80 "$f" | awk '!seen[$0]++' \
+      | while IFS= read -r hp; do printf 'http\t%s\thttp-pool\n' "$hp"; done \
+      >> "$EGRESS_CANDIDATES_FILE"
+    log "http source $(wc -l < "$f") entries ${url}"
   else
-    log "source unavailable: ${url}"
+    log "http source unavailable: ${url}"
   fi
 done
 
-# Candidate order matters: the first source is the one that actually works
-# (measured 12/100 reachable vs ~1/100 for the others), so it is probed first
-# and in full; the rest only fill the remaining budget.
-: > "$WORK/pool_u.txt"
-for f in ${SRC_FILES[@]+"${SRC_FILES[@]}"}; do
-  if command -v shuf >/dev/null 2>&1; then
-    shuf "$f" >> "$WORK/pool_u.txt"
+# Deduplicate while preserving order.
+awk -F'\t' '!seen[$1 FS $2]++' "$EGRESS_CANDIDATES_FILE" > "$EGRESS_CANDIDATES_FILE.tmp" \
+  && mv "$EGRESS_CANDIDATES_FILE.tmp" "$EGRESS_CANDIDATES_FILE"
+log "candidates: $(wc -l < "$EGRESS_CANDIDATES_FILE")"
+
+# ---- pick the first candidate that passes the real preflight --------------
+SELECTED_KIND=""; SELECTED_TARGET=""; SELECTED_SOURCE=""; SELECTED_UP=""; SELECTED_EGRESS=""
+n=0
+while IFS=$'\t' read -r kind target source; do
+  [ -n "${kind:-}" ] || continue
+  now=$(egress_now)
+  [ $((now - START)) -ge "$SELECT_BUDGET" ] && { log "selection budget exhausted"; break; }
+  [ "$n" -ge "$SELECT_MAX" ] && { log "selection max candidates reached"; break; }
+
+  case "$kind" in
+    direct) key="direct:${DIRECT_IP:-unknown}"; up="direct"; target="-" ;;
+    relay)  key="relay:$target"; up="relay:$target" ;;
+    http)   key="http:$target"; up="http:$target" ;;
+    *) continue ;;
+  esac
+
+  if egress_bl_has "$key"; then
+    log "skip blacklisted $key"
+    continue
+  fi
+  n=$((n + 1))
+  if [ "$kind" = "direct" ]; then
+    out=$(bash "$SCRIPT_DIR/egress-preflight.sh" direct "" 12 2>/dev/null || true)
   else
-    sort -R "$f" >> "$WORK/pool_u.txt" 2>/dev/null || cat "$f" >> "$WORK/pool_u.txt"
+    out=$(bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$target" 12 2>/dev/null || true)
   fi
-done
-awk '!seen[$0]++' "$WORK/pool_u.txt" | grep -v "^${PREV:-__none__}$" > "$WORK/pool_u2.txt"
-head -"$MAX_CANDIDATES" "$WORK/pool_u2.txt" > "$WORK/cands.txt"
-log "candidates: $(wc -l < "$WORK/cands.txt") (cap $MAX_CANDIDATES)"
-
-# --- 3. probe: a working CONNECT tunnel to the provider endpoint ------------
-: > "$WORK/probe.txt"
-probe_one() {
-  hp="$1"
-  t=$(curl -x "http://$hp" -m "$PROBE_TIMEOUT" -s -o /dev/null \
-        -w '%{http_code} %{time_total}' "$PROBE_URL" 2>/dev/null)
-  code="${t%% *}"
-  if [ "$code" != "000" ] && [ -n "$code" ]; then
-    echo "$hp $t" >> "$WORK/probe.txt"
-  fi
-}
-export -f probe_one
-export PROBE_URL PROBE_TIMEOUT WORK
-if command -v xargs >/dev/null 2>&1; then
-  timeout "$BUDGET_SECONDS" xargs -a "$WORK/cands.txt" -I{} -P "$PARALLEL" bash -c 'probe_one "$@"' _ {} 2>/dev/null
-else
-  while read -r hp; do probe_one "$hp"; done < "$WORK/cands.txt"
-fi
-log "reachable proxies: $(wc -l < "$WORK/probe.txt")"
-
-# --- 4. pick: lowest latency whose egress IP really differs ----------------
-SELECTED=""; LATENCY=""; EGRESS=""
-if [ -s "$WORK/probe.txt" ]; then
-  # probe.txt lines are "<host> <http_code> <seconds>": sort by the latency (field 3).
-  sort -k3 -n "$WORK/probe.txt" | cut -d' ' -f1,3 > "$WORK/probe_sorted.txt"
-  # The egress IP is only used to prove that the quota identity really changes
-  # (and to avoid the previous run's proxy). Public proxies often serve the
-  # provider but block the "what is my IP" services, so an unreadable egress is
-  # NOT a reason to drop a working proxy - it is only a reason to not know it.
-  egress_of() {
-    hp="$1"
-    for u in "$IP_URL" "https://ifconfig.me/ip" "https://icanhazip.com"; do
-      e=$(curl -x "http://$hp" -m 15 -s "$u" 2>/dev/null | tr -dc '0-9a-fA-F.:' | head -c 64)
-      if [ -n "$e" ]; then
-        echo "$e"
-        return 0
-      fi
-    done
-    return 1
-  }
-  while read -r hp lat; do
-    eip=$(egress_of "$hp" || true)
-    if [ -z "$eip" ]; then
-      log "egress ip unreadable through $hp; taking it anyway (it reached the provider)"
-      SELECTED="$hp"; LATENCY="$lat"; EGRESS=""
-      break
-    fi
-    [ -n "$DIRECT_IP" ] && [ "$eip" = "$DIRECT_IP" ] && continue
-    [ -n "$PREV_EGRESS" ] && [ "$eip" = "$PREV_EGRESS" ] && continue
-    SELECTED="$hp"; LATENCY="$lat"; EGRESS="$eip"
+  code=${out%%$'\t'*}
+  why=${out##*$'\t'}
+  [ -n "$code" ] || code=000
+  [ -n "$why" ] || why=transport
+  if [ "$code" = "200" ] && [ "$why" = "ok" ]; then
+    SELECTED_KIND="$kind"; SELECTED_TARGET="$target"; SELECTED_SOURCE="$source"; SELECTED_UP="$up"
+    case "$kind" in
+      direct) SELECTED_EGRESS="${DIRECT_IP:-unknown}" ;;
+      relay)  SELECTED_EGRESS=$(egress_trace_relay "$target") ;;
+      http)   SELECTED_EGRESS=$(egress_trace_http "$target") ;;
+    esac
+    [ -n "$SELECTED_EGRESS" ] || SELECTED_EGRESS="unknown"
+    egress_bl_del "$key"
+    log "selected $kind $target egress=$SELECTED_EGRESS code=200"
     break
-  done < "$WORK/probe_sorted.txt"
+  fi
+  ttl=21600
+  [ "$why" = "transport" ] && ttl=1800
+  if [ "$kind" = "direct" ]; then
+    failed_egress="${DIRECT_IP:-}"
+  elif [ "$why" = "quota" ] || [ "$why" = "body_error" ]; then
+    # Only trace quota failures: a dead relay would burn the trace timeout for
+    # no diagnostic value, and the entry address is enough to blacklist it.
+    failed_egress=$(egress_candidate_ip "$kind" "$target" 2>/dev/null || true)
+  else
+    failed_egress=""
+  fi
+  egress_bl_add "$key" "$failed_egress" "$why" "$ttl" || true
+  log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${ttl}s)"
+done < "$EGRESS_CANDIDATES_FILE"
+
+if [ -z "$SELECTED_KIND" ]; then
+  log "no candidate passed; falling back to direct (the next run gets a fresh runner IP)"
+  SELECTED_KIND="direct"; SELECTED_TARGET="-"; SELECTED_SOURCE="fallback-direct"
+  SELECTED_UP="direct"; SELECTED_EGRESS="${DIRECT_IP:-unknown}"
 fi
 
-# --- 5. export --------------------------------------------------------------
-# R941 (D5): release-assets.githubusercontent.com is the host that actually
-# serves release asset downloads. It was missing here, so `gh release download`
-# run from inside the opencode process went through the public proxy and failed
-# ("Too many open connections", observed 2026-10-21 while fetching the loop's
-# own state). GitHub hosts must always stay off the provider proxy.
+egress_write_upstream "$SELECTED_UP"
+egress_write_state "$SELECTED_KIND" "$SELECTED_UP" "$SELECTED_EGRESS" "$SELECTED_SOURCE" "${DIRECT_IP:-unknown}"
+
+# ---- handoff to the Run OpenCode step ------------------------------------
 NO_PROXY_LIST="localhost,127.0.0.1,::1,api.telegram.org,github.com,api.github.com,objects.githubusercontent.com,release-assets.githubusercontent.com,raw.githubusercontent.com,codeload.github.com,registry.npmjs.org"
-[ -z "$EGRESS" ] && EGRESS="unknown"
-
-if [ -n "$SELECTED" ]; then
-  {
-    echo "HTTP_PROXY=http://${SELECTED}"
-    echo "HTTPS_PROXY=http://${SELECTED}"
-    echo "http_proxy=http://${SELECTED}"
-    echo "https_proxy=http://${SELECTED}"
-    echo "NO_PROXY=${NO_PROXY_LIST}"
-    echo "no_proxy=${NO_PROXY_LIST}"
-  } > "$ENV_FILE"
-  log "selected http://${SELECTED} egress=${EGRESS} latency=${LATENCY}s"
-else
-  : > "$ENV_FILE"
-  log "no usable proxy found; continuing on the direct connection (${DIRECT_IP:-unknown})"
-fi
-
-# --- 6. state for the TG bridge and the next run ----------------------------
-cat > "$STATE_FILE" <<JSON
 {
-  "proxy": "${SELECTED}",
-  "scheme": "http",
-  "egress_ip": "${EGRESS}",
-  "direct_ip": "${DIRECT_IP}",
-  "latency_s": "${LATENCY}",
-  "source": "public-proxy-pool",
-  "picked_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-JSON
-chmod 600 "$STATE_FILE" 2>/dev/null || true
+  echo "HTTP_PROXY=http://127.0.0.1:${EGRESS_LOCAL_PORT}"
+  echo "HTTPS_PROXY=http://127.0.0.1:${EGRESS_LOCAL_PORT}"
+  echo "http_proxy=http://127.0.0.1:${EGRESS_LOCAL_PORT}"
+  echo "https_proxy=http://127.0.0.1:${EGRESS_LOCAL_PORT}"
+  echo "NO_PROXY=${NO_PROXY_LIST}"
+  echo "no_proxy=${NO_PROXY_LIST}"
+} > "$RUNNER_TEMP/exit-proxy.env"
+chmod 600 "$RUNNER_TEMP/exit-proxy.env" 2>/dev/null || true
 
-if [ -n "$SELECTED" ]; then
-  echo "exit-proxy: http://${SELECTED} egress=${EGRESS} latency=${LATENCY}s"
-else
-  echo "exit-proxy: none (direct ${DIRECT_IP:-unknown})"
-fi
+echo "[egress-select] upstream=$SELECTED_UP kind=$SELECTED_KIND egress=$SELECTED_EGRESS source=$SELECTED_SOURCE direct=${DIRECT_IP:-unknown}"
 exit 0

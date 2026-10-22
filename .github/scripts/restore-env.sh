@@ -194,7 +194,8 @@ if [ -d "$ENV_SRC/config" ]; then
     case "$(basename "$f")" in
       tg-chats.json|tg-chats-bot*.json|tg-bots.json|loop-ctl.json|loop-marker.json|\
       loop-guard.json|loop-sessions.json|model-windows.json|abort-events.json|\
-      inject-card-*.json|botname-*.json|service.json|tg-bot*.env|tg.env) continue ;;
+      inject-card-*.json|botname-*.json|service.json|tg-bot*.env|tg.env|\
+      egress-blacklist.json|exit-proxy.json) continue ;;
     esac
     cp -a "$f" "$HOME/.config/opencode/" 2>/dev/null || true
   done
