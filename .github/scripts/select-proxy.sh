@@ -8,6 +8,8 @@
 # Outputs:
 #   $RUNNER_TEMP/egress/upstream        direct | relay:ip:port | http:host:port
 #   $RUNNER_TEMP/egress/candidates.tsv  ordered fallbacks for runtime rotation
+#                                       (direct + proxyip relays; public HTTP
+#                                       only with EGRESS_ALLOW_PUBLIC_HTTP=1)
 #   $RUNNER_TEMP/exit-proxy.env         HTTP_PROXY=http://127.0.0.1:8089
 #   $HOME/.config/opencode/exit-proxy.json
 #   $HOME/.config/opencode/egress-blacklist.json (persisted, 0600)
@@ -57,28 +59,34 @@ else
   log "relay source unavailable: $RELAY_URL"
 fi
 
-# 3) public HTTP CONNECT proxies (fallback; preflight rejects exhausted ones)
-HTTP_SOURCES=(
-  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
-  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
-  "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt"
-  "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"
-)
-i=0
-for url in "${HTTP_SOURCES[@]}"; do
-  f="$EGRESS_STATE_DIR/http_$i.txt"
-  i=$((i + 1))
-  if curl -fsSL -m 25 "$url" -o "$f.raw" 2>/dev/null; then
-    tr -d '\r' < "$f.raw" | sed 's/#.*//' \
-      | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' | sort -u > "$f"
-    head -n 80 "$f" | awk '!seen[$0]++' \
-      | while IFS= read -r hp; do printf 'http\t%s\thttp-pool\n' "$hp"; done \
-      >> "$EGRESS_CANDIDATES_FILE"
-    log "http source $(wc -l < "$f") entries ${url}"
-  else
-    log "http source unavailable: ${url}"
-  fi
-done
+# 3) public HTTP CONNECT proxies are DISABLED by default. They are untrusted,
+#    unstable, and can observe SNI metadata. Keep the code behind an explicit
+#    opt-in for experiments; production uses direct + proxyip relays only.
+if [ "${EGRESS_ALLOW_PUBLIC_HTTP:-0}" = "1" ]; then
+  HTTP_SOURCES=(
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt"
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"
+  )
+  i=0
+  for url in "${HTTP_SOURCES[@]}"; do
+    f="$EGRESS_STATE_DIR/http_$i.txt"
+    i=$((i + 1))
+    if curl -fsSL -m 25 "$url" -o "$f.raw" 2>/dev/null; then
+      tr -d '\r' < "$f.raw" | sed 's/#.*//' \
+        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' | sort -u > "$f"
+      head -n 80 "$f" | awk '!seen[$0]++' \
+        | while IFS= read -r hp; do printf 'http\t%s\thttp-pool\n' "$hp"; done \
+        >> "$EGRESS_CANDIDATES_FILE"
+      log "http source $(wc -l < "$f") entries ${url}"
+    else
+      log "http source unavailable: ${url}"
+    fi
+  done
+else
+  log "public HTTP proxy pool disabled (set EGRESS_ALLOW_PUBLIC_HTTP=1 to enable)"
+fi
 
 # Deduplicate while preserving order.
 awk -F'\t' '!seen[$1 FS $2]++' "$EGRESS_CANDIDATES_FILE" > "$EGRESS_CANDIDATES_FILE.tmp" \

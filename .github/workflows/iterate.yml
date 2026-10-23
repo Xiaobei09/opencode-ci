@@ -161,9 +161,10 @@ jobs:
         # reached...". DNS edge tricks changed which Cloudflare edge answered, not the
         # source IP, so the quota stayed exhausted.
         #
-        # This step builds an ordered candidate list (direct runner IP, proxyip relay
-        # entries, public HTTP CONNECT proxies) and tests each candidate with the real
-        # inference call in scripts/egress-preflight.sh:
+        # This step builds an ordered candidate list (direct runner IP + proxyip relay
+        # entries; the public HTTP CONNECT pool is disabled unless
+        # EGRESS_ALLOW_PUBLIC_HTTP=1) and tests each candidate with the real inference
+        # call in scripts/egress-preflight.sh:
         #   POST https://opencode.ai/inference/v1/chat/completions
         #   Authorization: Bearer public, User-Agent: opencode/1.18.32
         # A /zen/v1/models 200 is NOT enough: the inference endpoint can still return
@@ -182,6 +183,7 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+          EGRESS_ALLOW_PUBLIC_HTTP: "0"
         run: |
           set +e
           bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
