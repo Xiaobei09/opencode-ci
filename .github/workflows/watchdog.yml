@@ -40,7 +40,9 @@ jobs:
             exit 0
           fi
           # A disabled workflow cannot be dispatched (R921: 422 disabled workflow).
-          state=$(gh workflow view iterate.yml --repo "$repo" --json state --jq .state 2>/dev/null || echo unknown)
+          # `gh workflow view` has no --json in the runner's gh; list supports it.
+          state=$(gh workflow list --repo "$repo" --json name,state --jq '.[] | select(.name == "iterate") | .state' 2>/dev/null | head -1)
+          [ -n "$state" ] || state=unknown
           if [ "$state" != "active" ]; then
             echo "::warning::iterate.yml is '$state'; enabling"
             gh workflow enable iterate.yml --repo "$repo" || true
