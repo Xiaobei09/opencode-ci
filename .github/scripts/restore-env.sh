@@ -321,6 +321,21 @@ def write_env(path, token, allowed_chat, push_chat, label=None):
 
 put({"id": "primary", "label": by.get("primary", {}).get("label", "CI"), "envFile": f"{home}/.opencode/tg.env"})
 
+for n in ("3", "4"):
+    tok = os.environ.get(f"TG_BOT{n}_TOKEN", "").strip()
+    bid = f"bot{n}"
+    envp = f"{home}/.config/opencode/tg-bot{n}.env"
+    if tok:
+        label = str(by.get(bid, {}).get("label") or bid)
+        write_env(envp, tok, allowed, push, label)
+        put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
+        print(f"bot{n} secret env written")
+    elif os.path.isfile(envp):
+        print(f"bot{n} env present (no CI secret this run)")
+    else:
+        print(f"::warning::TG_BOT{n}_TOKEN missing; bot{n} will run without a token")
+        by.pop(bid, None)
+
 raw = os.environ.get("TG_BOTS_EXTRA", "").strip()
 if raw:
     try:
@@ -346,20 +361,6 @@ if raw:
         put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
         print(f"bot {bid} secret env written (TG_BOTS_EXTRA)")
 
-for n in ("3", "4"):
-    tok = os.environ.get(f"TG_BOT{n}_TOKEN", "").strip()
-    bid = f"bot{n}"
-    envp = f"{home}/.config/opencode/tg-bot{n}.env"
-    if tok:
-        label = str(by.get(bid, {}).get("label") or bid)
-        write_env(envp, tok, allowed, push, label)
-        put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
-        print(f"bot{n} secret env written")
-    elif os.path.isfile(envp):
-        print(f"bot{n} env present (no CI secret this run)")
-    else:
-        print(f"::warning::TG_BOT{n}_TOKEN missing; bot{n} will run without a token")
-        by.pop(bid, None)
 
 # Pre-existing tg-bot*.env files (restored snapshot) join the registry automatically.
 for d in (f"{home}/.config/opencode", f"{home}/.opencode"):
