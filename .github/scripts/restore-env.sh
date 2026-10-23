@@ -253,32 +253,210 @@ if [ ! -d "$HOME/.config/opencode/plugins" ]; then
   exit 0
 fi
 # 3. Derived registry plus the secret env file, both kept outside the repo.
-if [ -f "$ENV_SRC/templates/tg-bots.json" ]; then
-  sed "s#__HOME__#$HOME#g" "$ENV_SRC/templates/tg-bots.json" > "$HOME/.config/opencode/tg-bots.json"
+# R2501 (2026-10-23): **never clobber a restored registry** with the static template.
+# The old unconditional `sed template > tg-bots.json` silently dropped every bot
+# the operator had added (bot3/bot4) on every boot; after the 2026-10-21 factory
+# reset that is exactly why bot4 received no updates. Seed only when missing, then
+# merge the bots whose tokens this run received below.
+REG="$HOME/.config/opencode/tg-bots.json"
+if [ ! -s "$REG" ] && [ -f "$ENV_SRC/templates/tg-bots.json" ]; then
+  sed "s#__HOME__#$HOME#g" "$ENV_SRC/templates/tg-bots.json" > "$REG"
 fi
+if [ ! -s "$REG" ]; then printf '{"bots":[{"id":"primary","label":"CI","envFile":"%s/.opencode/tg.env"}]}\n' "$HOME" > "$REG"; fi
+chmod 600 "$REG" 2>/dev/null || true
 : > "$HOME/.opencode/tg.env"
 if [ -n "${TG_BOT_TOKEN:-}" ]; then printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.opencode/tg.env"; fi
 if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
 if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
 chmod 600 "$HOME/.opencode/tg.env"
-# bot3/bot4 tokens come from CI secrets too (ROUND 26). A token file kept under
-# $HOME cannot survive on its own: the value-independent snapshot scrub rewrites
-# token-shaped text to REDACTED, and ~/.config/opencode/tg-bot*.env is excluded
-# from the package - so a hand-written file is gone after every restart (exactly
-# why bot3/bot4 kept reporting token=MISSING).
-for b in 3 4; do
-  v=""
-  [ "$b" = "3" ] && v="${TG_BOT3_TOKEN:-}"
-  [ "$b" = "4" ] && v="${TG_BOT4_TOKEN:-}"
-  if [ -n "$v" ]; then
-    printf 'TG_BOT_TOKEN=%s\nTG_ALLOWED_CHAT=%s\nTG_PUSH_CHAT=%s\n' \
-      "$v" "${TG_ALLOWED_CHAT:-}" "${TG_PUSH_CHAT:-}" > "$HOME/.config/opencode/tg-bot$b.env"
-    chmod 600 "$HOME/.config/opencode/tg-bot$b.env"
-    echo "bot$b secret env written"
-  else
-    echo "::warning::TG_BOT${b}_TOKEN missing; bot$b will run without a token"
-  fi
-done
+# bot env files + registry merge (2026-10-23): add bots **without touching code**.
+# Sources, in order:
+#   • TG_BOT3_TOKEN / TG_BOT4_TOKEN (legacy secrets, kept working)
+#   • TG_BOTS_EXTRA: one JSON secret with an array of {id,label,token,allowedChat?,pushChat?}
+#     — add/rotate any number of bots in one place.
+#   • any pre-existing tg-bot<id>.env file (restored from the environment snapshot)
+# Every token is written to a 0600 env file (excluded from packages), then the registry
+# is merged atomically instead of being overwritten. Entry discovery in the bridge entry
+# additionally picks up tg-bot*.env files, so a single dropped file is enough.
+export TG_BOTS_EXTRA="${TG_BOTS_EXTRA:-}"
+python3 - <<'PY'
+import json, os, re, tempfile
+
+home = os.path.expanduser("~")
+reg_path = f"{home}/.config/opencode/tg-bots.json"
+allowed = os.environ.get("TG_ALLOWED_CHAT", "")
+push = os.environ.get("TG_PUSH_CHAT", "")
+
+def read_json(p, default):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+data = read_json(reg_path, {"bots": []})
+if isinstance(data, list):
+    data = {"bots": data}
+bots = [b for b in data.get("bots", []) if isinstance(b, dict) and str(b.get("id", "")).strip()]
+by = {str(b["id"]).lower(): b for b in bots}
+
+def put(bot):
+    bid = re.sub(r"[^a-z0-9_-]", "", str(bot.get("id", "")).lower())
+    if not bid or len(bid) > 24:
+        return
+    bot["id"] = bid
+    by[bid] = bot
+
+def write_env(path, token, allowed_chat, push_chat, label=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(f"TG_BOT_TOKEN={token}\n")
+        f.write(f"TG_ALLOWED_CHAT={allowed_chat}\n")
+        f.write(f"TG_PUSH_CHAT={push_chat}\n")
+        if label:
+            f.write(f"TG_BOT_LABEL={label}\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+put({"id": "primary", "label": by.get("primary", {}).get("label", "CI"), "envFile": f"{home}/.opencode/tg.env"})
+
+raw = os.environ.get("TG_BOTS_EXTRA", "").strip()
+if raw:
+    try:
+        j = json.loads(raw)
+        extras = j.get("bots", []) if isinstance(j, dict) else j
+        if not isinstance(extras, list):
+            raise ValueError("expected a JSON array or {bots:[...]}")
+    except Exception as e:
+        extras = []
+        print(f"::warning::TG_BOTS_EXTRA ignored (invalid JSON): {e}")
+    for item in extras:
+        if not isinstance(item, dict) or not str(item.get("token", "")).strip():
+            print("::warning::TG_BOTS_EXTRA entry skipped (missing id/token)")
+            continue
+        bid = re.sub(r"[^a-z0-9_-]", "", str(item.get("id", "")).lower())
+        if not bid:
+            print("::warning::TG_BOTS_EXTRA entry skipped (invalid id)")
+            continue
+        file_id = bid[3:] if bid.startswith("bot") and len(bid) > 3 else bid
+        envp = os.path.expanduser(item.get("envFile") or f"{home}/.config/opencode/tg-bot{file_id}.env")
+        label = str(item.get("label") or bid)
+        write_env(envp, str(item["token"]).strip(), str(item.get("allowedChat") or allowed), str(item.get("pushChat") or push), label)
+        put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
+        print(f"bot {bid} secret env written (TG_BOTS_EXTRA)")
+
+for n in ("3", "4"):
+    tok = os.environ.get(f"TG_BOT{n}_TOKEN", "").strip()
+    bid = f"bot{n}"
+    envp = f"{home}/.config/opencode/tg-bot{n}.env"
+    if tok:
+        label = str(by.get(bid, {}).get("label") or bid)
+        write_env(envp, tok, allowed, push, label)
+        put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
+        print(f"bot{n} secret env written")
+    elif os.path.isfile(envp):
+        print(f"bot{n} env present (no CI secret this run)")
+    else:
+        print(f"::warning::TG_BOT{n}_TOKEN missing; bot{n} will run without a token")
+        by.pop(bid, None)
+
+# Pre-existing tg-bot*.env files (restored snapshot) join the registry automatically.
+for d in (f"{home}/.config/opencode", f"{home}/.opencode"):
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        continue
+    for n in names:
+        m = re.match(r"^tg-bot([a-z0-9_-]{1,24})\.env$", n, re.I)
+        if not m:
+            continue
+        sfx = m.group(1).lower()
+        bid = sfx if sfx.startswith("bot") else f"bot{sfx}"
+        if bid in by:
+            continue
+        envp = f"{d}/{n}"
+        ok, label = False, bid
+        try:
+            for line in open(envp, encoding="utf-8"):
+                if line.startswith("TG_BOT_TOKEN=") and line.split("=", 1)[1].strip():
+                    ok = True
+                if line.startswith("TG_BOT_LABEL=") and line.split("=", 1)[1].strip():
+                    label = line.split("=", 1)[1].strip()
+        except OSError:
+            continue
+        if ok:
+            try:
+                os.chmod(envp, 0o600)
+            except OSError:
+                pass
+            put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
+
+# Drop entries whose env file vanished: a registered-but-tokenless bot just logs
+# MISSING every boot and never answers (the recurring bot4 complaint).
+keep = {}
+for bid, b in by.items():
+    p = b.get("envFile")
+    if bid == "primary" or not p:
+        keep[bid] = b
+        continue
+    try:
+        txt = open(os.path.expanduser(p), encoding="utf-8").read()
+    except OSError:
+        print(f"bot registry: drop {bid} (env file missing: {p})")
+        continue
+    if "TG_BOT_TOKEN=" not in txt:
+        print(f"bot registry: drop {bid} (no token in env file)")
+        continue
+    keep[bid] = b
+
+# Same token must never be polled by two bots: Telegram returns 409 for both and
+# the later one silently receives nothing (bot4 symptom on 2026-10-23: the
+# TG_BOT3_TOKEN and TG_BOT4_TOKEN secrets hold the same value).
+import hashlib
+seen_tok = {}
+dedup = {}
+for bid, b in keep.items():
+    p = b.get("envFile")
+    tok = ""
+    if p:
+        try:
+            for line in open(os.path.expanduser(p), encoding="utf-8"):
+                if line.startswith("TG_BOT_TOKEN="):
+                    tok = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            tok = ""
+    if tok:
+        h = hashlib.sha256(tok.encode()).hexdigest()
+        if h in seen_tok:
+            print(f"::warning::bot registry: drop {bid} (duplicate token of {seen_tok[h]}; set a distinct token secret)")
+            continue
+        seen_tok[h] = bid
+    dedup[bid] = b
+keep = dedup
+
+out = {"bots": list(keep.values())}
+fd, tmp = tempfile.mkstemp(prefix=".tg-bots.", dir=os.path.dirname(reg_path), text=True)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(out, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, reg_path)
+print(f"bot registry: {len(keep)} bot(s) -> {', '.join(keep)}")
+PY
+# Web search without an interactive prompt: CI sessions have no one to answer
+# "choose a provider" (every search was cancelled with 'Web search cancelled').
+# Exa is a public MCP endpoint and works without a key; pin it globally.
+CFGJSON="$HOME/.config/opencode/opencode.json"
+if [ ! -s "$CFGJSON" ]; then
+  printf '{"$schema":"https://opencode.ai/config.json","websearch":{"provider":"exa"}}\n' > "$CFGJSON"
+fi
+if command -v jq >/dev/null 2>&1; then
+  tmp=$(mktemp)
+  jq '.websearch = ((.websearch // {}) + {provider: ((.websearch.provider) // "exa")})' "$CFGJSON" > "$tmp" 2>/dev/null && mv "$tmp" "$CFGJSON" || rm -f "$tmp"
+fi
+chmod 600 "$CFGJSON" 2>/dev/null || true
 # R648：tar 不保留空目录，snapshot gitdir 的 refs/ 会在跨 run 还原时丢失；
 # 随后 native snapshot 把 gitdir 判成 unreadable，产生 rebuilding/failed capture 风暴。
 # 只给看起来像 gitdir 的二级目录补 refs/，不动对象/索引。

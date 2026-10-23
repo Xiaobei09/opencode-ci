@@ -111,6 +111,7 @@ jobs:
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
           TG_BOT3_TOKEN: ${{ secrets.TG_BOT3_TOKEN }}
           TG_BOT4_TOKEN: ${{ secrets.TG_BOT4_TOKEN }}
+          TG_BOTS_EXTRA: ${{ secrets.TG_BOTS_EXTRA }}
         run: |
           set +e
           # R573: targets restore (~12s) and env restore (~17s) are independent; run them

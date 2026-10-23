@@ -1,0 +1,58 @@
+name: iterate-watchdog
+
+# R2501 (2026-10-23): the 2026-10-21 18:20 → 2026-10-23 02:03 gap had one cause:
+# every run relays its successor, so a run that is **cancelled while still queued**
+# (concurrency keeps only one pending run; a newer trigger replaces it) never
+# reaches the relay step. The 6h cron *should* eventually restart the loop, but it
+# was itself cancelled/starved during the same window. This watchdog is deliberately
+# outside the iterate concurrency group: every 10 minutes it looks at iterate's
+# status and dispatches one run only when nothing is running or queued.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: iterate-watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  GH_TOKEN: ${{ secrets.CROSS_PAT }}
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch iterate when the loop is gone
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          # queued / in_progress / pending / waiting are all "a successor exists".
+          live=$(gh run list --repo "$repo" --workflow iterate.yml --limit 20 \
+                   --json status --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "pending" or .status == "waiting" or .status == "requested")] | length')
+          if [ "${live:-0}" -gt 0 ]; then
+            echo "iterate alive: $live run(s) in flight; nothing to do"
+            exit 0
+          fi
+          # A disabled workflow cannot be dispatched (R921: 422 disabled workflow).
+          state=$(gh workflow view iterate.yml --repo "$repo" --json state --jq .state 2>/dev/null || echo unknown)
+          if [ "$state" != "active" ]; then
+            echo "::warning::iterate.yml is '$state'; enabling"
+            gh workflow enable iterate.yml --repo "$repo" || true
+          fi
+          echo "::notice::no iterate run in flight for >~10min; dispatching a successor"
+          for attempt in 1 2 3; do
+            if gh workflow run iterate.yml -f resume=true --repo "$repo"; then
+              echo "watchdog dispatched iterate on attempt $attempt"
+              exit 0
+            fi
+            echo "::warning::watchdog dispatch attempt $attempt failed; retrying"
+            sleep 5
+          done
+          echo "::error::watchdog could not dispatch iterate"
+          exit 1

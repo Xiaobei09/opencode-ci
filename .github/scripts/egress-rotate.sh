@@ -60,9 +60,11 @@ while IFS=$'\t' read -r kind target source; do
     continue
   fi
   tries=$((tries + 1))
-  [ "$tries" -gt 80 ] && { echo "rotate: candidate budget exhausted"; break; }
+  # Same tuning as select-proxy: 8s is enough for a real inference answer; 48
+  # candidates is ~4x the observed need. Keeps a quota rotation short.
+  [ "$tries" -gt "${EGRESS_SELECT_MAX:-48}" ] && { echo "rotate: candidate budget exhausted"; break; }
 
-  out=$(bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$([ "$kind" = direct ] && echo '' || echo "$target")" 12 2>/dev/null || true)
+  out=$(bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$([ "$kind" = direct ] && echo '' || echo "$target")" "${EGRESS_PREFLIGHT_TIMEOUT:-8}" 2>/dev/null || true)
   code=${out%%$'\t'*}
   why=${out##*$'\t'}
   [ -n "$code" ] || code=000
