@@ -601,6 +601,9 @@ jobs:
             fi
           fi
           if [ "$SKIP_ENV_PACK" != 1 ]; then
+          # R2507: transient shell transcripts can exceed GitHub's 100MiB file limit and
+          # bloat the fallback pack; they are not needed for restore.
+          find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null || true
           "${TAR_COMP[@]}" -C "$HOME" \
             --exclude='./work' \
             --exclude='./.cache' \
