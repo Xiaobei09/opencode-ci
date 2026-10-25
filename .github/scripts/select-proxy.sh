@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Select the initial egress for this CI run and write a local-proxy handoff.
 #
-# This replaces the old "probe /zen/v1/models" logic: a 200 from that endpoint
-# does NOT mean the free-tier quota is available. Every candidate is tested
-# with the real inference call (egress-preflight.sh) and only a 200 switches.
+# Every candidate is tested by zengate: the real OpenCode CLI runs one fresh
+# session per candidate through a candidate-specific local CONNECT proxy. This
+# avoids treating a synthetic curl 429 as proof that the IP is exhausted.
 #
 # Outputs:
 #   $RUNNER_TEMP/egress/upstream        direct | relay:ip:port | http:host:port
@@ -40,10 +40,10 @@ egress_bl_prune
 #   4. the previous run's working relay is re-probed in the first batch even if
 #      it is not near the head of the list (kills the "known-good but buried"
 #      regression after a rotation).
-SELECT_BUDGET="${EGRESS_SELECT_BUDGET:-180}"
-SELECT_MAX="${EGRESS_SELECT_MAX:-48}"
-PARALLEL="${EGRESS_PARALLEL:-4}"
-PREFLIGHT_TMO="${EGRESS_PREFLIGHT_TIMEOUT:-8}"
+SELECT_BUDGET="${EGRESS_SELECT_BUDGET:-120}"
+SELECT_MAX="${EGRESS_SELECT_MAX:-12}"
+PARALLEL="${EGRESS_PARALLEL:-1}"
+PREFLIGHT_TMO="${EGRESS_PREFLIGHT_TIMEOUT:-20}"
 # R2509: quota is account/model-wide (measured 2026-10-25: direct + 48 proxyip
 # relays all answered 429 quota). Once direct itself answers quota, probing the
 # whole relay list only delays startup; sample a few relays and then fall back
@@ -59,6 +59,16 @@ PROBE_TIMEOUT=$((PREFLIGHT_TMO + 2))
 START=$(egress_now)
 
 log() { echo "[egress-select] $*"; }
+
+PROBE_ENGINE=curl
+if bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
+  PROBE_ENGINE=zengate
+  PARALLEL=1
+  log "preflight engine=zengate (real OpenCode, fresh session per candidate)"
+  trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
+else
+  log "warning: zengate probe unavailable; falling back to curl preflight"
+fi
 
 DIRECT_IP=$(egress_trace_direct)
 DIRECT_COLO=$(curl -sS -m 10 --noproxy '*' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^colo=/{print $2}')
@@ -170,7 +180,10 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     fi
     pf="$EGRESS_STATE_DIR/preflight.$$.$idx"
     rm -f "$pf"
-    if [ "$kind" = "direct" ]; then
+    if [ "$PROBE_ENGINE" = "zengate" ]; then
+      timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
+        bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$([ "$kind" = direct ] && echo "" || echo "$target")" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
+    elif [ "$kind" = "direct" ]; then
       timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
         bash "$SCRIPT_DIR/egress-preflight.sh" direct "" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
     else
@@ -243,7 +256,11 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
       log "candidate direct failed code=$code reason=quota egress=${failed_egress:-?} (kept as fallback)"
     else
       egress_bl_add "$key" "$failed_egress" "$why" "$ttl" || true
-      log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${ttl}s)"
+      if [ "$EGRESS_BLACKLIST_ENABLED" = "1" ]; then
+        log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${ttl}s)"
+      else
+        log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist disabled)"
+      fi
     fi
   done
   if [ "$direct_quota" = 1 ] && [ "$quota_fails" -ge "$QUOTA_PROBE_MAX" ] && [ -z "$SELECTED_KIND" ]; then

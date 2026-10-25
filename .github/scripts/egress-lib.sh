@@ -9,6 +9,10 @@ set -uo pipefail
 
 EGRESS_STATE_DIR="${EGRESS_STATE_DIR:-${RUNNER_TEMP:-/tmp}/egress}"
 EGRESS_BLACKLIST="${EGRESS_BLACKLIST:-$HOME/.config/opencode/egress-blacklist.json}"
+# Disabled by default while the egress scheme is being revalidated with
+# zengate. The file is still left untouched; set EGRESS_BLACKLIST_ENABLED=1 to
+# restore the old skip/persist behavior.
+EGRESS_BLACKLIST_ENABLED="${EGRESS_BLACKLIST_ENABLED:-0}"
 EGRESS_UPSTREAM_FILE="$EGRESS_STATE_DIR/upstream"
 EGRESS_EPOCH_FILE="$EGRESS_STATE_DIR/epoch"
 EGRESS_CANDIDATES_FILE="$EGRESS_STATE_DIR/candidates.tsv"
@@ -19,7 +23,9 @@ egress_now() { date +%s; }
 egress_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 egress_bl_init() {
-  mkdir -p "$(dirname "$EGRESS_BLACKLIST")" "$EGRESS_STATE_DIR"
+  mkdir -p "$EGRESS_STATE_DIR"
+  [ "$EGRESS_BLACKLIST_ENABLED" = "1" ] || return 0
+  mkdir -p "$(dirname "$EGRESS_BLACKLIST")"
   if [ ! -s "$EGRESS_BLACKLIST" ]; then
     printf '%s\n' '{"version":1,"entries":{}}' > "$EGRESS_BLACKLIST"
   fi
@@ -28,6 +34,7 @@ egress_bl_init() {
 
 egress_bl_prune() {
   local now tmp
+  [ "$EGRESS_BLACKLIST_ENABLED" = "1" ] || return 0
   now=$(egress_now)
   [ -s "$EGRESS_BLACKLIST" ] || return 0
   tmp=$(mktemp "${EGRESS_BLACKLIST}.XXXXXX") || return 0
@@ -44,6 +51,7 @@ egress_bl_prune() {
 # egress_bl_has <key>
 egress_bl_has() {
   local key="$1" now
+  [ "$EGRESS_BLACKLIST_ENABLED" = "1" ] || return 1
   now=$(egress_now)
   jq -e --arg k "$key" --argjson now "$now" \
     '(.entries[$k].until // 0) > $now' "$EGRESS_BLACKLIST" >/dev/null 2>&1
@@ -52,6 +60,7 @@ egress_bl_has() {
 # egress_bl_add <key> <egress> <reason> <ttl-seconds>
 egress_bl_add() {
   local key="$1" egress="$2" reason="$3" ttl="${4:-21600}" until at tmp
+  [ "$EGRESS_BLACKLIST_ENABLED" = "1" ] || return 0
   until=$(( $(egress_now) + ttl ))
   at=$(egress_iso)
   tmp=$(mktemp "${EGRESS_BLACKLIST}.XXXXXX") || return 1
@@ -71,6 +80,7 @@ egress_bl_add() {
 
 egress_bl_del() {
   local key="$1" tmp
+  [ "$EGRESS_BLACKLIST_ENABLED" = "1" ] || return 0
   tmp=$(mktemp "${EGRESS_BLACKLIST}.XXXXXX") || return 0
   if jq --arg k "$key" 'del(.entries[$k])' "$EGRESS_BLACKLIST" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$EGRESS_BLACKLIST"

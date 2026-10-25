@@ -37,6 +37,7 @@ PROVIDER_HOSTS = {
     if h.strip()
 }
 PROVIDER_PORT = int(os.environ.get("EGRESS_PROVIDER_PORT", "443"))
+IDLE_TIMEOUT = int(os.environ.get("EGRESS_IDLE_TIMEOUT", "240"))
 
 
 def provider_target(host):
@@ -92,10 +93,14 @@ def watch_epoch():
         time.sleep(0.4)
 
 
-def pipe(a, b):
+def pipe(a, b, label):
     try:
         while True:
-            data = a.recv(65536)
+            try:
+                data = a.recv(65536)
+            except socket.timeout:
+                print(f"error target={label} idle_timeout after {IDLE_TIMEOUT}s", flush=True)
+                break
             if not data:
                 break
             b.sendall(data)
@@ -189,12 +194,15 @@ def handle(client):
             upstream.sendall(rest)
         if extra:
             client.sendall(extra)
+        # Only the upstream->client direction gets a stall timeout. A timeout
+        # on the client->upstream thread would fire while a response is actively
+        # streaming, because the client has nothing to send during that time.
         client.settimeout(None)
-        upstream.settimeout(None)
+        upstream.settimeout(IDLE_TIMEOUT)
         with lock:
             active.append((client, upstream))
-        threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
-        pipe(upstream, client)
+        threading.Thread(target=pipe, args=(client, upstream, target), daemon=True).start()
+        pipe(upstream, client, target)
     except Exception as exc:  # noqa: BLE001
         print(f"error target={target} {exc}", flush=True)
         try:

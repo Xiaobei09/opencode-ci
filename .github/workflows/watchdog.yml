@@ -32,6 +32,11 @@ jobs:
         run: |
           set -euo pipefail
           repo="${{ github.repository }}"
+          paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo false)
+          if [ "$paused" = "true" ]; then
+            echo "CI_LOOP_PAUSED=true; watchdog will not restart the loop"
+            exit 0
+          fi
           # queued / in_progress / pending / waiting are all "a successor exists".
           live=$(gh run list --repo "$repo" --workflow iterate.yml --limit 20 \
                    --json status --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "pending" or .status == "waiting" or .status == "requested")] | length')
@@ -44,8 +49,10 @@ jobs:
           state=$(gh workflow list --repo "$repo" --json name,state --jq '.[] | select(.name == "iterate") | .state' 2>/dev/null | head -1)
           [ -n "$state" ] || state=unknown
           if [ "$state" != "active" ]; then
-            echo "::warning::iterate.yml is '$state'; enabling"
-            gh workflow enable iterate.yml --repo "$repo" || true
+            # Disabling iterate.yml is an operator stop signal. Do not re-enable
+            # it automatically: that used to make "stop CI" impossible.
+            echo "::notice::iterate.yml is '$state'; treating it as an operator stop"
+            exit 0
           fi
           echo "::notice::no iterate run in flight for >~10min; dispatching a successor"
           for attempt in 1 2 3; do
