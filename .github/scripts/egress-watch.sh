@@ -35,13 +35,22 @@ while IFS= read -r line; do
       fi
       last=$now
       log "quota error detected; rotating egress"
-      if bash "$SCRIPT_DIR/egress-rotate.sh" --reason quota >> "$WATCH_LOG" 2>&1; then
+      bash "$SCRIPT_DIR/egress-rotate.sh" --reason quota >> "$WATCH_LOG" 2>&1
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
         # The rotation can take 10-60s. Reset the debounce *after* it returns so
         # 429 lines already buffered from the old egress cannot immediately
         # blacklist the freshly selected one.
         last=$(egress_now)
         state=$(jq -c '{kind,upstream,egress_ip}' "$EGRESS_STATE_FILE" 2>/dev/null || echo '{}')
         log "rotate ok $state"
+      elif [ "$rc" -eq 2 ]; then
+        # Every candidate answered 429 quota: the limit is account/model-wide,
+        # so another 48-relay sweep cannot help. Keep the current egress and
+        # wait for the quota window to roll over.
+        last=$(egress_now)
+        fail_until=$((last + 600))
+        log "rotate skipped: all candidates quota-limited; keeping current egress (backoff 10m)"
       else
         last=$(egress_now)
         log "rotate failed; keeping current egress"
