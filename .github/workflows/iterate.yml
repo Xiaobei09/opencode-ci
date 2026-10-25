@@ -18,6 +18,11 @@ on:
         type: boolean
         required: false
         default: false
+      smoke:
+        description: One-off smoke test; bypass pause, never relay a successor
+        type: boolean
+        required: false
+        default: false
       split_size:
         description: Max bytes per release asset when paging the packages (GitHub allows up to 2GiB per asset; smaller pages upload in parallel — default 256m, e.g. 1500m for single-stream)
         type: string
@@ -27,7 +32,9 @@ on:
     - cron: "0 */6 * * *"
 
 concurrency:
-  group: iterate
+  # Smoke tests must not sit behind a stale queued production run. They get a
+  # unique group and are explicitly barred from relaying.
+  group: ${{ inputs.smoke && format('iterate-smoke-{0}', github.run_id) || 'iterate' }}
   cancel-in-progress: false
 
 permissions:
@@ -46,7 +53,7 @@ jobs:
     # Set the repository variable CI_LOOP_PAUSED=true to stop the loop without
     # relying on an in-flight run's relay step. A paused run is skipped and has
     # no successor.
-    if: vars.CI_LOOP_PAUSED != 'true'
+    if: inputs.smoke || vars.CI_LOOP_PAUSED != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -376,7 +383,7 @@ jobs:
 
       - name: Update failure streak and stop policy
         id: failure_guard
-        if: always() && steps.lock.outputs.acquired == 'true'
+        if: always() && !inputs.smoke && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
         run: |
@@ -417,7 +424,7 @@ jobs:
         # failure is being retried and the 3-failure guard still allows it.
         # Cancellation is a stop signal: it never relays. This removes the
         # infinite "cancel one run -> another appears" loop.
-        if: always() && steps.lock.outputs.acquired == 'true' && vars.CI_LOOP_PAUSED != 'true' && steps.failure_guard.outputs.allow_relay == 'true'
+        if: always() && !inputs.smoke && steps.lock.outputs.acquired == 'true' && vars.CI_LOOP_PAUSED != 'true' && steps.failure_guard.outputs.allow_relay == 'true'
         run: |
           set +e
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
