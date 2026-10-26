@@ -3,7 +3,7 @@
 # errors or on repeated provider transport failures/timeouts. Stop the run after
 # three consecutive failed egress recovery attempts, or after three preflight
 # false positives (a candidate answers 200 but real generation hits quota
-# within 120s).
+# within 600s).
 #
 # Usage: egress-watch.sh <run-log> [proxy-log]
 set -uo pipefail
