@@ -7,13 +7,18 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EGRESS_STATE_DIR="${EGRESS_STATE_DIR:-${RUNNER_TEMP:-/tmp}/egress}"
+# shellcheck source=egress-lib.sh
+. "$SCRIPT_DIR/egress-lib.sh"
 PROBE_DIR="${EGRESS_PROBE_DIR:-$EGRESS_STATE_DIR/probe}"
 ZG_PORT="${EGRESS_ZENGATE_PORT:-18083}"
 KIND="${1:?usage: egress-preflight-zengate.sh <direct|relay|http> <target> [timeout]}"
 TARGET="${2:-}"
 TMO="${3:-20}"
-MODEL="${EGRESS_PROBE_MODEL:-big-pickle}"
+# R2511: probe the model the agent really uses, not a fixed big-pickle. The
+# free quota is per model; a mismatched probe can return 200 while the real
+# session immediately fails with provider.free-limit.
+MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
+echo "zengate preflight model=$MODEL" >&2
 
 case "$KIND" in
   direct) UP="direct" ;;
@@ -44,7 +49,7 @@ all="$js $err"
 reason=ok
 if [ "$code" = "200" ] && [ -n "$content" ]; then
   reason=ok
-elif [ "$code" = "429" ] || printf '%s' "$all" | grep -qiE 'FreeUsageLimit|free usage limit|quota|rate.?limit'; then
+elif [ "$code" = "429" ] || printf '%s' "$all" | grep -qiE 'FreeUsageLimit|free usage limit|free-limit|provider\.free-limit|quota|rate.?limit'; then
   reason=quota
 elif [ "$code" = "000" ] || [ "$code" = "502" ] || [ "$code" = "503" ] || [ "$code" = "504" ] \
      || printf '%s' "$all" | grep -qiE 'ECONN|ETIMEDOUT|timed out|socket|connect|network'; then

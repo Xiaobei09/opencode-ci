@@ -22,6 +22,24 @@ EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
 egress_now() { date +%s; }
 egress_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Latest model the agent actually used. The free tier is metered per model as
+# well as per account: probing `big-pickle` while the session runs
+# `deepseek-v4.1-flash-free` produced the operator-reported "preflight 200 then
+# provider.free-limit" false positive. Read the newest assistant message from
+# the restored DB so the probe hits the same quota bucket as the real session.
+# Falls back to EGRESS_PROBE_MODEL_FALLBACK (big-pickle) when the DB is absent.
+egress_probe_model() {
+  local db="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}" m=""
+  if [ -s "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    m=$(sqlite3 "$db" \
+      "select json_extract(data,'\$.model.id') from session_message
+        where type='assistant' and json_extract(data,'\$.model.id') is not null
+        order by time_created desc limit 1;" 2>/dev/null | head -1)
+  fi
+  [ -n "$m" ] || m="${EGRESS_PROBE_MODEL_FALLBACK:-big-pickle}"
+  printf '%s\n' "$m"
+}
+
 egress_bl_init() {
   mkdir -p "$EGRESS_STATE_DIR"
   [ "$EGRESS_BLACKLIST_ENABLED" = "1" ] || return 0

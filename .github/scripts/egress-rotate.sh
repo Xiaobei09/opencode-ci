@@ -14,6 +14,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=egress-lib.sh
 . "$SCRIPT_DIR/egress-lib.sh"
 
+# R2511: rotate with the same model the real session uses (see
+# egress_probe_model); a big-pickle probe can 200 while deepseek is exhausted.
+export EGRESS_PROBE_MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
+
 REASON="${1:-quota}"
 [ "$REASON" = "--reason" ] && REASON="${2:-quota}"
 case "$REASON" in
@@ -32,7 +36,7 @@ PROBE_ENGINE=curl
 if bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
   PROBE_ENGINE=zengate
   trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
-  echo "rotate: preflight engine=zengate (real OpenCode, fresh session per candidate)"
+  echo "rotate: preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate)"
 else
   echo "rotate: warning: zengate probe unavailable; falling back to curl preflight"
 fi

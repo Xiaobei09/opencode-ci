@@ -29,7 +29,10 @@ on:
         required: false
         default: "256m"
   schedule:
-    - cron: "0 */6 * * *"
+    # R2511 temporary handoff: the live smoke run 40288116253 ends ~13:20 UTC.
+    # Keep the next scheduled production start after it so two OpenCode
+    # instances never share one session; revert to "0 */6 * * *" in that run.
+    - cron: "0 14 * * *"
 
 concurrency:
   # Smoke tests must not sit behind a stale queued production run. They get a
@@ -354,6 +357,22 @@ jobs:
           fi
           # Session content must never reach the CI log, so only a non-content summary.
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
+          # R2511: the operator asked for every OpenCode error in the log. Strip
+          # ANSI/TUI control sequences, keep only error-marked lines (never the
+          # conversation body), then show distinct kinds with counts + the tail.
+          ERR_TXT="$RUNNER_TEMP/opencode-errors.txt"
+          if [ -s "$RUN_LOG" ]; then
+            tr '\r' '\n' < "$RUN_LOG" 2>/dev/null \
+              | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+              | grep -aE 'FreeUsageLimit|free usage limit|provider\.free-limit|provider\.transport|level=ERROR|error target=|idle_timeout|"type":"error"|HTTP 429|rate.?limit' \
+              > "$ERR_TXT" 2>/dev/null || true
+            echo "opencode error summary: total=$(wc -l < "$ERR_TXT" 2>/dev/null || echo 0)"
+            if [ -s "$ERR_TXT" ]; then
+              sort "$ERR_TXT" 2>/dev/null | uniq -c | sort -rn | head -30 | cut -c1-360 || true
+              echo "opencode error tail:"
+              tail -20 "$ERR_TXT" 2>/dev/null | cut -c1-360 || true
+            fi
+          fi
           # Egress audit: which upstreams served provider CONNECTs, and any switch.
           if [ -f "$EGRESS_DIR/proxy.log" ]; then
             echo "egress connections:"
@@ -367,7 +386,7 @@ jobs:
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             jq -c '{iocount, paused, selfmute, halted:(.halted|length), qlen:((.queue//[])|length), pqlen:((.pinqueue//[])|length)}' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true
           fi
-          for pat in "pinject delivered" "pinject failed" "inject failed" "getUpdates failed" "loop stopped" "sendMessage chunked ok" "free tier" "instance registered" "turnActuallyIdle" "loop skip" "loopskip"; do
+          for pat in "pinject delivered" "pinject failed" "inject failed" "getUpdates failed" "loop stopped" "sendMessage chunked ok" "free tier" "FreeUsageLimitError" "provider.free-limit" "instance registered" "turnActuallyIdle" "loop skip" "loopskip"; do
             echo "diag '$pat' = $(grep -c -- "$pat" "$RUN_LOG" 2>/dev/null || echo 0)"
           done
           # R213：143（SIGTERM 收尾，插件端 endRunNow 的 TERM 路径）同样视为“已受控结束=成功”，

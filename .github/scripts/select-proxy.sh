@@ -22,6 +22,9 @@ export EGRESS_STATE_DIR
 # shellcheck source=egress-lib.sh
 . "$SCRIPT_DIR/egress-lib.sh"
 
+# R2511: probe the same model the agent really uses (see egress_probe_model).
+export EGRESS_PROBE_MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
+
 mkdir -p "$EGRESS_STATE_DIR"
 : > "$EGRESS_CANDIDATES_FILE"
 echo 0 > "$EGRESS_EPOCH_FILE"
@@ -64,7 +67,7 @@ PROBE_ENGINE=curl
 if bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
   PROBE_ENGINE=zengate
   PARALLEL=1
-  log "preflight engine=zengate (real OpenCode, fresh session per candidate)"
+  log "preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate)"
   trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
 else
   log "warning: zengate probe unavailable; falling back to curl preflight"
