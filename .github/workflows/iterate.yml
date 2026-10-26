@@ -29,10 +29,9 @@ on:
         required: false
         default: "256m"
   schedule:
-    # R2511 temporary handoff: the live smoke run 40288116253 ends ~13:20 UTC.
-    # Keep the next scheduled production start after it so two OpenCode
-    # instances never share one session; revert to "0 */6 * * *" in that run.
-    - cron: "0 14 * * *"
+    # R2512: the smoke handoff is over (run 40292189607 is the live production
+    # run). Restore the normal 6-hour cadence; relay still handles the loop.
+    - cron: "0 */6 * * *"
 
 concurrency:
   # Smoke tests must not sit behind a stale queued production run. They get a
