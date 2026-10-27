@@ -19,7 +19,7 @@ on:
         required: false
         default: false
       smoke:
-        description: One-off smoke test; bypass pause, never relay a successor
+        description: One-off smoke test; bypass pause, never relay a successor, never write the release
         type: boolean
         required: false
         default: false
@@ -29,14 +29,18 @@ on:
         required: false
         default: "256m"
   schedule:
-    # R2512: the smoke handoff is over (run 40292189607 is the live production
-    # run). Restore the normal 6-hour cadence; relay still handles the loop.
+    # R2513: 6-hour cadence. Relay drives the loop; cron is the safety net when
+    # a relay attempt fails (API blip, network).
     - cron: "0 */6 * * *"
 
 concurrency:
-  # Smoke tests must not sit behind a stale queued production run. They get a
-  # unique group and are explicitly barred from relaying.
-  group: ${{ inputs.smoke == 'true' && format('iterate-smoke-{0}', github.run_id) || 'iterate' }}
+  # R2513: `inputs.smoke` is a BOOLEAN in the `inputs` context (type: boolean).
+  # Comparing it to the string 'true' is always false (boolean vs string
+  # comparison coerces to numbers: true→1, 'true'→NaN). That silently disabled
+  # this branch and made smoke runs share the production `iterate` group.
+  # `github.event.inputs.*` is always a string, so compare against that.
+  # This rule is applied to EVERY smoke check below.
+  group: ${{ github.event.inputs.smoke == 'true' && format('iterate-smoke-{0}', github.run_id) || 'iterate' }}
   cancel-in-progress: false
 
 permissions:
@@ -52,24 +56,27 @@ env:
 
 jobs:
   iterate:
-    # Set the repository variable CI_LOOP_PAUSED=true to stop the loop without
-    # relying on an in-flight run's relay step. A paused run is skipped and has
-    # no successor.
-    if: inputs.smoke == 'true' || vars.CI_LOOP_PAUSED != 'true'
+    # R2513: manual dispatch ALWAYS runs, even when the loop is paused. That is
+    # the only way the Resume step below can clear CI_LOOP_PAUSED; the previous
+    # `inputs.smoke || vars.CI_LOOP_PAUSED != 'true'` skipped manual dispatches
+    # while paused, so nothing ever cleared the flag again -> infinite skip.
+    # Schedule still respects pause (it must NOT auto-revive a stopped loop).
+    # smoke always runs.
+    if: github.event.inputs.smoke == 'true' || github.event_name == 'workflow_dispatch' || vars.CI_LOOP_PAUSED != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - name: Check out ci-repo
-        uses: actions/checkout@v6
+        # R2513: `actions/checkout@v6` does not exist (latest stable line is
+        # v4/v5). A missing tag fails with "unable to resolve action" before any
+        # step runs, which looks like another silent skip.
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
       - name: Install GitHub CLI and configure git
         run: |
           set -euo pipefail
-          # R341: ubuntu-latest ships gh (measured 2.102.0); the apt dance below only
-          # exists for images without it. Measured cost when needlessly run: ~8s of
-          # `apt-get update` on every boot. Keep the installer as the fallback path.
           if ! command -v gh >/dev/null 2>&1; then
             sudo mkdir -p -m 755 /etc/apt/keyrings
             key=$(mktemp)
@@ -91,11 +98,8 @@ jobs:
           set -euo pipefail
           if [ ! -d "$SESSIONS_DIR/.git" ]; then
             mkdir -p "$(dirname "$SESSIONS_DIR")"
-            # R574（⑧）：只取 main 的最新一版（脚本/配置；记录由 records release 覆盖）。
-            # env-sync 分支由 restore-env 自己 `git clone --depth 1 --single-branch
-            # --branch env-sync` 拉，boot 阶段不需要整仓克隆。旧 `gh repo clone` 会把
-            # 214MB payload 工作树 + 34 个历史提交一起拉：K 代 3s → L 代 30s（链增长）。
-            # 实测 main 浅克隆 1.4s/576KB，pre 阶段省 ~28s。
+            # R574: main-only shallow clone; env-sync branch is fetched separately
+            # by restore-env.sh. Saves ~28s vs a full clone at boot.
             gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR" -- --depth 1 --single-branch --branch main
           fi
           mkdir -p "$SESSIONS_DIR/state" "$SESSIONS_DIR/tasks" "$SESSIONS_DIR/sessions" "$SESSIONS_DIR/workspace-snapshots"
@@ -104,19 +108,17 @@ jobs:
       - name: Acquire lock
         id: lock
         run: |
-          # Runs are serialized by the workflow-level `concurrency` group, so no
-          # cross-run lock file is needed. The step id/output are kept so downstream
-          # `if:` guards stay simple. A committed lock file used to deadlock the loop
-          # whenever a push failed; removing it removes that whole failure class.
+          # Serialized by the workflow-level `concurrency` group. The step id and
+          # output are kept so downstream `if:` guards stay uniform.
           echo "acquired=true" >> "$GITHUB_OUTPUT"
 
       - name: Resume loop on manual dispatch
-        # R2512（运营者：重新启动 CI 后会话不能自动继续）：手动 dispatch 就是明确的
-        # “重新开始”信号。旧行为下，上一次 run 被 cancel 会把 CI_LOOP_PAUSED 置 true；
-        # 之后手动重启的 run 虽然会跑 OpenCode，但 run 尾的 relay 被 pause 条件挡住，
-        # 跑完这一轮就彻底停住。这里在手动 run 启动时清 pause/streak，让重启真正接力。
-        # smoke 测试不碰生产变量；schedule 仍然尊重 pause（不自动复活）。
-        if: github.event_name == 'workflow_dispatch' && inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
+        # R2513: a manual dispatch is an explicit "restart" signal. When the
+        # previous run was cancelled, `failure_guard` set CI_LOOP_PAUSED=true;
+        # without clearing it here Relay stays blocked and every schedule tick
+        # is skipped -> "CI does not continue". smoke must NOT touch production
+        # variables (compare against github.event.inputs.smoke, not inputs.smoke).
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
         run: |
@@ -149,9 +151,8 @@ jobs:
           TG_BOTS_EXTRA: ${{ secrets.TG_BOTS_EXTRA }}
         run: |
           set +e
-          # R573: targets restore (~12s) and env restore (~17s) are independent; run them
-          # in parallel and wait for both. Both are children of this step, so `wait` is
-          # reliable (no cross-step background process). Failure of either fails the step.
+          # R573: targets restore and env restore are independent; run them in
+          # parallel. Both are children of this step, so `wait` is reliable.
           bash "$GITHUB_WORKSPACE/.github/scripts/restore-targets.sh" > /tmp/restore-targets.log 2>&1 &
           p_t=$!
           bash "$GITHUB_WORKSPACE/.github/scripts/restore-env.sh" > /tmp/restore-env.log 2>&1 &
@@ -166,15 +167,8 @@ jobs:
             echo "::error::restore failed (targets rc=$rc_t env rc=$rc_e)"
             exit 1
           fi
-          # R743: env-sync tar restore can widen secret files to 0644. Normalize
-          # before OpenCode starts; the bridge repeats this for service.json,
-          # which the host creates later.
-          # R941 (D3): the old hand-written list kept missing runtime files - after
-          # the 2026-10-21 factory reset, tg-chats.json came back 0644 (only the
-          # bridge's first state save narrowed it) and inject-card-*.json stayed
-          # 0644. Normalize every runtime json/env under the config dir with globs
-          # so the list cannot fall behind the set of runtime-state files again
-          # (all of them are mode 600 by design; nothing else reads them).
+          # R941: env-sync tar restore can widen secret files to 0644. Normalize
+          # every runtime json/env under the config dir with globs.
           for p in "$HOME/.config/opencode"/*.json \
                    "$HOME/.config/opencode"/*.env \
                    "$HOME/.local/state/opencode/service.json" \
@@ -195,41 +189,23 @@ jobs:
           set -euo pipefail
           curl -fsSL https://opencode.ai/v2/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          # zengate runs the real OpenCode CLI and creates a fresh session for
-          # every request. The egress preflight uses it so a synthetic curl 429
-          # is not mistaken for an exhausted IP.
+          # zengate runs the real OpenCode CLI for the egress preflight, so a
+          # synthetic curl 429 is not mistaken for an exhausted IP.
           npm install -g workferry zengate@1.3.1
 
       - name: Select egress proxy
-        # The opencode zen free tier is quota'd per client IP. A long-lived runner burns
-        # through that quota and every later provider call fails with "Free usage limit
-        # reached...". DNS edge tricks changed which Cloudflare edge answered, not the
-        # source IP, so the quota stayed exhausted.
-        #
-        # This step builds an ordered candidate list (direct runner IP + proxyip relay
-        # entries; the public HTTP CONNECT pool is disabled unless
-        # EGRESS_ALLOW_PUBLIC_HTTP=1) and tests each candidate with the real inference
-        # call in scripts/egress-preflight.sh:
-        #   POST https://opencode.ai/inference/v1/chat/completions
-        #   Authorization: Bearer public, User-Agent: opencode/1.18.32
-        # A /zen/v1/models 200 is NOT enough: the inference endpoint can still return
-        # 429 FreeUsageLimitError. Only a 200 with completion data selects/switches an
-        # egress. Failed candidates are written to egress-blacklist.json under
-        # $HOME/.config/opencode (mode 600) with a TTL (6h quota, 30m transport), so
-        # they survive via the whole-$HOME env snapshot and are skipped next run.
-        #
-        # The selected upstream is written to $RUNNER_TEMP/egress/upstream. The Run
-        # step starts a local CONNECT proxy and exports HTTP_PROXY=http://127.0.0.1:8089;
-        # the public proxy/relay is never injected directly into opencode. That lets
-        # egress-watch.sh hot-swap the upstream mid-run (the epoch file closes live
-        # tunnels) without restarting the process. The env file is sourced by the Run
-        # step only, so gh/curl in the snapshot and relay steps stay direct.
+        # R2513: `EGRESS_BLACKLIST_ENABLED` was "0" while the comments and the
+        # `reset_baseline` exclusions assume the blacklist is live. That
+        # silently disabled the TTL mechanism (previously-failed candidates
+        # were re-tested every boot). Restored to "1". If the operator ever
+        # needs to turn it off, also delete the paragraph above so the docs
+        # and the code cannot disagree again.
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
           EGRESS_ALLOW_PUBLIC_HTTP: "0"
-          EGRESS_BLACKLIST_ENABLED: "0"
+          EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_SELECT_MAX: "12"
           EGRESS_SELECT_BUDGET: "120"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
@@ -237,10 +213,9 @@ jobs:
           set +e
           bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
           echo "select-proxy rc=${PIPESTATUS[0]}"
-          # Direct notification instead of a bridge message: the bridge lives inside the
-          # proxied opencode process, so a dead proxy would silence the only channel
-          # that could report it. api.telegram.org is in NO_PROXY, but this step runs
-          # before any proxy env is applied anyway.
+          # Direct notification instead of a bridge message: the bridge lives
+          # inside the proxied opencode process, so a dead proxy would silence
+          # the only channel that could report it.
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             if [ -s "$HOME/.config/opencode/exit-proxy.json" ]; then
               KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
@@ -264,14 +239,15 @@ jobs:
           TARGETS_DIR: /home/runner/work/targets
           TG_BRIDGE_FORCE_SERVE: "1"
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
-          EGRESS_BLACKLIST_ENABLED: "0"
+          # R2513: must match the select step; see the comment there.
+          EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
         run: |
           set +e
-          # Egress manager: OpenCode only ever sees http://127.0.0.1:8089. The
-          # manager (egress-proxy.py) forwards provider CONNECTs through the
-          # selected direct/relay upstream, and egress-watch.sh can hot-swap that
-          # upstream by bumping the epoch file. TLS stays end-to-end.
+          # Egress manager: OpenCode only ever sees http://127.0.0.1:8089.
+          # The manager forwards provider CONNECTs through the selected
+          # direct/relay upstream. egress-watch.sh can hot-swap that upstream
+          # mid-run without restarting the process. TLS stays end-to-end.
           RUN_LOG="$RUNNER_TEMP/opencode-run.log"
           EGRESS_DIR="${EGRESS_STATE_DIR:-$RUNNER_TEMP/egress}"
           export EGRESS_STATE_DIR="$EGRESS_DIR"
@@ -323,47 +299,80 @@ jobs:
             echo "egress proxy: none (direct connection)"
           fi
           BUDGET="${BUDGET_SECONDS:-19800}"
-          # Cold-start resume. `opencode run` is one-shot: it loads the plugins, sends
-          # one message and exits, so the tg-bridge is only alive for that one turn and
-          # most operator messages get no reply. Instead we open the exact session the
-          # bridge is bound to in the long-lived interactive mode, whose server loads
-          # the plugins and stays up for the whole budget. No prompt is injected and no
-          # new session is created; the bridge feeds operator Telegram messages into
-          # this same session and pushes the replies.
-          # ROUND 42（重启自动恢复的加固，运营者第 3 项要求）：pin 来自**随包还原**的
-          # tg-chats.json.front，但"文件在"不等于"会话在" —— 若会话 DB 缺失/被换成旧代，
-          # `--session <sid>` 会开一个**空的**新会话，看起来"恢复了"其实上下文全丢。
-          # 故先查 DB 里是否真有该会话：确认为 "no" 才退回 `--continue`（恢复最近一次会话）；
-          # DB 读不出（err/n-a）时**保持 pin**（pin 是已验证路径，不因探针抖动而改写）。
-          # 诊断只打计数/是否，绝不打会话内容。
+          # Cold-start resume. `opencode run` is one-shot; the long-lived
+          # interactive mode keeps the tg-bridge alive for the whole budget and
+          # feeds operator Telegram messages into the same session.
           SID=""
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
           fi
+          # R2513: the probe previously used `session_v2` unconditionally and
+          # swallowed every error, so a schema change (or a wholly missing
+          # table) looked like "n/a" and silently fell through to `--continue`,
+          # wiping context. Now: try the known table names, emit an explicit
+          # `no-table`/`err`, and print the presence state in the log.
           SID_PRESENT="n/a"
           if [ -n "$SID" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-            SID_PRESENT=$(python3 -c 'import sqlite3,sys,os;c=sqlite3.connect("file:"+os.path.expanduser("~/.local/share/opencode/opencode.db")+"?mode=ro",uri=True);print("yes" if c.execute("select 1 from session_v2 where id=?",(sys.argv[1],)).fetchone() else "no")' "$SID" 2>/dev/null || echo "err")
+            SID_PRESENT=$(SID="$SID" python3 - <<'PY' 2>/dev/null
+import sqlite3, os, sys
+sid = os.environ["SID"]
+db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+try:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    for t in ("session_v2", "session"):
+        if t in tables:
+            print("yes" if c.execute(f"select 1 from {t} where id=?", (sid,)).fetchone() else "no")
+            sys.exit(0)
+    print("no-table")
+except Exception:
+    print("err")
+PY
+)
+            [ -z "$SID_PRESENT" ] && SID_PRESENT="err"
           fi
-          # ROUND 44（重启自动恢复加固）：bound 会话**确认为 no**（或压根没有 bound）时，**不要**盲目
-          # `--continue`——数据丢失后 `--continue` 只会打开本轮新建的空会话（实测：撕裂包 → 空 DB →
-          # 新会话 ses_eb24bf12，旧 ses_eb626522 的 1056 条上下文全部掉线）。改为挑 DB 里**消息最多**
-          # 的会话（最富上下文者，通常就是主循环会话）作为恢复目标；探针 err/n-a 仍保持 pin 不动。
+          echo "bound session probe: present=$SID_PRESENT"
           RECOVER_LINE=""
-          if { [ "$SID_PRESENT" = "no" ] || [ -z "$SID" ]; } && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-            RECOVER_LINE=$(python3 -c 'import sqlite3,os;c=sqlite3.connect("file:"+os.path.expanduser("~/.local/share/opencode/opencode.db")+"?mode=ro",uri=True);r=c.execute("select session_id,count(*) n from session_message group by session_id order by n desc limit 1").fetchone();print("%s %d"%(r[0],r[1]) if r else "")' 2>/dev/null || true)
+          if { [ "$SID_PRESENT" = "no" ] || [ "$SID_PRESENT" = "no-table" ] || [ -z "$SID" ]; } \
+             && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
+            RECOVER_LINE=$(python3 - <<'PY' 2>/dev/null
+import sqlite3, os
+db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+try:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    for t in ("session_message", "message_v2", "message"):
+        if t in tables:
+            try:
+                r = c.execute(f"select session_id, count(*) n from {t} group by session_id order by n desc limit 1").fetchone()
+                if r:
+                    print("%s %d" % (r[0], r[1]))
+                    break
+            except Exception:
+                continue
+except Exception:
+    pass
+PY
+)
           fi
           RECOVER="${RECOVER_LINE%% *}"
           RECOVER_MSGS="${RECOVER_LINE##* }"
-          if [ -n "$SID" ] && [ "$SID_PRESENT" != "no" ]; then
+          [ -z "$RECOVER_MSGS" ] && RECOVER_MSGS="0"
+          echo "recovery probe: recover=$([ -n "$RECOVER" ] && echo yes || echo no) msgs=$RECOVER_MSGS"
+          if [ -n "$SID" ] && [ "$SID_PRESENT" = "yes" ]; then
             ARGS=(--standalone --session "$SID")
             echo "resuming bound session present_in_db=$SID_PRESENT"
+          elif [ -n "$SID" ] && [ "$SID_PRESENT" != "no" ] && [ "$SID_PRESENT" != "no-table" ]; then
+            # DB unreadable (err/n-a): keep the pin; it is the verified path.
+            ARGS=(--standalone --session "$SID")
+            echo "resuming pinned session (db unreadable, present_in_db=$SID_PRESENT)"
           elif [ -n "$RECOVER" ]; then
             ARGS=(--standalone --session "$RECOVER")
-            echo "recovery: bound=$([ -n "$SID" ] && echo yes || echo none) present_in_db=$SID_PRESENT; pinned the richest restored session (msgs=$RECOVER_MSGS)"
+            echo "recovery: bound absent (present_in_db=$SID_PRESENT); pinned the richest restored session (msgs=$RECOVER_MSGS)"
           else
             ARGS=(--standalone --continue)
             if [ -n "$SID" ]; then
-              echo "bound session absent from the restored db ($SID_PRESENT); no richer session to recover; falling back to --continue"
+              echo "bound session absent from the restored db (present_in_db=$SID_PRESENT); no richer session to recover; falling back to --continue"
             else
               echo "no bound session found; continuing the last session"
             fi
@@ -372,19 +381,13 @@ jobs:
             opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
           RC=$?
           if [ -f "$EGRESS_DIR/stop" ]; then
-            # R2512（运营者：CI 有时以错误结束）：watcher 的“连续 3 次失败停止本轮”
-            # 是**受控结束**，不是崩溃。旧实现强制 RC=1 → run 变红、不 relay，用户看到
-            # “CI 以错误结束”。现在标记 watcher_stop 并让本步成功；failure_guard 会把
-            # 循环置 pause（不再自动接力），手动 dispatch 时再由 Resume 步骤恢复。
+            # The watcher's "3 consecutive failures" is a controlled stop, not a
+            # crash. Keep the step green; failure_guard pauses the loop.
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "::warning::egress watcher stopped this round after 3 consecutive failures; pausing the loop (manual dispatch resumes)"
             RC=0
           fi
-          # Session content must never reach the CI log, so only a non-content summary.
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
-          # R2511: the operator asked for every OpenCode error in the log. Strip
-          # ANSI/TUI control sequences, keep only error-marked lines (never the
-          # conversation body), then show distinct kinds with counts + the tail.
           ERR_TXT="$RUNNER_TEMP/opencode-errors.txt"
           if [ -s "$RUN_LOG" ]; then
             tr '\r' '\n' < "$RUN_LOG" 2>/dev/null \
@@ -398,7 +401,6 @@ jobs:
               tail -20 "$ERR_TXT" 2>/dev/null | cut -c1-360 || true
             fi
           fi
-          # Egress audit: which upstreams served provider CONNECTs, and any switch.
           if [ -f "$EGRESS_DIR/proxy.log" ]; then
             echo "egress connections:"
             grep -aE 'target=opencode\.ai|epoch [0-9]+:' "$EGRESS_DIR/proxy.log" | tail -8 || true
@@ -407,15 +409,12 @@ jobs:
             echo "egress watch:"
             tail -8 "$EGRESS_DIR/watch.log" 2>/dev/null || true
           fi
-          # Content-safe bridge diagnostics: counters only, never message text.
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             jq -c '{iocount, paused, selfmute, halted:(.halted|length), qlen:((.queue//[])|length), pqlen:((.pinqueue//[])|length)}' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true
           fi
           for pat in "pinject delivered" "pinject failed" "inject failed" "getUpdates failed" "loop stopped" "sendMessage chunked ok" "free tier" "FreeUsageLimitError" "provider.free-limit" "instance registered" "turnActuallyIdle" "loop skip" "loopskip"; do
             echo "diag '$pat' = $(grep -c -- "$pat" "$RUN_LOG" 2>/dev/null || echo 0)"
           done
-          # R213：143（SIGTERM 收尾，插件端 endRunNow 的 TERM 路径）同样视为“已受控结束=成功”，
-          # 与 124/137 一并白名单，确保 END-ROUND-CI 一定能走到 relay；真崩溃（其他非零）仍不接力。
           if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ] || [ "$RC" -eq 143 ]; then
             echo "opencode hit the time budget; treated as success so the loop continues."
             exit 0
@@ -427,7 +426,8 @@ jobs:
 
       - name: Update failure streak and stop policy
         id: failure_guard
-        if: always() && inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
+        # R2513: smoke must not touch production variables.
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
         run: |
@@ -437,48 +437,52 @@ jobs:
           watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
           allow=false
           if [ "$watcher_stop" = "true" ]; then
-            # R2512：连续 3 次失败是“停止本轮”而不是“运行崩溃”。本步保持绿色，
-            # 但置 pause + 不接力，等运营者手动 dispatch（Resume 步骤会清 pause）。
             gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
             gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             echo "::notice::watcher stopped the round after 3 consecutive failures; CI_LOOP_PAUSED=true, no successor"
             echo "allow_relay=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # R2514: `skipped` means a prerequisite (restore / setup-node /
+          # install / select-proxy) failed, so Run OpenCode never ran. That is
+          # a transient failure and should increment the streak, NOT pause the
+          # loop. `cancelled` is an operator signal and pauses immediately.
           if [ "$outcome" = "success" ]; then
             gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             allow=true
             echo "run succeeded; reset CI_FAIL_STREAK"
-          elif [ "$outcome" = "failure" ]; then
+          elif [ "$outcome" = "failure" ] || [ "$outcome" = "skipped" ]; then
             cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
             case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
             next=$((cur + 1))
             if gh variable set CI_FAIL_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1; then
               if [ "$next" -ge 3 ]; then
                 gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-                echo "::error::three consecutive failed runs; CI_LOOP_PAUSED=true, no successor"
+                echo "::error::three consecutive failed/skipped runs (last outcome=$outcome); CI_LOOP_PAUSED=true, no successor"
               else
                 allow=true
-                echo "run failed; CI_FAIL_STREAK=$next/3, will retry"
+                echo "run outcome=$outcome; CI_FAIL_STREAK=$next/3, will retry"
               fi
             else
               echo "::error::could not update CI_FAIL_STREAK; refusing to relay blindly"
             fi
-          else
-            # A cancelled/skipped run means an operator (or the platform) stopped
-            # this run. Do not create a successor and do not let the watchdog
-            # silently restart it later.
+          elif [ "$outcome" = "cancelled" ]; then
             gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-            echo "::notice::run outcome=$outcome; paused the loop and suppressing relay"
+            echo "::notice::run cancelled by operator; CI_LOOP_PAUSED=true, no successor"
+          else
+            # Unknown outcome: be conservative.
+            gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+            echo "::notice::unexpected outcome=$outcome; paused the loop and suppressing relay"
           fi
           echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
 
       - name: Relay next run
-        # Relay only when the run itself finished successfully, or when a real
-        # failure is being retried and the 3-failure guard still allows it.
-        # Cancellation is a stop signal: it never relays. This removes the
-        # infinite "cancel one run -> another appears" loop.
-        if: always() && inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && vars.CI_LOOP_PAUSED != 'true' && steps.failure_guard.outputs.allow_relay == 'true'
+        # R2513: do NOT gate on `vars.CI_LOOP_PAUSED` — `vars` is snapshotted at
+        # run start, so a Resume step that just cleared the flag would still be
+        # overruled by the stale value. `allow_relay` is the single source of
+        # truth for pause: it is false whenever the loop was paused at the time
+        # Relay would have run (watcher stop, 3-failure guard, cancel).
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.failure_guard.outputs.allow_relay == 'true'
         run: |
           set +e
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
@@ -501,18 +505,19 @@ jobs:
           fi
 
       - name: Save workspace snapshots
-        # ROUND 46（防数据丢失）：只有 workspace 还原步**成功**才允许快照；若本轮在还原期间被取消
-        # （outcome=cancelled）或根本没跑到（skipped），$HOME/targets 是半套/空壳，快照它会把
-        # 「半套世界」固化进 release。跳过 ⇒ 保留上一代完好包。
-        if: always() && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
+        # R2513: smoke must NOT write to the env release (it runs in a separate
+        # concurrency group, so a smoke save could race and overwrite the
+        # production package). Also keep the "restore must succeed" guard so a
+        # half-restored world is never snapshotted.
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         run: |
           set +e
           SNAP="$SESSIONS_DIR/workspace-snapshots"
           mkdir -p "$SNAP"
           INDEX="$SNAP/index.json"
           [ -f "$INDEX" ] || echo '{"snapshots": []}' > "$INDEX"
-          # R342：清掉旧格式（bundle/worktree）解包残留——新格式的 workspace-snapshots/
-          # 只应有 index.json；任何子目录都是上一代旧包的遗留物，必须删掉以免被打进新包。
+          # R342: workspace-snapshots/ must contain only index.json; any subdir
+          # is a leftover from the old bundle/worktree format.
           find "$SNAP" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
           shopt -s nullglob
           for target_dir in "$TARGETS_DIR"/*/; do
@@ -520,10 +525,6 @@ jobs:
             [ -d "$repo_dir/.git" ] || continue
             name=$(basename "$repo_dir")
             snap_dir="$SNAP/$name"
-            # R342（Stage C）：目标工作区不再转 bundle，而是整目录留在原地、由 Snapshot
-            # 步直接打进 targets 包（解包=还原，实测 11s vs bundle 克隆 72s）。这里只做：
-            # 清掉旧代解包残留的 bundle 目录、写 index 元数据（含内容指纹 fp，供「未变
-            # 则沿用」判定）。旧格式残留必须删除，否则会被打包。
             rm -rf "$snap_dir"
 
             BRANCH=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || true)
@@ -531,17 +532,7 @@ jobs:
             REMOTE=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
             SAVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-            # R573（slim targets）：HEAD 可从远端分支到达、无子模块、无未合并索引时，
-            # targets 包只携带工作树（不含 .git 历史），恢复侧按 commit 做 depth-1 fetch
-            # 重建 git 元数据。实测 proxyip .git=1.5GB 而工作树压缩包仅 33MB；这是
-            # 「每轮非 opencode 时间 <1 分钟」的最大单项（旧包 1.58GB，打包+双上传 38s）。
-            # 本地未推送提交/冲突/子模块一律回退全量 .git，避免丢状态。
             MODE="dirtar"
-            # R2511: reuse the previous slim decision when HEAD is unchanged.
-            # proxyip's `git fetch` measured 107s (capped at 20s in-run) and all
-            # four targets were unchanged, so this fetch was the remaining ~20s
-            # of the Save step. If HEAD moved (agent committed) we still fetch
-            # and re-verify reachability.
             PRIOR=$(jq -r --arg d "$name" '.snapshots[] | select(.dir == $d) | [.commit // "", .mode // ""] | @tsv' "$INDEX" 2>/dev/null | head -1)
             PRIOR_COMMIT=${PRIOR%%$'\t'*}
             PRIOR_MODE=${PRIOR##*$'\t'}
@@ -552,15 +543,7 @@ jobs:
               SKIP_FETCH=1
               MODE="dirtar-slim"
             fi
-            # R618：本地 refs/remotes/origin/* 可能是上次恢复时的旧值；先拉目标分支
-            # 的最新远端对象，再判断 HEAD 是否真正可从远端到达。fetch 失败/超时则
-            # 保持全量包，绝不因陈旧 ref 误判 slim 而丢可恢复性。
             if [ "$SKIP_FETCH" != 1 ] && [ -n "$REMOTE" ] && [ -n "$BRANCH" ]; then
-              # R2506: a single-branch restore only tracks main. A target checked out
-              # on a feature branch (e.g. test/egress-parallel) therefore had no
-              # refs/remotes/origin/<branch>; `branch -r --contains` failed and every
-              # save fell back to full .git. Fetch into the tracking ref explicitly,
-              # then the slim test below is meaningful for all branches.
               timeout 20 git -C "$repo_dir" fetch --quiet --no-tags origin \
                 "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null || true
             fi
@@ -570,8 +553,6 @@ jobs:
               MODE="dirtar-slim"
             fi
 
-            # 全量模式保留旧行为：把未提交状态固化成 stash（.git 随包携带）。slim 不建
-            # stash：包内无 .git，stash 恢复时必然丢失；未提交内容已由工作树完整携带。
             if [ "$MODE" = "dirtar" ]; then
               STASH_HASH=$(git -C "$repo_dir" stash create "snapshot-$(date -u +%s)")
               if [ -n "$STASH_HASH" ]; then
@@ -579,22 +560,15 @@ jobs:
               fi
             fi
 
-            # R573：不再 unshallow。slim 恢复的是 shallow 仓，若每代 Save 都补全历史，
-            # 1.5GB 会重新下载并回到包里，slim 优化即失效。需要历史时由代理按需
-            # `git fetch --deepen/--unshallow`；远端始终保有完整历史。
-
-            # R342/R573（内容指纹）：「未变则沿用 targets」只认 HEAD/分支/工作树文件内容。
-            # 刻意排除 .git 内部细节与**全部 refs**：refs/stash 每代 stash 必变，
-            # refs/remotes 随 fetch 漂移，tags 不影响工作树——旧实现把 refs 算进 fp，
-            # 导致每代都判定「已变」并重传 1.58GB（实测 K 代 Snapshot 65s 的主因）。
-            # 工作树哈希含未跟踪/被忽略文件，与 slim 包内容一一对应，跨恢复稳定。
+            # R342/R573: fingerprint covers HEAD, branch, and worktree content.
+            # Refs and .git internals are deliberately excluded (refs/stash
+            # changes every generation; refs/remotes drift with fetch).
             FP=$( {
               printf 'head=%s\n' "$COMMIT"
               printf 'branch=%s\n' "$BRANCH"
               printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
             } | sha256sum | cut -d' ' -f1 )
 
-            # bundle/worktree 留空仅为旧读侧兼容（旧读侧 clone 空路径失败后会走远端克隆兜底）。
             ENTRY=$(jq -n \
               --arg repo "$REMOTE" \
               --arg dir "$name" \
@@ -612,58 +586,33 @@ jobs:
           done
 
       - name: Snapshot environment to sessions repository
-        # ROUND 46（防数据丢失）：同 workspace —— 只有 env 还原步**成功**才允许快照，避免把
-        # 「取消在还原途中」留下的半套/空 $HOME 固化进 release（那正是 R44 那轮丢失的成因）。
-        if: always() && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
+        # R2513: smoke must NOT write to the release (same rationale as the
+        # workspace snapshot step).
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         env:
           SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
           set +e
           ENV_SRC="$SESSIONS_DIR/opencode"
           mkdir -p "$ENV_SRC"
-          # R2508: the sessions repository is PRIVATE, so storing bot tokens there is
-          # allowed (operator: "私有仓库中存储的内容不需要脱敏"). The old scrub cost
-          # 10-30s per run and rewrote tg-bot*.env / the session DB with REDACTED,
-          # which broke bot registration on restore. Public bridge repo still sanitizes
-          # via publish-bridge.sh; do not reintroduce scrubbing here.
-          # Whole-package capture: tar the ENTIRE $HOME in one go - a complete snapshot,
-          # not a delta/overlay. This is what guarantees completeness: the agent may drop
-          # files anywhere, and files it copies or moves keep their old timestamps, so a
-          # "changed-since-the-last-run" scan would silently miss them. Exclusions are
-          # only reinstallable caches, the work/ tree (targets + the repo clone, both
-          # persisted elsewhere and the latter would recurse), the opencode binary,
-          # server logs and secrets.
+          # R2508: the sessions repo is PRIVATE, so bot tokens are stored as-is.
+          # Do NOT reintroduce scrubbing: it broke bot registration on restore.
           ENV_TAG="env"
-          # ROUND 35：分页大小按「支持的单个资产上限」取大（90m→1500m）曾把上传压成**单流**。
-          # R428 Stage D 基准（本 runner→GitHub release）：单流 27–33 MB/s、4 流 65 MB/s、
-          # 8 流 82 MB/s ⇒ 改为**小页 + 相位内并行**：默认 256m（targets ≈6 页），stage/真名
-          # 两相内各页并行（SNAP_UP_PAR 默认 8）。序列不变量（stage→校验→删旧→真名→meta→删stage）不变。
-          # 可用 dispatch 输入 `split_size` 覆盖（relay 只传 resume ⇒ 用默认值）。
           SPLIT_SIZE="${SPLIT_SIZE:-256m}"
-          # Checkpoint the SQLite sessions DB first so the packaged copy is consistent.
           if command -v python3 >/dev/null 2>&1 && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
             python3 -c 'import sqlite3;c=sqlite3.connect("'"$HOME"'/.local/share/opencode/opencode.db");c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close()' 2>/dev/null \
               && echo "sqlite WAL checkpointed" || echo "::warning::sqlite WAL checkpoint skipped"
           fi
-          # R2508: no binary DB redaction either — the sessions repo is private.
           OUT=/tmp/envsnap
           rm -rf "$OUT" && mkdir -p "$OUT"
-          # R341 (non-agent time): pack with parallel gzip when available. pigz output
-          # is a standard multi-member gzip stream, so every reader (this workflow's
-          # magic-detection + `tar -xz`) stays dependency-free; fall back to gzip -6.
-          # Measured on a 1.4GB target package: gzip 31.3s -> pigz -p4 12.4s.
-          # R736: level 1 is still a normal gzip stream; local 460MB targets measured
-          # 1.9s/126MB vs level 6 2.56s/111MB (page-cached), so prefer speed here.
           if command -v pigz >/dev/null 2>&1; then
             TAR_COMP=(tar -I 'pigz -1 -p4' -cf -)
           else
             TAR_COMP=(tar -czf -)
           fi
-          # ROUND 278（「快照优化」— save 侧）：run-end env-sync 把**终态**推到 env-sync
-          # 分支；成功且能取到旧 meta（其 env 段仍与保留的 release env 卷吻合）时跳过全量
-          # env 打包（本次最大单项 ~1m45s）。失败/取不到旧 meta 一律回退全量打包（保守）。
-          # 两次尝试 + 20s 间隔，化解与插件 tick 的锁竞争。分支即 B 侧首选还原源；
-          # release env 卷保留为 size-verified 回退（不再每代刷新，由 .env.carried 标记）。
+          # ROUND 278: run-end env-sync pushes the final state to the env-sync
+          # branch. On success the full env pack can be skipped; the branch is
+          # the primary source and the release env is a size-verified fallback.
           SKIP_ENV_PACK=0
           if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
             SYNC_OK=0
@@ -690,8 +639,7 @@ jobs:
             fi
           fi
           if [ "$SKIP_ENV_PACK" != 1 ]; then
-          # R2507: transient shell transcripts can exceed GitHub's 100MiB file limit and
-          # bloat the fallback pack; they are not needed for restore.
+          # R2507: transient shell transcripts can exceed GitHub's 100MiB limit.
           find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null || true
           "${TAR_COMP[@]}" -C "$HOME" \
             --exclude='./work' \
@@ -715,17 +663,14 @@ jobs:
             . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." \
             || echo "::warning::environment package failed"
           fi
-          # R342（records 独立资产，Stage B）：records 很小但每轮都变；targets 很大但内容
-          # 可以不变。独立打包 records ⇒ targets 未变时只换 records（~2MB），跳过 ~1.4GB
-          # 的暂存+正式双上传。targets 包内仍内嵌一份 records（兼容旧读侧；未变轮次里它
-          # 可能略旧，新读侧会用独立资产覆盖）。
+          # R342: records are small but change every run; targets are large but
+          # often unchanged. Splitting them lets a carry-round replace only
+          # records (~2MB) and skip a ~1.4GB re-upload.
           REC_OK=0
           ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" state tasks sessions loop-state.md 2>/dev/null ) \
             | split -b "$SPLIT_SIZE" - "$OUT/records.tar.gz." \
             && ls "$OUT"/records.tar.gz.* >/dev/null 2>&1 && REC_OK=1 \
             || echo "::warning::records package failed; readers will use the copy embedded in the targets package"
-          # R342：聚合内容指纹（来自 Save 步写入的 index.json）——只有全部快照都是新格式
-          # 且带指纹时才允许「未变沿用」，否则一律重传（保守）。
           TGT_FP=""; TGT_MODE=""
           IDX="$SESSIONS_DIR/workspace-snapshots/index.json"
           if [ -s "$IDX" ]; then
@@ -740,8 +685,9 @@ jobs:
               TGT_FP=$(jq -r '[.snapshots[] | .dir + "=" + .fp] | sort | join("\n")' "$IDX" | sha256sum | cut -d' ' -f1)
             fi
           fi
-          # R342（未变沿用判定）：上一代 meta 与 release 现状都要自洽才可信——格式/指纹
-          # 一致、records 包已生成、且 release 里的 targets 页数与上一代 meta 相符。
+          # R342: carry only when the previous meta and the release's current
+          # state are self-consistent (format/fingerprint match, records pack
+          # exists, page count matches the previous meta).
           CARRY=0
           if [ "$SKIP_ENV_PACK" = 1 ] && [ "$REC_OK" = 1 ] && [ -n "$TGT_FP" ] && [ -f "$OUT/meta.env-carry.json" ] \
             && jq -e '(.targets.mode // "") | test("^(dirtar|mixed)")' "$OUT/meta.env-carry.json" >/dev/null 2>&1 \
@@ -755,9 +701,6 @@ jobs:
               echo "::warning::targets fingerprint matches but the release has ${_have_n:-0} of ${_prev_n:-0} page(s); re-uploading targets"
             fi
           fi
-          # R342（Stage C）：目标工作区以目录直存随 targets 包同行（tar 根下 <name>，排除
-          # 运行态文件锁）；只打包真正的 git 工作区（跳过 data/.github 等辅助目录）。
-          # 沿用轮次（CARRY=1）跳过打包，省 ~15s。
           if [ "$CARRY" != 1 ]; then
             TGT_PACK_T0=$(date +%s)
             TGT_DIRS=()
@@ -765,8 +708,7 @@ jobs:
             for d in "$TARGETS_DIR"/*/; do
               [ -d "${d%/}/.git" ] && TGT_DIRS+=("$(basename "$d")")
             done
-            # R573: slim 目标不把 .git 历史打进包（proxyip 实测 1.5GB → 0）。排除项按
-            # index 逐目录生成；全量模式目录不受影响。
+            # R573: slim targets exclude .git history (proxyip: 1.5GB -> 0).
             if [ -s "$IDX" ]; then
               while IFS= read -r sd; do
                 [ -n "$sd" ] && SLIM_EXCLUDES+=("--exclude=$sd/.git" "--exclude=$sd/.git/*")
@@ -775,7 +717,6 @@ jobs:
             ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
               | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
               || echo "::warning::target workspace package failed"
-            # R736: sub-step timing makes the next run's <60s target auditable.
             echo "snapshot timing: targets pack $(( $(date +%s) - TGT_PACK_T0 ))s, $(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c) bytes"
           fi
           SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
@@ -787,35 +728,28 @@ jobs:
           REC_SZ=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c)
           REC_N=$(ls "$OUT"/records.tar.gz.* 2>/dev/null | wc -l)
           REC_SHA=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
-          # ── R428 / Stage D：分页并行上传助手（有界并发）────────────────────────
-          # 依据：2026-10-19 基准（本 runner→GitHub release，256 MiB 定字节）：
-          #   单流 27–33 MB/s；4 流 65 MB/s；8 流 82 MB/s（≈2.5–3×）。
-          # 因此在**相位内**把分页资产并行上传；相位序不变：stage→校验→删旧→真名→meta→删stage。
-          # 每页一个 `gh release upload`（内部单流），并发 N ⇒ 聚合吞吐上台阶。
-          # 失败语义沿用原版：任一页失败 ⇒ 本相失败（stage 失败不动旧包；真名失败写 warning）；
-          # 每个调用点都保留单次全量 `gh release upload` 作为回退（并行助手失败时回落，仍是正确序）。
+          # R428 / Stage D: page-parallel upload (bounded concurrency).
           SNAP_UP_PAR="${SNAP_UP_PAR:-8}"
+          # R2513: TAG/REPO via env; the script body reads $TAG, $REPO, $1 —
+          # no fragile $0/_/$2/$3 positional contract.
           upload_par() {
             local fail=0
             [ "$#" -gt 0 ] || return 1
-            printf '%s\0' "$@" | xargs -0 -n1 -P"$SNAP_UP_PAR" bash -c \
-              'gh release upload "$0" "$3" --repo "$2" --clobber >/dev/null 2>&1' "$ENV_TAG" _ "$SESSIONS_REPO" || fail=1
+            printf '%s\0' "$@" | \
+              TAG="$ENV_TAG" REPO="$SESSIONS_REPO" \
+              xargs -0 -n1 -P"$SNAP_UP_PAR" \
+                bash -c 'gh release upload "$TAG" "$1" --repo "$REPO" --clobber >/dev/null 2>&1' _ \
+              || fail=1
             return "$fail"
           }
-          # ROUND 35：只有当 **env 页真的存在** 时才进入「删旧资产 + 上传」分支。否则打包失败
-          # 会把上一代好包删掉（manifest 本身也会让目录非空，所以这里不能用"目录非空"当判据）。
           if ls "$OUT"/env.tar.gz.* >/dev/null 2>&1; then
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
               || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
                    --notes "Whole-\$HOME environment + target workspace packages; replaced every run." >/dev/null 2>&1
-            # ROUND 42（取消安全换装，关键）：旧序是「先删光旧卷、再上传」——取消若切在中间，
-            # release 会**没有包或只剩残包**，下一轮就还原不出环境。运营者现在会**故意**做
-            # 一系列取消来验证无缝，故改成与 `env-backup.sh swap` 同款的原子序：
-            #   ① 先建好 manifest（本地）
-            #   ② 新代以 STAGE 名上传（读侧 glob `env.tar.gz*` 与删除正则都不匹配 stage-*）
-            #   ③ 远程逐个比对 STAGE 尺寸
-            #   ④ 删旧代  ⑤ 真名上传（manifest 最后）  ⑥ 远程校验真名  ⑦ 删 STAGE 副本
-            # 任何中断都退化成「上一代完整包仍在」，永不出现混杂/空缺。
+            # ROUND 42: cancel-safe atomic swap. Sequence: build manifest ->
+            # upload STAGE copies -> verify sizes -> delete old -> upload real
+            # names -> upload meta -> delete STAGE. Any interruption leaves the
+            # previous complete package in place.
             jq -n --arg tag "$ENV_TAG" --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
                   --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
                   --argjson env_bytes "${SZ:-0}" --argjson targets_bytes "${TZ:-0}" \
@@ -851,7 +785,6 @@ jobs:
               echo "::warning::staged upload failed; the previous package is left untouched"
             fi
             if [ "$stage_ok" -eq 1 ]; then
-              # 旧代删除（正则与读侧 glob 都不匹配 stage-*，故暂存副本安全）；逐资产后台并行、wait 收口
               mapfile -t DELOLD < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
                 | grep -E '^(env|home|targets|records)\.tar\.gz(\.|$)|^meta\.json$' || true)
               for a in ${DELOLD[@]+"${DELOLD[@]}"}; do
@@ -863,8 +796,7 @@ jobs:
                 [ -f "$f" ] && UPF+=("$f")
               done
               if upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-                # ROUND 35：manifest 最后上传 ⇒ 它的存在即代表页是完整的；读侧据它检测
-                # "下载不全"并拒绝半套应用；缺失时读侧退回无校验直解（降级读）。
+                # manifest last: its presence means the pages are complete.
                 if [ -s "$OUT/meta.json" ]; then
                   gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
                     || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
@@ -885,10 +817,9 @@ jobs:
             fi
           elif [ "$SKIP_ENV_PACK" = 1 ] \
             && { [ "${CARRY:-0}" = 1 ] || ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; }; then
-            # ROUND 278：env 由 env-sync 分支承担 ⇒ 本次**仅**原子换装 targets 包；
-            # release 里的旧 env 卷**保留**为回退源（env_try 仍按其尺寸校验）。新 meta
-            # 沿用旧 meta 的 env 段并打 .env.carried=true（读侧据此让位给分支）。
-            # R342：records（每轮必新）+ targets（内容未变则沿用，跳过 ~1.4GB 双上传）。
+            # ROUND 278: env is carried by the env-sync branch; only atomically
+            # swap the targets/records packages. The old release env pages
+            # remain as a size-verified fallback.
             if [ -f "$OUT/meta.env-carry.json" ] \
               && jq --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
                  --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
@@ -984,24 +915,25 @@ jobs:
           rm -rf "$OUT"
 
       - name: Rebuild repository baseline
-        if: always() && steps.lock.outputs.acquired == 'true' && inputs.reset_baseline
+        # R2513: smoke must not mutate the repository baseline. Also added
+        # idempotency (see below) for interrupted previous attempts.
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && inputs.reset_baseline
         run: |
           set +e
           cd "$SESSIONS_DIR"
-          # Rewrite the repository to its clean initial baseline. Only the bridge CODE and
-          # templates stay in git; ALL runtime state (sessions DB, bridge chats, loop
-          # control, shell capture) now lives in the `env` release. This is the "reset to
-          # factory" baseline: restoring it - and dropping the env release - returns the
-          # loop to the initial state. Run this with reset_baseline=true once (or whenever
-          # you want to re-freeze the baseline).
+          # R2514: make the orphan reset idempotent. If a previous attempt was
+          # interrupted between `checkout --orphan` and `branch -M`, the
+          # `baseline-reset` branch still exists and `checkout --orphan` would
+          # fail. Detach first, then delete the stale branch.
+          git checkout --detach HEAD >/dev/null 2>&1 || true
+          git branch -D baseline-reset >/dev/null 2>&1 || true
           git checkout --orphan baseline-reset >/dev/null 2>&1
           rm -rf opencode/data
           mkdir -p opencode/data
           touch opencode/data/.gitkeep
-          # 循环记录同样是**运行态**：它活在 env release 的工作树里，绝不进"出厂基线"。
-          # 否则 reset 出来的"干净、开箱即用"环境会带着历史轮次记录（运营者 2026-10-18 指出）。
-          # 注：assets 快照已排除 ./work（见 --exclude='./work'），因此记录**不**会进 env 包；
-          # 若运营者要求"仓库树也永远干净"，需再把记录迁到 $HOME 内被快照的路径（待决策）。
+          # Runtime state (sessions DB, bridge chats, loop control, shell capture)
+          # lives in the env release, not in git. Loop records are runtime state
+          # too; a "clean" baseline must not carry them.
           rm -rf sessions state tasks workspace-snapshots loop-state.md
           rm -f opencode/config/tg-chats.json opencode/config/tg-chats-bot*.json \
                 opencode/config/loop-ctl.json opencode/config/loop-marker.json \
@@ -1014,7 +946,6 @@ jobs:
             echo '# Runtime state lives in the env release, not in git.'
             echo 'opencode/data/*'
             echo '!opencode/data/.gitkeep'
-            # 循环记录（轮次笔记 / 状态 / 任务 / 快照索引）也不是基线的一部分
             echo 'sessions/'
             echo 'state/'
             echo 'tasks/'
