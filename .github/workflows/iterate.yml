@@ -29,17 +29,12 @@ on:
         required: false
         default: "256m"
   schedule:
-    # R2513: 6-hour cadence. Relay drives the loop; cron is the safety net when
-    # a relay attempt fails (API blip, network).
     - cron: "0 */6 * * *"
 
 concurrency:
   # R2513: `inputs.smoke` is a BOOLEAN in the `inputs` context (type: boolean).
-  # Comparing it to the string 'true' is always false (boolean vs string
-  # comparison coerces to numbers: true→1, 'true'→NaN). That silently disabled
-  # this branch and made smoke runs share the production `iterate` group.
-  # `github.event.inputs.*` is always a string, so compare against that.
-  # This rule is applied to EVERY smoke check below.
+  # Comparing boolean to string 'true' coerces to numbers (true→1, 'true'→NaN)
+  # and is always false. `github.event.inputs.*` is always a string — use it.
   group: ${{ github.event.inputs.smoke == 'true' && format('iterate-smoke-{0}', github.run_id) || 'iterate' }}
   cancel-in-progress: false
 
@@ -56,20 +51,19 @@ env:
 
 jobs:
   iterate:
-    # R2513: manual dispatch ALWAYS runs, even when the loop is paused. That is
-    # the only way the Resume step below can clear CI_LOOP_PAUSED; the previous
-    # `inputs.smoke || vars.CI_LOOP_PAUSED != 'true'` skipped manual dispatches
-    # while paused, so nothing ever cleared the flag again -> infinite skip.
-    # Schedule still respects pause (it must NOT auto-revive a stopped loop).
+    # R2513: manual dispatch ALWAYS runs, even when the loop is paused — that
+    # is the only way the Resume step below can clear CI_LOOP_PAUSED. The
+    # previous `inputs.smoke || vars.CI_LOOP_PAUSED != 'true'` skipped manual
+    # dispatches while paused, so nothing ever cleared the flag: infinite skip.
+    # Schedule still respects pause (must not auto-revive a stopped loop).
     # smoke always runs.
     if: github.event.inputs.smoke == 'true' || github.event_name == 'workflow_dispatch' || vars.CI_LOOP_PAUSED != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - name: Check out ci-repo
-        # R2513: `actions/checkout@v6` does not exist (latest stable line is
-        # v4/v5). A missing tag fails with "unable to resolve action" before any
-        # step runs, which looks like another silent skip.
+        # R2513: `actions/checkout@v6` does not exist (latest stable is v4/v5).
+        # A missing tag fails before any step runs.
         uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -98,8 +92,6 @@ jobs:
           set -euo pipefail
           if [ ! -d "$SESSIONS_DIR/.git" ]; then
             mkdir -p "$(dirname "$SESSIONS_DIR")"
-            # R574: main-only shallow clone; env-sync branch is fetched separately
-            # by restore-env.sh. Saves ~28s vs a full clone at boot.
             gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR" -- --depth 1 --single-branch --branch main
           fi
           mkdir -p "$SESSIONS_DIR/state" "$SESSIONS_DIR/tasks" "$SESSIONS_DIR/sessions" "$SESSIONS_DIR/workspace-snapshots"
@@ -108,16 +100,13 @@ jobs:
       - name: Acquire lock
         id: lock
         run: |
-          # Serialized by the workflow-level `concurrency` group. The step id and
-          # output are kept so downstream `if:` guards stay uniform.
           echo "acquired=true" >> "$GITHUB_OUTPUT"
 
       - name: Resume loop on manual dispatch
-        # R2513: a manual dispatch is an explicit "restart" signal. When the
-        # previous run was cancelled, `failure_guard` set CI_LOOP_PAUSED=true;
-        # without clearing it here Relay stays blocked and every schedule tick
-        # is skipped -> "CI does not continue". smoke must NOT touch production
-        # variables (compare against github.event.inputs.smoke, not inputs.smoke).
+        # R2513: a manual dispatch is an explicit "restart" signal. Previous
+        # cancellation set CI_LOOP_PAUSED=true; without clearing it here Relay
+        # stays blocked and every schedule tick is skipped. smoke must NOT
+        # touch production variables.
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
@@ -151,8 +140,6 @@ jobs:
           TG_BOTS_EXTRA: ${{ secrets.TG_BOTS_EXTRA }}
         run: |
           set +e
-          # R573: targets restore and env restore are independent; run them in
-          # parallel. Both are children of this step, so `wait` is reliable.
           bash "$GITHUB_WORKSPACE/.github/scripts/restore-targets.sh" > /tmp/restore-targets.log 2>&1 &
           p_t=$!
           bash "$GITHUB_WORKSPACE/.github/scripts/restore-env.sh" > /tmp/restore-env.log 2>&1 &
@@ -167,8 +154,6 @@ jobs:
             echo "::error::restore failed (targets rc=$rc_t env rc=$rc_e)"
             exit 1
           fi
-          # R941: env-sync tar restore can widen secret files to 0644. Normalize
-          # every runtime json/env under the config dir with globs.
           for p in "$HOME/.config/opencode"/*.json \
                    "$HOME/.config/opencode"/*.env \
                    "$HOME/.local/state/opencode/service.json" \
@@ -189,17 +174,12 @@ jobs:
           set -euo pipefail
           curl -fsSL https://opencode.ai/v2/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          # zengate runs the real OpenCode CLI for the egress preflight, so a
-          # synthetic curl 429 is not mistaken for an exhausted IP.
           npm install -g workferry zengate@1.3.1
 
       - name: Select egress proxy
-        # R2513: `EGRESS_BLACKLIST_ENABLED` was "0" while the comments and the
-        # `reset_baseline` exclusions assume the blacklist is live. That
-        # silently disabled the TTL mechanism (previously-failed candidates
-        # were re-tested every boot). Restored to "1". If the operator ever
-        # needs to turn it off, also delete the paragraph above so the docs
-        # and the code cannot disagree again.
+        # R2513: `EGRESS_BLACKLIST_ENABLED` was "0" while the comments assume
+        # the blacklist is live. Restored to "1". If you ever need it off,
+        # also delete the paragraph above so docs and code cannot disagree.
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -213,9 +193,6 @@ jobs:
           set +e
           bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
           echo "select-proxy rc=${PIPESTATUS[0]}"
-          # Direct notification instead of a bridge message: the bridge lives
-          # inside the proxied opencode process, so a dead proxy would silence
-          # the only channel that could report it.
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             if [ -s "$HOME/.config/opencode/exit-proxy.json" ]; then
               KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
@@ -239,15 +216,10 @@ jobs:
           TARGETS_DIR: /home/runner/work/targets
           TG_BRIDGE_FORCE_SERVE: "1"
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
-          # R2513: must match the select step; see the comment there.
           EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
         run: |
           set +e
-          # Egress manager: OpenCode only ever sees http://127.0.0.1:8089.
-          # The manager forwards provider CONNECTs through the selected
-          # direct/relay upstream. egress-watch.sh can hot-swap that upstream
-          # mid-run without restarting the process. TLS stays end-to-end.
           RUN_LOG="$RUNNER_TEMP/opencode-run.log"
           EGRESS_DIR="${EGRESS_STATE_DIR:-$RUNNER_TEMP/egress}"
           export EGRESS_STATE_DIR="$EGRESS_DIR"
@@ -299,61 +271,38 @@ jobs:
             echo "egress proxy: none (direct connection)"
           fi
           BUDGET="${BUDGET_SECONDS:-19800}"
-          # Cold-start resume. `opencode run` is one-shot; the long-lived
-          # interactive mode keeps the tg-bridge alive for the whole budget and
-          # feeds operator Telegram messages into the same session.
           SID=""
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
           fi
-          # R2513: the probe previously used `session_v2` unconditionally and
-          # swallowed every error, so a schema change (or a wholly missing
-          # table) looked like "n/a" and silently fell through to `--continue`,
-          # wiping context. Now: try the known table names, emit an explicit
-          # `no-table`/`err`, and print the presence state in the log.
+          # R2513: session presence probe. Uses the sqlite3 CLI (present on
+          # ubuntu-latest) instead of an inline Python heredoc — a heredoc whose
+          # contents are column-0 inside `run: |` breaks YAML parsing.
           SID_PRESENT="n/a"
-          if [ -n "$SID" ] && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-            SID_PRESENT=$(SID="$SID" python3 - <<'PY' 2>/dev/null
-import sqlite3, os, sys
-sid = os.environ["SID"]
-db = os.path.expanduser("~/.local/share/opencode/opencode.db")
-try:
-    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
-    for t in ("session_v2", "session"):
-        if t in tables:
-            print("yes" if c.execute(f"select 1 from {t} where id=?", (sid,)).fetchone() else "no")
-            sys.exit(0)
-    print("no-table")
-except Exception:
-    print("err")
-PY
-)
-            [ -z "$SID_PRESENT" ] && SID_PRESENT="err"
+          DB="$HOME/.local/share/opencode/opencode.db"
+          if [ -n "$SID" ] && [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+            TABLES=$(sqlite3 "$DB" ".tables" 2>/dev/null || echo "")
+            if echo " $TABLES " | grep -qw session_v2; then
+              HIT=$(sqlite3 "$DB" "SELECT 1 FROM session_v2 WHERE id = '$SID' LIMIT 1" 2>/dev/null || true)
+              [ "$HIT" = "1" ] && SID_PRESENT="yes" || SID_PRESENT="no"
+            elif echo " $TABLES " | grep -qw session; then
+              HIT=$(sqlite3 "$DB" "SELECT 1 FROM session WHERE id = '$SID' LIMIT 1" 2>/dev/null || true)
+              [ "$HIT" = "1" ] && SID_PRESENT="yes" || SID_PRESENT="no"
+            else
+              SID_PRESENT="no-table"
+            fi
           fi
           echo "bound session probe: present=$SID_PRESENT"
           RECOVER_LINE=""
           if { [ "$SID_PRESENT" = "no" ] || [ "$SID_PRESENT" = "no-table" ] || [ -z "$SID" ]; } \
-             && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
-            RECOVER_LINE=$(python3 - <<'PY' 2>/dev/null
-import sqlite3, os
-db = os.path.expanduser("~/.local/share/opencode/opencode.db")
-try:
-    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
-    for t in ("session_message", "message_v2", "message"):
-        if t in tables:
-            try:
-                r = c.execute(f"select session_id, count(*) n from {t} group by session_id order by n desc limit 1").fetchone()
-                if r:
-                    print("%s %d" % (r[0], r[1]))
-                    break
-            except Exception:
-                continue
-except Exception:
-    pass
-PY
-)
+             && [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+            TABLES=$(sqlite3 "$DB" ".tables" 2>/dev/null || echo "")
+            for tbl in session_message message_v2 message; do
+              if echo " $TABLES " | grep -qw "$tbl"; then
+                RECOVER_LINE=$(sqlite3 "$DB" "SELECT session_id || ' ' || COUNT(*) FROM $tbl GROUP BY session_id ORDER BY COUNT(*) DESC LIMIT 1" 2>/dev/null || true)
+                [ -n "$RECOVER_LINE" ] && break
+              fi
+            done
           fi
           RECOVER="${RECOVER_LINE%% *}"
           RECOVER_MSGS="${RECOVER_LINE##* }"
@@ -363,7 +312,6 @@ PY
             ARGS=(--standalone --session "$SID")
             echo "resuming bound session present_in_db=$SID_PRESENT"
           elif [ -n "$SID" ] && [ "$SID_PRESENT" != "no" ] && [ "$SID_PRESENT" != "no-table" ]; then
-            # DB unreadable (err/n-a): keep the pin; it is the verified path.
             ARGS=(--standalone --session "$SID")
             echo "resuming pinned session (db unreadable, present_in_db=$SID_PRESENT)"
           elif [ -n "$RECOVER" ]; then
@@ -372,7 +320,7 @@ PY
           else
             ARGS=(--standalone --continue)
             if [ -n "$SID" ]; then
-              echo "bound session absent from the restored db (present_in_db=$SID_PRESENT); no richer session to recover; falling back to --continue"
+              echo "bound session absent (present_in_db=$SID_PRESENT); no richer session to recover; falling back to --continue"
             else
               echo "no bound session found; continuing the last session"
             fi
@@ -381,8 +329,6 @@ PY
             opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
           RC=$?
           if [ -f "$EGRESS_DIR/stop" ]; then
-            # The watcher's "3 consecutive failures" is a controlled stop, not a
-            # crash. Keep the step green; failure_guard pauses the loop.
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "::warning::egress watcher stopped this round after 3 consecutive failures; pausing the loop (manual dispatch resumes)"
             RC=0
@@ -426,7 +372,6 @@ PY
 
       - name: Update failure streak and stop policy
         id: failure_guard
-        # R2513: smoke must not touch production variables.
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
@@ -443,10 +388,9 @@ PY
             echo "allow_relay=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # R2514: `skipped` means a prerequisite (restore / setup-node /
-          # install / select-proxy) failed, so Run OpenCode never ran. That is
-          # a transient failure and should increment the streak, NOT pause the
-          # loop. `cancelled` is an operator signal and pauses immediately.
+          # R2514: `skipped` (prerequisite failed, Run OpenCode never ran) is a
+          # transient failure — increment streak, do NOT pause. `cancelled` is
+          # an operator signal — pause immediately.
           if [ "$outcome" = "success" ]; then
             gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             allow=true
@@ -470,7 +414,6 @@ PY
             gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
             echo "::notice::run cancelled by operator; CI_LOOP_PAUSED=true, no successor"
           else
-            # Unknown outcome: be conservative.
             gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
             echo "::notice::unexpected outcome=$outcome; paused the loop and suppressing relay"
           fi
@@ -478,10 +421,8 @@ PY
 
       - name: Relay next run
         # R2513: do NOT gate on `vars.CI_LOOP_PAUSED` — `vars` is snapshotted at
-        # run start, so a Resume step that just cleared the flag would still be
-        # overruled by the stale value. `allow_relay` is the single source of
-        # truth for pause: it is false whenever the loop was paused at the time
-        # Relay would have run (watcher stop, 3-failure guard, cancel).
+        # run start, so a Resume step that cleared the flag would be overruled.
+        # `allow_relay` is the single source of truth.
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.failure_guard.outputs.allow_relay == 'true'
         run: |
           set +e
@@ -505,10 +446,8 @@ PY
           fi
 
       - name: Save workspace snapshots
-        # R2513: smoke must NOT write to the env release (it runs in a separate
-        # concurrency group, so a smoke save could race and overwrite the
-        # production package). Also keep the "restore must succeed" guard so a
-        # half-restored world is never snapshotted.
+        # R2513: smoke must NOT write the env release (it runs in a separate
+        # concurrency group, so a save could race and overwrite production).
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         run: |
           set +e
@@ -516,8 +455,6 @@ PY
           mkdir -p "$SNAP"
           INDEX="$SNAP/index.json"
           [ -f "$INDEX" ] || echo '{"snapshots": []}' > "$INDEX"
-          # R342: workspace-snapshots/ must contain only index.json; any subdir
-          # is a leftover from the old bundle/worktree format.
           find "$SNAP" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
           shopt -s nullglob
           for target_dir in "$TARGETS_DIR"/*/; do
@@ -560,9 +497,6 @@ PY
               fi
             fi
 
-            # R342/R573: fingerprint covers HEAD, branch, and worktree content.
-            # Refs and .git internals are deliberately excluded (refs/stash
-            # changes every generation; refs/remotes drift with fetch).
             FP=$( {
               printf 'head=%s\n' "$COMMIT"
               printf 'branch=%s\n' "$BRANCH"
@@ -586,8 +520,6 @@ PY
           done
 
       - name: Snapshot environment to sessions repository
-        # R2513: smoke must NOT write to the release (same rationale as the
-        # workspace snapshot step).
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         env:
           SPLIT_SIZE: ${{ inputs.split_size }}
@@ -595,8 +527,6 @@ PY
           set +e
           ENV_SRC="$SESSIONS_DIR/opencode"
           mkdir -p "$ENV_SRC"
-          # R2508: the sessions repo is PRIVATE, so bot tokens are stored as-is.
-          # Do NOT reintroduce scrubbing: it broke bot registration on restore.
           ENV_TAG="env"
           SPLIT_SIZE="${SPLIT_SIZE:-256m}"
           if command -v python3 >/dev/null 2>&1 && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
@@ -610,9 +540,6 @@ PY
           else
             TAR_COMP=(tar -czf -)
           fi
-          # ROUND 278: run-end env-sync pushes the final state to the env-sync
-          # branch. On success the full env pack can be skipped; the branch is
-          # the primary source and the release env is a size-verified fallback.
           SKIP_ENV_PACK=0
           if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
             SYNC_OK=0
@@ -639,7 +566,6 @@ PY
             fi
           fi
           if [ "$SKIP_ENV_PACK" != 1 ]; then
-          # R2507: transient shell transcripts can exceed GitHub's 100MiB limit.
           find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null || true
           "${TAR_COMP[@]}" -C "$HOME" \
             --exclude='./work' \
@@ -663,9 +589,6 @@ PY
             . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." \
             || echo "::warning::environment package failed"
           fi
-          # R342: records are small but change every run; targets are large but
-          # often unchanged. Splitting them lets a carry-round replace only
-          # records (~2MB) and skip a ~1.4GB re-upload.
           REC_OK=0
           ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" state tasks sessions loop-state.md 2>/dev/null ) \
             | split -b "$SPLIT_SIZE" - "$OUT/records.tar.gz." \
@@ -685,9 +608,6 @@ PY
               TGT_FP=$(jq -r '[.snapshots[] | .dir + "=" + .fp] | sort | join("\n")' "$IDX" | sha256sum | cut -d' ' -f1)
             fi
           fi
-          # R342: carry only when the previous meta and the release's current
-          # state are self-consistent (format/fingerprint match, records pack
-          # exists, page count matches the previous meta).
           CARRY=0
           if [ "$SKIP_ENV_PACK" = 1 ] && [ "$REC_OK" = 1 ] && [ -n "$TGT_FP" ] && [ -f "$OUT/meta.env-carry.json" ] \
             && jq -e '(.targets.mode // "") | test("^(dirtar|mixed)")' "$OUT/meta.env-carry.json" >/dev/null 2>&1 \
@@ -708,7 +628,6 @@ PY
             for d in "$TARGETS_DIR"/*/; do
               [ -d "${d%/}/.git" ] && TGT_DIRS+=("$(basename "$d")")
             done
-            # R573: slim targets exclude .git history (proxyip: 1.5GB -> 0).
             if [ -s "$IDX" ]; then
               while IFS= read -r sd; do
                 [ -n "$sd" ] && SLIM_EXCLUDES+=("--exclude=$sd/.git" "--exclude=$sd/.git/*")
@@ -728,10 +647,7 @@ PY
           REC_SZ=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c)
           REC_N=$(ls "$OUT"/records.tar.gz.* 2>/dev/null | wc -l)
           REC_SHA=$(cat "$OUT"/records.tar.gz.* 2>/dev/null | sha256sum | cut -d' ' -f1)
-          # R428 / Stage D: page-parallel upload (bounded concurrency).
           SNAP_UP_PAR="${SNAP_UP_PAR:-8}"
-          # R2513: TAG/REPO via env; the script body reads $TAG, $REPO, $1 —
-          # no fragile $0/_/$2/$3 positional contract.
           upload_par() {
             local fail=0
             [ "$#" -gt 0 ] || return 1
@@ -746,10 +662,6 @@ PY
             gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
               || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
                    --notes "Whole-\$HOME environment + target workspace packages; replaced every run." >/dev/null 2>&1
-            # ROUND 42: cancel-safe atomic swap. Sequence: build manifest ->
-            # upload STAGE copies -> verify sizes -> delete old -> upload real
-            # names -> upload meta -> delete STAGE. Any interruption leaves the
-            # previous complete package in place.
             jq -n --arg tag "$ENV_TAG" --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
                   --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
                   --argjson env_bytes "${SZ:-0}" --argjson targets_bytes "${TZ:-0}" \
@@ -796,7 +708,6 @@ PY
                 [ -f "$f" ] && UPF+=("$f")
               done
               if upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-                # manifest last: its presence means the pages are complete.
                 if [ -s "$OUT/meta.json" ]; then
                   gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
                     || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
@@ -817,9 +728,6 @@ PY
             fi
           elif [ "$SKIP_ENV_PACK" = 1 ] \
             && { [ "${CARRY:-0}" = 1 ] || ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; }; then
-            # ROUND 278: env is carried by the env-sync branch; only atomically
-            # swap the targets/records packages. The old release env pages
-            # remain as a size-verified fallback.
             if [ -f "$OUT/meta.env-carry.json" ] \
               && jq --arg run "${GITHUB_RUN_ID:-}" --arg commit "${GITHUB_SHA:-}" \
                  --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg split "$SPLIT_SIZE" \
@@ -915,25 +823,16 @@ PY
           rm -rf "$OUT"
 
       - name: Rebuild repository baseline
-        # R2513: smoke must not mutate the repository baseline. Also added
-        # idempotency (see below) for interrupted previous attempts.
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && inputs.reset_baseline
         run: |
           set +e
           cd "$SESSIONS_DIR"
-          # R2514: make the orphan reset idempotent. If a previous attempt was
-          # interrupted between `checkout --orphan` and `branch -M`, the
-          # `baseline-reset` branch still exists and `checkout --orphan` would
-          # fail. Detach first, then delete the stale branch.
           git checkout --detach HEAD >/dev/null 2>&1 || true
           git branch -D baseline-reset >/dev/null 2>&1 || true
           git checkout --orphan baseline-reset >/dev/null 2>&1
           rm -rf opencode/data
           mkdir -p opencode/data
           touch opencode/data/.gitkeep
-          # Runtime state (sessions DB, bridge chats, loop control, shell capture)
-          # lives in the env release, not in git. Loop records are runtime state
-          # too; a "clean" baseline must not carry them.
           rm -rf sessions state tasks workspace-snapshots loop-state.md
           rm -f opencode/config/tg-chats.json opencode/config/tg-chats-bot*.json \
                 opencode/config/loop-ctl.json opencode/config/loop-marker.json \
