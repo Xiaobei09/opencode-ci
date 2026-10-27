@@ -36,7 +36,7 @@ on:
 concurrency:
   # Smoke tests must not sit behind a stale queued production run. They get a
   # unique group and are explicitly barred from relaying.
-  group: ${{ inputs.smoke && format('iterate-smoke-{0}', github.run_id) || 'iterate' }}
+  group: ${{ inputs.smoke == 'true' && format('iterate-smoke-{0}', github.run_id) || 'iterate' }}
   cancel-in-progress: false
 
 permissions:
@@ -55,7 +55,7 @@ jobs:
     # Set the repository variable CI_LOOP_PAUSED=true to stop the loop without
     # relying on an in-flight run's relay step. A paused run is skipped and has
     # no successor.
-    if: inputs.smoke || vars.CI_LOOP_PAUSED != 'true'
+    if: inputs.smoke == 'true' || vars.CI_LOOP_PAUSED != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -116,7 +116,7 @@ jobs:
         # 之后手动重启的 run 虽然会跑 OpenCode，但 run 尾的 relay 被 pause 条件挡住，
         # 跑完这一轮就彻底停住。这里在手动 run 启动时清 pause/streak，让重启真正接力。
         # smoke 测试不碰生产变量；schedule 仍然尊重 pause（不自动复活）。
-        if: github.event_name == 'workflow_dispatch' && !inputs.smoke && steps.lock.outputs.acquired == 'true'
+        if: github.event_name == 'workflow_dispatch' && inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
         run: |
@@ -427,7 +427,7 @@ jobs:
 
       - name: Update failure streak and stop policy
         id: failure_guard
-        if: always() && !inputs.smoke && steps.lock.outputs.acquired == 'true'
+        if: always() && inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
         run: |
@@ -478,7 +478,7 @@ jobs:
         # failure is being retried and the 3-failure guard still allows it.
         # Cancellation is a stop signal: it never relays. This removes the
         # infinite "cancel one run -> another appears" loop.
-        if: always() && !inputs.smoke && steps.lock.outputs.acquired == 'true' && vars.CI_LOOP_PAUSED != 'true' && steps.failure_guard.outputs.allow_relay == 'true'
+        if: always() && inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && vars.CI_LOOP_PAUSED != 'true' && steps.failure_guard.outputs.allow_relay == 'true'
         run: |
           set +e
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
