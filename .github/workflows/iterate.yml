@@ -177,15 +177,16 @@ jobs:
           npm install -g workferry zengate@1.3.1
 
       - name: Select egress proxy
-        # R2513: `EGRESS_BLACKLIST_ENABLED` was "0" while the comments assume
-        # the blacklist is live. Restored to "1". If you ever need it off,
-        # also delete the paragraph above so docs and code cannot disagree.
+        # R2513/R2512（运营者：先禁用黑名单机制）：free-limit 是按账号/模型计，
+        # 不是按出口 IP 计；把 relay 拉黑只会让下一轮少一批可用出口。保持禁用，
+        # 让每次旋转都重新实测真实 OpenCode 预检。若未来要恢复，改回 "1" 并同步
+        # 更新 egress-lib.sh 的默认值与注释。
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
           EGRESS_ALLOW_PUBLIC_HTTP: "0"
-          EGRESS_BLACKLIST_ENABLED: "1"
+          EGRESS_BLACKLIST_ENABLED: "0"
           EGRESS_SELECT_MAX: "12"
           EGRESS_SELECT_BUDGET: "120"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
@@ -216,7 +217,7 @@ jobs:
           TARGETS_DIR: /home/runner/work/targets
           TG_BRIDGE_FORCE_SERVE: "1"
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
-          EGRESS_BLACKLIST_ENABLED: "1"
+          EGRESS_BLACKLIST_ENABLED: "0"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
         run: |
           set +e
