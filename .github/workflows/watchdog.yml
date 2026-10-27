@@ -44,6 +44,16 @@ jobs:
             echo "iterate alive: $live run(s) in flight; nothing to do"
             exit 0
           fi
+          # R2512（运营者：取消 CI 时不应该自动启动新一轮 CI）：如果最近一次 run
+          # 是被取消的，即使 failure_guard 没来得及置 pause（例如 job 被强杀），
+          # watchdog 也把它当作运营者停止信号，不自动重启。手动 dispatch 仍是恢复入口。
+          latest=$(gh run list --repo "$repo" --workflow iterate.yml --limit 1 \
+                     --json conclusion --jq '.[0].conclusion // ""' 2>/dev/null || echo "")
+          if [ "$latest" = "cancelled" ]; then
+            gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+            echo "::notice::latest iterate run was cancelled; treating it as an operator stop (no restart)"
+            exit 0
+          fi
           # A disabled workflow cannot be dispatched (R921: 422 disabled workflow).
           # `gh workflow view` has no --json in the runner's gh; list supports it.
           state=$(gh workflow list --repo "$repo" --json name,state --jq '.[] | select(.name == "iterate") | .state' 2>/dev/null | head -1)

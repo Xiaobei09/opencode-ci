@@ -3,7 +3,8 @@
 # errors or on repeated provider transport failures/timeouts. Stop the run after
 # three consecutive failed egress recovery attempts, or after three preflight
 # false positives (a candidate answers 200 but real generation hits quota
-# within 600s).
+# within 600s). A stop is a **controlled end of round**: the workflow keeps the
+# step green and pauses the loop, so CI does not show up as a red failure.
 #
 # Usage: egress-watch.sh <run-log> [proxy-log]
 set -uo pipefail

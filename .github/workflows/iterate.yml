@@ -372,8 +372,13 @@ jobs:
             opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
           RC=$?
           if [ -f "$EGRESS_DIR/stop" ]; then
-            echo "::error::egress watcher requested stop after 3 consecutive recovery failures"
-            RC=1
+            # R2512（运营者：CI 有时以错误结束）：watcher 的“连续 3 次失败停止本轮”
+            # 是**受控结束**，不是崩溃。旧实现强制 RC=1 → run 变红、不 relay，用户看到
+            # “CI 以错误结束”。现在标记 watcher_stop 并让本步成功；failure_guard 会把
+            # 循环置 pause（不再自动接力），手动 dispatch 时再由 Resume 步骤恢复。
+            echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::egress watcher stopped this round after 3 consecutive failures; pausing the loop (manual dispatch resumes)"
+            RC=0
           fi
           # Session content must never reach the CI log, so only a non-content summary.
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
@@ -429,7 +434,17 @@ jobs:
           set +e
           repo="${{ github.repository }}"
           outcome="${{ steps.run_opencode.outcome }}"
+          watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
           allow=false
+          if [ "$watcher_stop" = "true" ]; then
+            # R2512：连续 3 次失败是“停止本轮”而不是“运行崩溃”。本步保持绿色，
+            # 但置 pause + 不接力，等运营者手动 dispatch（Resume 步骤会清 pause）。
+            gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+            gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+            echo "::notice::watcher stopped the round after 3 consecutive failures; CI_LOOP_PAUSED=true, no successor"
+            echo "allow_relay=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$outcome" = "success" ]; then
             gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             allow=true
