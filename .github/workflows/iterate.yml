@@ -110,6 +110,27 @@ jobs:
           # whenever a push failed; removing it removes that whole failure class.
           echo "acquired=true" >> "$GITHUB_OUTPUT"
 
+      - name: Resume loop on manual dispatch
+        # R2512（运营者：重新启动 CI 后会话不能自动继续）：手动 dispatch 就是明确的
+        # “重新开始”信号。旧行为下，上一次 run 被 cancel 会把 CI_LOOP_PAUSED 置 true；
+        # 之后手动重启的 run 虽然会跑 OpenCode，但 run 尾的 relay 被 pause 条件挡住，
+        # 跑完这一轮就彻底停住。这里在手动 run 启动时清 pause/streak，让重启真正接力。
+        # smoke 测试不碰生产变量；schedule 仍然尊重 pause（不自动复活）。
+        if: github.event_name == 'workflow_dispatch' && !inputs.smoke && steps.lock.outputs.acquired == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_PAT }}
+        run: |
+          set +e
+          repo="${{ github.repository }}"
+          paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "")
+          if [ "$paused" = "true" ]; then
+            gh variable set CI_LOOP_PAUSED --body false --repo "$repo" >/dev/null 2>&1 || true
+            gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+            echo "manual dispatch resumed the loop (CI_LOOP_PAUSED=false, CI_FAIL_STREAK=0)"
+          else
+            echo "loop is not paused; nothing to resume"
+          fi
+
       - name: Prepare target workspace
         if: steps.lock.outputs.acquired == 'true'
         run: |
