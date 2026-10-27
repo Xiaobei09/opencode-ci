@@ -340,6 +340,7 @@ jobs:
             tr '\r' '\n' < "$RUN_LOG" 2>/dev/null \
               | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
               | grep -aE 'FreeUsageLimit|free usage limit|provider\.free-limit|provider\.transport|level=ERROR|error target=|idle_timeout|"type":"error"|HTTP 429|rate.?limit' \
+              | grep -avE 'grep -aE|grep -aoE|ERR_TXT=|opencode-errors\.txt|=== ' \
               > "$ERR_TXT" 2>/dev/null || true
             echo "opencode error summary: total=$(wc -l < "$ERR_TXT" 2>/dev/null || echo 0)"
             if [ -s "$ERR_TXT" ]; then
