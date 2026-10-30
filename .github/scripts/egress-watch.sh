@@ -32,6 +32,9 @@ last_rotate_ok_at=0
 # 只统计 watcher 运行期的 rotate（不含启动时 select-proxy 的首次选择）。
 reselections=0
 RESELECT_LIMIT=3
+# 全候选都返回 quota 的连续次数：账号级额度耗尽时，重选 IP 不会恢复额度。
+# 连续 3 次仍全 quota 就受控停本轮，避免每 4 分钟 relay 一次的空转。
+quota_streak=0
 
 log() { echo "$(egress_iso) $*" >> "$WATCH_LOG"; }
 
@@ -80,15 +83,22 @@ rotate() {
   last=$(egress_now)
   if [ "$rc" -eq 0 ]; then
     rotate_fail_streak=0
+    quota_streak=0
     last_rotate_ok_at=$last
     state=$(jq -c '{kind,upstream,egress_ip}' "$EGRESS_STATE_FILE" 2>/dev/null || echo '{}')
     log "rotate ok $state"
   elif [ "$rc" -eq 2 ]; then
-    # Every candidate answered quota. This is account-wide, so do not count it
-    # as an egress failure or stop the run; back off and keep the current route.
+    # Every candidate answered quota. This is account-wide: retrying another IP
+    # cannot buy quota back. Count consecutive all-quota rotations and stop the
+    # round after 3 (operator rule: any failure 3x => controlled stop), with a
+    # short 30s backoff so the 3 attempts can fit inside one run.
+    quota_streak=$((quota_streak + 1))
     last_rotate_ok_at=0
-    fail_until=$((last + 600))
-    log "rotate skipped: all candidates quota-limited; keeping current egress (backoff 10m)"
+    fail_until=$((last + 30))
+    log "rotate skipped: all candidates quota-limited (streak=$quota_streak/3); keeping current egress (backoff 30s)"
+    if [ "$quota_streak" -ge 3 ]; then
+      stop_run "three consecutive all-candidate quota rotations; pausing the loop"
+    fi
   else
     rotate_fail_streak=$((rotate_fail_streak + 1))
     last_rotate_ok_at=0
