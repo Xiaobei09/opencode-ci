@@ -8,6 +8,11 @@ on:
         type: boolean
         required: false
         default: true
+      relay:
+        description: Internal marker for relay-dispatched runs (never clears an operator pause)
+        type: boolean
+        required: false
+        default: false
       budget_seconds:
         description: OpenCode run budget in seconds (default ~5h30m; max job is 6h)
         type: string
@@ -107,7 +112,7 @@ jobs:
         # cancellation set CI_LOOP_PAUSED=true; without clearing it here Relay
         # stays blocked and every schedule tick is skipped. smoke must NOT
         # touch production variables.
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.smoke != 'true' && github.event.inputs.relay != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
         run: |
@@ -345,8 +350,8 @@ jobs:
             echo "opencode error summary: total=$(wc -l < "$ERR_TXT" 2>/dev/null || echo 0)"
             if [ -s "$ERR_TXT" ]; then
               sort "$ERR_TXT" 2>/dev/null | uniq -c | sort -rn | head -30 | cut -c1-360 || true
-              echo "opencode error tail:"
-              tail -20 "$ERR_TXT" 2>/dev/null | cut -c1-360 || true
+              echo "opencode error lines (all):"
+              cut -c1-500 "$ERR_TXT" 2>/dev/null || true
             fi
           fi
           if [ -f "$EGRESS_DIR/proxy.log" ]; then
@@ -422,16 +427,26 @@ jobs:
           echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
 
       - name: Relay next run
+        id: relay
         # R2513: do NOT gate on `vars.CI_LOOP_PAUSED` — `vars` is snapshotted at
         # run start, so a Resume step that cleared the flag would be overruled.
-        # `allow_relay` is the single source of truth.
+        # `allow_relay` is the single source of truth for the run outcome.
+        # R2517: still re-read the LIVE pause variable before dispatching — an
+        # operator stop issued while this run was in flight must win over relay.
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.failure_guard.outputs.allow_relay == 'true'
         run: |
           set +e
+          repo="${{ github.repository }}"
+          paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "")
+          if [ "$paused" = "true" ]; then
+            echo "relayed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CI_LOOP_PAUSED=true (live); operator stopped the loop, suppressing relay"
+            exit 0
+          fi
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
           relayed=0
           for attempt in 1 2 3; do
-            out=$(gh workflow run iterate.yml -f resume=true --repo "${{ github.repository }}" 2>&1)
+            out=$(gh workflow run iterate.yml -f resume=true -f relay=true --repo "$repo" 2>&1)
             rc=$?
             if [ "$rc" = "0" ]; then
               echo "relayed next run on attempt $attempt"
@@ -442,9 +457,52 @@ jobs:
             echo "::warning::relay attempt $attempt failed; not re-enabling a disabled workflow"
             sleep 5
           done
+          if [ "$relayed" = "1" ]; then
+            echo "relayed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relayed=false" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$relayed" != "1" ]; then
             echo "::error::relay failed after 3 attempts; no successor queued"
             exit 1
+          fi
+
+      - name: Notify loop stop
+        # R2517（运营者：每次 CI 结束告诉我本轮结束的原因）：只在循环真正停下时发一条，
+        # 正常接力不打扰。覆盖：连续 3 次失败、watcher 停止、取消、relay 失败、
+        # 运营者暂停后 relay 主动让路。
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && (steps.failure_guard.outputs.allow_relay != 'true' || steps.relay.outputs.relayed != 'true')
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_PAT }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+        run: |
+          set +e
+          repo="${{ github.repository }}"
+          outcome="${{ steps.run_opencode.outcome }}"
+          relay_out="${{ steps.relay.outcome }}"
+          watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
+          streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
+          paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
+          reason="本轮结束（opencode=$outcome）"
+          if [ "$watcher" = "true" ]; then
+            reason="连续失败 3 次，watcher 停止本轮（循环已暂停）"
+          elif [ "$outcome" = "cancelled" ]; then
+            reason="本轮被取消（运营者停止信号，不会自动接力）"
+          elif [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
+            reason="连续失败 3 次，循环已暂停"
+          elif [ "$relay_out" = "failure" ]; then
+            reason="接力失败：3 次 dispatch 均未成功，没有后继 run"
+          elif [ "$paused" = "true" ]; then
+            reason="循环已暂停（运营者停止或失败阈值），relay 已让路"
+          fi
+          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\nopencode：%s；relay：%s；streak：%s；pause：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$outcome" "$relay_out" "$streak" "$paused")
+          if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
+            curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${text}" \
+              >/dev/null 2>&1 || echo "::warning::could not send loop-stop notice to telegram"
+          else
+            echo "::warning::TG_BOT_TOKEN/TG_PUSH_CHAT missing; loop-stop notice skipped"
           fi
 
       - name: Save workspace snapshots
