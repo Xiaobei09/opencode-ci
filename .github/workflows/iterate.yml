@@ -600,15 +600,20 @@ jobs:
           else
             TAR_COMP=(tar -czf -)
           fi
+          SNAP_T0=$(date +%s)
           SKIP_ENV_PACK=0
           if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
             SYNC_OK=0
             for a in 1 2; do
-              if ENV_SYNC_WHY=run-end ENV_SYNC_TIMEOUT=180 \
-                   timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >/dev/null 2>&1; then
+              # R2518: WAIT_LOCK makes run-end wait for the bridge interval sync
+              # instead of silently skipping (rc=75 = still locked → retry).
+              ENV_SYNC_WHY=run-end ENV_SYNC_TIMEOUT=180 ENV_SYNC_WAIT_LOCK=1 \
+                timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >/dev/null 2>&1
+              sync_rc=$?
+              if [ "$sync_rc" = 0 ]; then
                 SYNC_OK=1; break
               fi
-              echo "::warning::run-end env-sync attempt $a did not complete; retrying"
+              echo "::warning::run-end env-sync attempt $a failed rc=$sync_rc (75=lock busy); retrying"
               sleep 20
             done
             if [ "$SYNC_OK" = 1 ]; then
@@ -625,6 +630,7 @@ jobs:
               echo "::warning::run-end env-sync failed; packing the env release as before"
             fi
           fi
+          echo "snapshot timing: env-sync $(( $(date +%s) - SNAP_T0 ))s (skip_pack=$SKIP_ENV_PACK)"
           if [ "$SKIP_ENV_PACK" != 1 ]; then
           find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null || true
           "${TAR_COMP[@]}" -C "$HOME" \
@@ -650,10 +656,12 @@ jobs:
             || echo "::warning::environment package failed"
           fi
           REC_OK=0
+          REC_T0=$(date +%s)
           ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" state tasks sessions loop-state.md 2>/dev/null ) \
             | split -b "$SPLIT_SIZE" - "$OUT/records.tar.gz." \
             && ls "$OUT"/records.tar.gz.* >/dev/null 2>&1 && REC_OK=1 \
             || echo "::warning::records package failed; readers will use the copy embedded in the targets package"
+          echo "snapshot timing: records pack $(( $(date +%s) - REC_T0 ))s, $(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c) bytes"
           TGT_FP=""; TGT_MODE=""
           IDX="$SESSIONS_DIR/workspace-snapshots/index.json"
           if [ -s "$IDX" ]; then
@@ -698,6 +706,7 @@ jobs:
               || echo "::warning::target workspace package failed"
             echo "snapshot timing: targets pack $(( $(date +%s) - TGT_PACK_T0 ))s, $(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c) bytes"
           fi
+          UP_T0=$(date +%s)
           SZ=$(cat "$OUT"/env.tar.gz.* 2>/dev/null | wc -c)
           TZ=$(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c)
           ENV_N=$(ls "$OUT"/env.tar.gz.* 2>/dev/null | wc -l)
@@ -880,6 +889,7 @@ jobs:
           else
             echo "::warning::environment package is empty"
           fi
+          echo "snapshot timing: publish $(( $(date +%s) - UP_T0 ))s, total $(( $(date +%s) - SNAP_T0 ))s"
           rm -rf "$OUT"
 
       - name: Rebuild repository baseline
