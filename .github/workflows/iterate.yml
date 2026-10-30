@@ -201,12 +201,17 @@ jobs:
           echo "select-proxy rc=${PIPESTATUS[0]}"
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             if [ -s "$HOME/.config/opencode/exit-proxy.json" ]; then
+              # R2520：与 TG 错误卡 exitProxySummary() 使用完全相同的键名/顺序：
+              # kind → upstream → local → egress → direct。旧格式 `CI egress: direct direct`
+              # 与错误卡的 `exit proxy: http://127.0.0.1:8089 ...` 对不上。
               KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
               UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+              SCHEME=$(jq -r '.scheme // "http"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+              PROXY=$(jq -r '.proxy // "127.0.0.1:8089"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
               EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-              MSG="CI egress: ${KIND} ${UP} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+              MSG="exit proxy: kind=${KIND} upstream=${UP} local=${SCHEME}://${PROXY} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
             else
-              MSG="CI egress: state missing (direct connection)"
+              MSG="exit proxy: none (state missing; direct connection)"
             fi
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \

@@ -28,6 +28,10 @@ trans_first=0
 rotate_fail_streak=0
 probe_false_streak=0
 last_rotate_ok_at=0
+# R2520（运营者）：每轮 CI 出问题时优先重选出口，但最多重选 3 次。
+# 只统计 watcher 运行期的 rotate（不含启动时 select-proxy 的首次选择）。
+reselections=0
+RESELECT_LIMIT=3
 
 log() { echo "$(egress_iso) $*" >> "$WATCH_LOG"; }
 
@@ -65,6 +69,11 @@ stop_run() {
 
 rotate() {
   local reason="$1" rc
+  reselections=$((reselections + 1))
+  if [ "$reselections" -gt "$RESELECT_LIMIT" ]; then
+    stop_run "egress re-selection limit exceeded (${reselections}/${RESELECT_LIMIT}); pausing the loop"
+  fi
+  log "reselection ${reselections}/${RESELECT_LIMIT} reason=$reason"
   log "rotating egress reason=$reason"
   bash "$SCRIPT_DIR/egress-rotate.sh" --reason "$reason" >> "$WATCH_LOG" 2>&1
   rc=$?
@@ -88,6 +97,11 @@ rotate() {
     if [ "$rotate_fail_streak" -ge 3 ]; then
       stop_run "three consecutive egress rotation failures"
     fi
+  fi
+  # 第 3 次重选后无论成功与否都受控结束本轮：relay 起的新 run 会重新做一次
+  # 完整出口选择；继续留在本轮只会在同一额度/代理问题上空转。
+  if [ "$reselections" -ge "$RESELECT_LIMIT" ]; then
+    stop_run "reached ${RESELECT_LIMIT} egress re-selections this round (last reason=$reason rc=$rc); pausing the loop"
   fi
 }
 
