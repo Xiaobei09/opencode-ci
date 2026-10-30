@@ -340,8 +340,9 @@ jobs:
             opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
           RC=$?
           if [ -f "$EGRESS_DIR/stop" ]; then
+            STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::egress watcher stopped this round after 3 consecutive failures; pausing the loop (manual dispatch resumes)"
+            echo "::warning::egress watcher stopped this round: ${STOP_REASON:-unknown}; pausing the loop (manual dispatch resumes)"
             RC=0
           fi
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
@@ -364,8 +365,11 @@ jobs:
             grep -aE 'target=opencode\.ai|epoch [0-9]+:' "$EGRESS_DIR/proxy.log" | tail -8 || true
           fi
           if [ -f "$EGRESS_DIR/watch.log" ]; then
-            echo "egress watch:"
-            tail -8 "$EGRESS_DIR/watch.log" 2>/dev/null || true
+            # R2520：reselection 行会被 rotate 的多行输出挤出 tail -8，单独再打一遍。
+            echo "egress watch (last 40):"
+            tail -40 "$EGRESS_DIR/watch.log" 2>/dev/null || true
+            echo "egress watch reselections/stops:"
+            grep -aE 'reselection|STOP:' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -20 || true
           fi
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             jq -c '{iocount, paused, selfmute, halted:(.halted|length), qlen:((.queue//[])|length), pqlen:((.pinqueue//[])|length)}' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true
