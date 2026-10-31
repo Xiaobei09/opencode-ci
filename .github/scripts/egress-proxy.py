@@ -37,7 +37,11 @@ PROVIDER_HOSTS = {
     if h.strip()
 }
 PROVIDER_PORT = int(os.environ.get("EGRESS_PROVIDER_PORT", "443"))
-IDLE_TIMEOUT = int(os.environ.get("EGRESS_IDLE_TIMEOUT", "240"))
+# R2520: 240s is shorter than a long tool call (large CI logs can take 4-5 min),
+# so the proxy killed an otherwise healthy provider stream and the watcher
+# misread it as a transport failure (run 41175155727 at 06:10:13Z). Keep the
+# stall detector, but give long tool calls room; override via env if needed.
+IDLE_TIMEOUT = int(os.environ.get("EGRESS_IDLE_TIMEOUT", "900"))
 
 
 def provider_target(host):
