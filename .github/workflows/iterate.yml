@@ -358,7 +358,8 @@ jobs:
           if [ -f "$EGRESS_DIR/stop" ]; then
             STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::egress watcher stopped this round: ${STOP_REASON:-unknown}; pausing the loop (manual dispatch resumes)"
+            echo "watcher_reason=${STOP_REASON:-unknown}" >> "$GITHUB_OUTPUT"
+            echo "::warning::egress watcher ended this round: ${STOP_REASON:-unknown}; relay policy decides whether to pause"
             RC=0
           fi
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
@@ -414,16 +415,26 @@ jobs:
           watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
           allow=false
           if [ "$watcher_stop" = "true" ]; then
-            gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-            gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
-            echo "::notice::watcher stopped the round after 3 consecutive failures; CI_LOOP_PAUSED=true, no successor"
-            echo "allow_relay=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            # R2520 收尾（运营者新指令）：一轮内连续 3 次出口错误只结束本轮并换新 run，
+            # 不立刻暂停循环；只有连续 3 轮都没有成功回合才停循环。
+            cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
+            case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+            next=$((cur + 1))
+            if gh variable set CI_FAIL_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1; then
+              if [ "$next" -ge 3 ]; then
+                gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+                echo "::error::watcher ended the round; $next consecutive rounds without a successful round; CI_LOOP_PAUSED=true, no successor"
+              else
+                allow=true
+                echo "::notice::watcher ended the round; CI_FAIL_STREAK=$next/3, will relay a fresh round"
+              fi
+            else
+              echo "::error::could not update CI_FAIL_STREAK; refusing to relay blindly"
+            fi
           # R2514: `skipped` (prerequisite failed, Run OpenCode never ran) is a
           # transient failure — increment streak, do NOT pause. `cancelled` is
           # an operator signal — pause immediately.
-          if [ "$outcome" = "success" ]; then
+          elif [ "$outcome" = "success" ]; then
             gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             allow=true
             echo "run succeeded; reset CI_FAIL_STREAK"
@@ -492,6 +503,28 @@ jobs:
             exit 1
           fi
 
+      - name: Notify round end
+        # R2520 收尾：一轮内 3 次出口错误结束本轮并成功接力时，也告诉运营者真实原因；
+        # 正常成功接力不发，避免刷屏。
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outputs.watcher_stop == 'true' && steps.failure_guard.outputs.allow_relay == 'true' && steps.relay.outputs.relayed == 'true'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+        run: |
+          set +e
+          repo="${{ github.repository }}"
+          reason="${{ steps.run_opencode.outputs.watcher_reason }}"
+          [ -n "$reason" ] || reason="watcher ended the round after 3 consecutive egress errors"
+          streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
+          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\nopencode：%s；streak：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "${{ steps.run_opencode.outcome }}" "$streak")
+          if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
+            curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${text}" \
+              >/dev/null 2>&1 || echo "::warning::could not send round-end notice to telegram"
+          else
+            echo "::warning::TG_BOT_TOKEN/TG_PUSH_CHAT missing; round-end notice skipped"
+          fi
+
       - name: Notify loop stop
         # R2517（运营者：每次 CI 结束告诉我本轮结束的原因）：只在循环真正停下时发一条，
         # 正常接力不打扰。覆盖：连续 3 次失败、watcher 停止、取消、relay 失败、
@@ -511,7 +544,12 @@ jobs:
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
           reason="本轮结束（opencode=$outcome）"
           if [ "$watcher" = "true" ]; then
-            reason="连续失败 3 次，watcher 停止本轮（循环已暂停）"
+            wr=$(tr '\n' ' ' < "$RUNNER_TEMP/egress/stop" 2>/dev/null | cut -c1-300)
+            if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
+              reason="连续 3 轮无成功，循环已暂停（last: ${wr:-watcher stop}）"
+            else
+              reason="watcher 结束本轮，但未能接力（${wr:-unknown}）"
+            fi
           elif [ "$outcome" = "cancelled" ]; then
             reason="本轮被取消（运营者停止信号，不会自动接力）"
           elif [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then

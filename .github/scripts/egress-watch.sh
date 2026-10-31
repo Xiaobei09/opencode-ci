@@ -4,7 +4,8 @@
 # three consecutive failed egress recovery attempts, or after three preflight
 # false positives (a candidate answers 200 but real generation hits quota
 # within 600s). A stop is a **controlled end of round**: the workflow keeps the
-# step green and pauses the loop, so CI does not show up as a red failure.
+# step green and relays a fresh run; only three consecutive no-success rounds
+# pause the loop (operator rule R2520).
 #
 # Usage: egress-watch.sh <run-log> [proxy-log]
 set -uo pipefail
