@@ -177,7 +177,23 @@ jobs:
         if: steps.lock.outputs.acquired == 'true'
         run: |
           set -euo pipefail
-          curl -fsSL https://opencode.ai/v2/install | bash
+          # R2520: the opencode.ai installer can transiently 404 while the latest
+          # release asset is propagating (run 41143504097 died here and the
+          # skipped prerequisite counted toward the 3-strike pause). Retry the
+          # whole installer before burning a loop slot.
+          installed=0
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 2 --retry-delay 2 https://opencode.ai/v2/install | bash; then
+              installed=1
+              break
+            fi
+            echo "::warning::opencode install attempt ${attempt}/3 failed"
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+          done
+          if [ "$installed" -ne 1 ]; then
+            echo "::error::opencode install failed after 3 attempts (upstream 404?)"
+            exit 1
+          fi
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           npm install -g workferry zengate@1.3.1
 
