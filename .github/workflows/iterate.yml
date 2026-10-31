@@ -359,7 +359,19 @@ jobs:
             STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "watcher_reason=${STOP_REASON:-unknown}" >> "$GITHUB_OUTPUT"
+            echo "round_success=false" >> "$GITHUB_OUTPUT"
             echo "::warning::egress watcher ended this round: ${STOP_REASON:-unknown}; relay policy decides whether to pause"
+            RC=0
+          elif [ -f "$RUNNER_TEMP/round-end.json" ]; then
+            # R2521: auto-continue END-ROUND-CI writes this marker. It used to exit 0
+            # silently, so failure_guard treated the round as a success and reset
+            # CI_FAIL_STREAK forever. The marker carries whether any healthy turn ran.
+            STOP_REASON=$(jq -r '.reason // "auto-continue ended the round"' "$RUNNER_TEMP/round-end.json" 2>/dev/null || echo "auto-continue ended the round")
+            ROUND_SUCCESS=$(jq -r '.success // false' "$RUNNER_TEMP/round-end.json" 2>/dev/null || echo false)
+            echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
+            echo "watcher_reason=auto-continue: ${STOP_REASON}" >> "$GITHUB_OUTPUT"
+            echo "round_success=${ROUND_SUCCESS}" >> "$GITHUB_OUTPUT"
+            echo "::warning::auto-continue ended this round: ${STOP_REASON} (round_success=${ROUND_SUCCESS}); relay policy decides whether to pause"
             RC=0
           fi
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
@@ -413,8 +425,19 @@ jobs:
           repo="${{ github.repository }}"
           outcome="${{ steps.run_opencode.outcome }}"
           watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
+          round_success="${{ steps.run_opencode.outputs.round_success }}"
           allow=false
           if [ "$watcher_stop" = "true" ]; then
+            # R2521：本轮如果出现过正常回合（200/正常产出），失败计数清零；
+            # 只有真正"连续 3 轮没有任何成功"才暂停。END-ROUND-CI 的 marker
+            # 会带 success=true/false；egress watcher 停止按无成功处理。
+            if [ "$round_success" = "true" ]; then
+              gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+              allow=true
+              echo "round ended after a successful turn; reset CI_FAIL_STREAK; will relay"
+              echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             # R2520 收尾（运营者新指令）：一轮内连续 3 次出口错误只结束本轮并换新 run，
             # 不立刻暂停循环；只有连续 3 轮都没有成功回合才停循环。
             cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
