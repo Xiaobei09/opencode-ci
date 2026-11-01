@@ -75,7 +75,7 @@ rotate() {
   local reason="$1" rc
   reselections=$((reselections + 1))
   if [ "$reselections" -gt "$RESELECT_LIMIT" ]; then
-    stop_run "egress re-selection limit exceeded (${reselections}/${RESELECT_LIMIT}); pausing the loop"
+    stop_run "egress re-selection limit exceeded (${reselections}/${RESELECT_LIMIT}); ending this round (relay unless 3 consecutive rounds without success)"
   fi
   log "reselection ${reselections}/${RESELECT_LIMIT} reason=$reason"
   log "rotating egress reason=$reason"
@@ -98,7 +98,7 @@ rotate() {
     fail_until=$((last + 30))
     log "rotate skipped: all candidates quota-limited (streak=$quota_streak/3); keeping current egress (backoff 30s)"
     if [ "$quota_streak" -ge 3 ]; then
-      stop_run "three consecutive all-candidate quota rotations; pausing the loop"
+      stop_run "three consecutive all-candidate quota rotations; ending this round (relay unless 3 consecutive rounds without success)"
     fi
   else
     rotate_fail_streak=$((rotate_fail_streak + 1))
@@ -106,13 +106,13 @@ rotate() {
     fail_until=$((last + 60))
     log "rotate failed (streak=$rotate_fail_streak/3); keeping current egress"
     if [ "$rotate_fail_streak" -ge 3 ]; then
-      stop_run "three consecutive egress rotation failures"
+      stop_run "three consecutive egress rotation failures; ending this round"
     fi
   fi
   # 第 3 次重选后无论成功与否都受控结束本轮：relay 起的新 run 会重新做一次
   # 完整出口选择；继续留在本轮只会在同一额度/代理问题上空转。
   if [ "$reselections" -ge "$RESELECT_LIMIT" ]; then
-    stop_run "reached ${RESELECT_LIMIT} egress re-selections this round (last reason=$reason rc=$rc); pausing the loop"
+    stop_run "reached ${RESELECT_LIMIT} egress re-selections this round (last reason=$reason rc=$rc); ending this round (relay unless 3 consecutive rounds without success)"
   fi
 }
 
@@ -128,7 +128,7 @@ while IFS= read -r line; do
         log "preflight false positive: 200 then quota after $((now - last_rotate_ok_at))s (streak=$probe_false_streak/3)"
         last_rotate_ok_at=0
         if [ "$probe_false_streak" -ge 3 ]; then
-          stop_run "three consecutive preflight false positives (200 then quota)"
+          stop_run "three consecutive preflight false positives (200 then quota); free quota is account-wide, so a new exit proxy may not restore it"
         fi
       fi
       if [ "$now" -lt "$fail_until" ] || [ $((now - last)) -lt 20 ]; then
