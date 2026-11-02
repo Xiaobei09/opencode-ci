@@ -66,6 +66,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Mark setup start
+        run: echo "PRE_OPENCODE_T0=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Check out ci-repo
         # R2513: `actions/checkout@v6` does not exist (latest stable is v4/v5).
         # A missing tag fails before any step runs.
@@ -232,6 +235,9 @@ jobs:
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \
               >/dev/null 2>&1 || echo "::warning::could not send the exit-proxy notice to telegram"
+          fi
+          if [ -n "${PRE_OPENCODE_T0:-}" ]; then
+            echo "setup timing: pre-opencode $(( $(date +%s) - PRE_OPENCODE_T0 ))s (target <60s: checkout+restore+install+select)"
           fi
           exit 0
 
