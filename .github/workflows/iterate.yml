@@ -365,7 +365,15 @@ jobs:
             STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "watcher_reason=${STOP_REASON:-unknown}" >> "$GITHUB_OUTPUT"
-            echo "round_success=false" >> "$GITHUB_OUTPUT"
+            # R2535：watcher 是进程外停止，不能一律按失败计。auto-continue 在首个
+            # 正常 assistant 回合写该标记；有 200 的轮次必须清零 streak（运营者规则：
+            # 只有连续 3 轮没有任何 200 才停循环）。
+            if [ -f "$RUNNER_TEMP/round-had-success" ]; then
+              echo "round_success=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::egress watcher ended this round after a healthy turn; CI_FAIL_STREAK will reset"
+            else
+              echo "round_success=false" >> "$GITHUB_OUTPUT"
+            fi
             echo "::warning::egress watcher ended this round: ${STOP_REASON:-unknown}; relay policy decides whether to pause"
             RC=0
           elif [ -f "$RUNNER_TEMP/round-end.json" ]; then
