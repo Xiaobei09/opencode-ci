@@ -632,6 +632,7 @@ jobs:
           mkdir -p "$SNAP"
           INDEX="$SNAP/index.json"
           [ -f "$INDEX" ] || echo '{"snapshots": []}' > "$INDEX"
+          echo "target snapshots: index=$INDEX"
           find "$SNAP" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
           shopt -s nullglob
           for target_dir in "$TARGETS_DIR"/*/; do
@@ -694,7 +695,9 @@ jobs:
             jq --arg dir "$name" '.snapshots |= map(select(.dir != $dir))' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
             tmp=$(mktemp)
             jq --argjson e "$ENTRY" '.snapshots += [$e]' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
+            echo "target snapshot indexed: dir=$name commit=${COMMIT:0:12} mode=$MODE fp=${FP:0:12}"
           done
+          echo "target snapshot index: $(jq -r '[.snapshots[]?] | length' "$INDEX" 2>/dev/null || echo 0) entries"
 
       - name: Snapshot environment to sessions repository
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
@@ -801,7 +804,7 @@ jobs:
             _have_n=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '[.assets[].name | select(test("^targets\\.tar\\.gz"))] | length' 2>/dev/null || echo 0)
             if [ "${_prev_n:-0}" -gt 0 ] 2>/dev/null && [ "${_prev_n:-0}" = "${_have_n:-0}" ]; then
               CARRY=1
-              echo "targets unchanged (fingerprint match, $_have_n page(s)); carrying the previous targets package"
+              echo "targets unchanged (fingerprint match, $_have_n page(s)); carrying the previous targets package (the embedded index saved_at stays at the last repack; this run is recorded as meta.targets.carried_at)"
             else
               echo "::warning::targets fingerprint matches but the release has ${_have_n:-0} of ${_prev_n:-0} page(s); re-uploading targets"
             fi
