@@ -153,9 +153,10 @@ while IFS= read -r line; do
       log "quota error detected"
       rotate quota
       ;;
-    *"injected round prompt"*|*"proto send ok"*)
-      # 正常回合已经在新出口上跑通，说明 rotate 后的 200 不是误报；此后若再撞
-      # quota，应按真实额度问题处理，而不是累计 “preflight false positive”。
+    *"auto-continue: healthy turn"*)
+      # R2536：只认 auto-continue 在**真实正常回合**写下的结构化日志。旧实现
+      # 匹配 `injected round prompt`，但那只是注入动作；实测注入后同一 upstream
+      # 立即 quota，会错误重置误报窗口。正常回合跑通才说明 rotate 后的 200 不是误报。
       if [ "$probe_false_streak" -ne 0 ] || [ "$last_rotate_ok_at" -gt 0 ]; then
         log "healthy turn after rotation; reset preflight false-positive window (streak=$probe_false_streak)"
         probe_false_streak=0
