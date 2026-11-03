@@ -121,13 +121,16 @@ jobs:
         run: |
           set +e
           repo="${{ github.repository }}"
+          # R2535：手动 dispatch 是运营者的显式重启信号。即使循环没被暂停，
+          # 也要清掉上一轮的失败计数；否则"重启以应用更新"后仍沿用旧 streak，
+          # 下一轮再失败一次就触发 3 连败暂停，违背"启动后保持接力运行"。
+          gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "")
           if [ "$paused" = "true" ]; then
             gh variable set CI_LOOP_PAUSED --body false --repo "$repo" >/dev/null 2>&1 || true
-            gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             echo "manual dispatch resumed the loop (CI_LOOP_PAUSED=false, CI_FAIL_STREAK=0)"
           else
-            echo "loop is not paused; nothing to resume"
+            echo "manual dispatch reset CI_FAIL_STREAK; loop was not paused"
           fi
 
       - name: Prepare target workspace
