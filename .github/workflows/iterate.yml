@@ -544,19 +544,32 @@ jobs:
           fi
 
       - name: Notify round end
-        # R2520 收尾：一轮内 3 次出口错误结束本轮并成功接力时，也告诉运营者真实原因；
-        # 正常成功接力不发，避免刷屏。
-        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.run_opencode.outputs.watcher_stop == 'true' && steps.failure_guard.outputs.allow_relay == 'true' && steps.relay.outputs.relayed == 'true'
+        # R2540（运营者：每次 CI 结束告诉我本轮结束的原因）：所有已成功接力的轮次
+        # 都发一条，包括正常成功 / 预算耗尽 / watcher 停止。旧实现只看
+        # watcher_stop == 'true'，导致正常成功轮静默结束；兜底文案还把缺原因
+        # 一律写成“3 次出口错误”。现在按 outcome 给出真实原因。
+        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.failure_guard.outputs.allow_relay == 'true' && steps.relay.outputs.relayed == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
         run: |
           set +e
           repo="${{ github.repository }}"
+          outcome="${{ steps.run_opencode.outcome }}"
+          watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
           reason="${{ steps.run_opencode.outputs.watcher_reason }}"
-          [ -n "$reason" ] || reason="watcher ended the round after 3 consecutive egress errors"
+          if [ "$watcher" = "true" ]; then
+            [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
+            reason="watcher：${reason}"
+          elif [ "$outcome" = "success" ]; then
+            reason="opencode 正常结束（预算耗尽或正常收尾），已接力新 run"
+          elif [ "$outcome" = "failure" ]; then
+            reason="opencode 失败（outcome=failure），已按失败计数接力重试"
+          else
+            reason="opencode 结束（outcome=${outcome:-unknown}），已接力新 run"
+          fi
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
-          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\nopencode：%s；streak：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "${{ steps.run_opencode.outcome }}" "$streak")
+          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\nopencode：%s；streak：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$outcome" "$streak")
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${text}" \
@@ -566,8 +579,9 @@ jobs:
           fi
 
       - name: Notify loop stop
-        # R2517（运营者：每次 CI 结束告诉我本轮结束的原因）：只在循环真正停下时发一条，
-        # 正常接力不打扰。覆盖：连续 3 次失败、watcher 停止、取消、relay 失败、
+        # R2517（运营者：每次 CI 结束告诉我本轮结束的原因）：只在循环真正停下时发
+        # 停止卡；已成功接力的轮次由 Notify round end 发结束原因，两者按 relayed
+        # 互斥。覆盖：连续 3 次失败、watcher 停止未接力、取消、relay 失败、
         # 运营者暂停后 relay 主动让路。
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && (steps.failure_guard.outputs.allow_relay != 'true' || steps.relay.outputs.relayed != 'true')
         env:
