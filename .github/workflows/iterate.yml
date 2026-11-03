@@ -750,7 +750,7 @@ jobs:
             --exclude='./.git-credentials' \
             --exclude='./.local/share/opencode/log' \
             --exclude='./.npm/_cacache' \
-            --exclude='./.bun/install/cache' \
+            --exclude='./.bun' \
             --exclude='./actions-runner' \
             --exclude='./.rustup' \
             --exclude='./.dotnet' \
