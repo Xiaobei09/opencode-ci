@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# Watch the OpenCode run log and the local proxy log. Rotate egress on quota
-# errors or on repeated provider transport failures/timeouts. Stop the run after
+# Watch the structured plugin log and the local proxy log. NEVER parse the TUI
+# run log: it contains the assistant's own prose (and our diagnostics), so words
+# like `idle_timeout`/`quota` in a report would self-trigger rotations. The
+# proxy log carries transport/idle events; the plugin log carries provider
+# errors (`error=provider.free-limit`) and healthy-turn markers. Rotate egress
+# on quota errors or on repeated provider transport failures/timeouts. Stop the run after
 # three consecutive failed egress recovery attempts, or after three preflight
 # false positives (a candidate answers 200 but real generation hits quota
-# within 600s). A stop is a **controlled end of round**: the workflow keeps the
+# within 120s). A stop is a **controlled end of round**: the workflow keeps the
 # step green and relays a fresh run; only three consecutive no-success rounds
 # pause the loop (operator rule R2520).
 #
-# Usage: egress-watch.sh <run-log> [proxy-log]
+# Usage: egress-watch.sh <run-log> [proxy-log] [plugin-log]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=egress-lib.sh
 . "$SCRIPT_DIR/egress-lib.sh"
 
-LOG="${1:?usage: egress-watch.sh <run-log> [proxy-log]}"
+LOG="${1:?usage: egress-watch.sh <run-log> [proxy-log] [plugin-log]}"
 PROXY_LOG="${2:-$EGRESS_STATE_DIR/proxy.log}"
+PLUGIN_LOG="${3:-${AC_TAP_PATH:-/tmp/opencode/v2plugin.log}}"
 mkdir -p "$EGRESS_STATE_DIR"
 WATCH_LOG="$EGRESS_STATE_DIR/watch.log"
 STOP_FILE="$EGRESS_STATE_DIR/stop"
@@ -39,7 +44,8 @@ quota_streak=0
 
 log() { echo "$(egress_iso) $*" >> "$WATCH_LOG"; }
 
-log "watch start log=$LOG proxy_log=$PROXY_LOG upstream=$(cat "$EGRESS_UPSTREAM_FILE" 2>/dev/null || echo '?')"
+CUR_UP=$(cat "$EGRESS_UPSTREAM_FILE" 2>/dev/null || echo '?')
+log "watch start run_log=$LOG proxy_log=$PROXY_LOG plugin_log=$PLUGIN_LOG upstream=$CUR_UP"
 
 # R2511: select-proxy may have picked a candidate seconds ago. Treat that
 # preflight as the "200" side of the false-positive window, so a quota error
@@ -86,6 +92,7 @@ rotate() {
     rotate_fail_streak=0
     quota_streak=0
     last_rotate_ok_at=$last
+    CUR_UP=$(jq -r '.upstream // "?"' "$EGRESS_STATE_FILE" 2>/dev/null || echo '?')
     state=$(jq -c '{kind,upstream,egress_ip}' "$EGRESS_STATE_FILE" 2>/dev/null || echo '{}')
     log "rotate ok $state"
   elif [ "$rc" -eq 2 ]; then
@@ -120,6 +127,15 @@ while IFS= read -r line; do
   now=$(egress_now)
   case "$line" in
     *"Free usage limit reached"*|*"FreeUsageLimitError"*|*"free usage limit reached"*|*"provider.free-limit"*)
+      # R2535：插件日志会带 `upstream=relay:...`。rotate 后 tail 仍可能读到
+      # rotate 之前那一轮的延迟日志；若 upstream 已不是当前出口，它既不是
+      # 新出口的误报，也不该再次触发 rotate（实测 03:13:24 把旧 relay 的
+      # 延迟 quota 行算成 “200 then quota after 0s”）。
+      err_up=$(printf '%s' "$line" | sed -nE 's/.*upstream=([^ )]+).*/\1/p' | head -1)
+      if [ -n "$err_up" ] && [ "$CUR_UP" != "?" ] && [ "$err_up" != "$CUR_UP" ]; then
+        log "stale quota line from upstream=$err_up (current=$CUR_UP); ignoring"
+        continue
+      fi
       # R2511: a candidate that answered 200 but hits quota within 120s is a
       # false positive, not a real recovery. Count it even inside the 20s
       # rotation cool-down (the cool-down only suppresses another rotation).
@@ -136,6 +152,15 @@ while IFS= read -r line; do
       fi
       log "quota error detected"
       rotate quota
+      ;;
+    *"injected round prompt"*|*"proto send ok"*)
+      # 正常回合已经在新出口上跑通，说明 rotate 后的 200 不是误报；此后若再撞
+      # quota，应按真实额度问题处理，而不是累计 “preflight false positive”。
+      if [ "$probe_false_streak" -ne 0 ] || [ "$last_rotate_ok_at" -gt 0 ]; then
+        log "healthy turn after rotation; reset preflight false-positive window (streak=$probe_false_streak)"
+        probe_false_streak=0
+        last_rotate_ok_at=0
+      fi
       ;;
     *idle_timeout*)
       if [ "$now" -lt "$fail_until" ] || [ $((now - last)) -lt 20 ]; then
@@ -164,6 +189,6 @@ while IFS= read -r line; do
       fi
       ;;
   esac
-done < <(tail -n +1 -F -- "$LOG" "$PROXY_LOG" 2>/dev/null)
+done < <(tail -q -n +1 -F -- "$PROXY_LOG" "$PLUGIN_LOG" 2>/dev/null)
 
 log "watch end"
