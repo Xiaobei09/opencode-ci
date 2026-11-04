@@ -44,6 +44,17 @@ quota_streak=0
 
 log() { echo "$(egress_iso) $*" >> "$WATCH_LOG"; }
 
+# R2544：插件日志有两种 quota 行——`rate-limit/quota error (... upstream=...)`
+# 和 `eval ... error=provider.free-limit`。后者没有 upstream=，rotate 后 tail
+# 仍会读到 rotate 前的同一批错误，被误算成“200 then quota after 0s”。
+# 这里按行首 ISO 时间戳判定：早于最近一次成功 rotate 的行一定是旧账。
+line_epoch() {
+  local ts
+  ts=$(printf '%s' "$1" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z' | head -1)
+  [ -n "$ts" ] || return 1
+  date -u -d "$ts" +%s 2>/dev/null || return 1
+}
+
 CUR_UP=$(cat "$EGRESS_UPSTREAM_FILE" 2>/dev/null || echo '?')
 log "watch start run_log=$LOG proxy_log=$PROXY_LOG plugin_log=$PLUGIN_LOG upstream=$CUR_UP"
 
@@ -135,6 +146,14 @@ while IFS= read -r line; do
       if [ -n "$err_up" ] && [ "$CUR_UP" != "?" ] && [ "$err_up" != "$CUR_UP" ]; then
         log "stale quota line from upstream=$err_up (current=$CUR_UP); ignoring"
         continue
+      fi
+      # R2544：无 upstream 的 eval 行按时间戳丢弃 rotate 前的旧错误。
+      if [ "$last_rotate_ok_at" -gt 0 ]; then
+        err_at=$(line_epoch "$line" || true)
+        if [ -n "$err_at" ] && [ "$err_at" -lt "$last_rotate_ok_at" ]; then
+          log "stale quota line predates rotation (line_ts=$err_at, rotate=$last_rotate_ok_at); ignoring"
+          continue
+        fi
       fi
       # R2511: a candidate that answered 200 but hits quota within 120s is a
       # false positive, not a real recovery. Count it even inside the 20s

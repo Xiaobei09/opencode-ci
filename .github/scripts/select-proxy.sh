@@ -223,7 +223,9 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
         esac
         [ -n "$SELECTED_EGRESS" ] || SELECTED_EGRESS="unknown"
         egress_bl_del "$key"
-        log "selected $kind $target egress=$SELECTED_EGRESS code=200 (batch=$batch_start)"
+        why_note=""
+        [ "$kind" = "direct" ] && why_note=" (direct-first: candidate #1 passed)"
+        log "selected $kind $target egress=$SELECTED_EGRESS source=$SELECTED_SOURCE code=200${why_note} (batch=$batch_start)"
       fi
       # Stop paying for lower-priority probes as soon as the winner is known.
       killed=0
