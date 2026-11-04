@@ -727,14 +727,17 @@ jobs:
             for a in 1 2; do
               # R2518: WAIT_LOCK makes run-end wait for the bridge interval sync
               # instead of silently skipping (rc=75 = still locked → retry).
+              # R2543: cap each wait at 8s (boot sync can hold the lock for
+              # minutes); the release pack below still captures the final state.
               ENV_SYNC_WHY=run-end ENV_SYNC_TIMEOUT=180 ENV_SYNC_WAIT_LOCK=1 \
+                ENV_SYNC_WAIT_SECONDS=8 \
                 timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >/dev/null 2>&1
               sync_rc=$?
               if [ "$sync_rc" = 0 ]; then
                 SYNC_OK=1; break
               fi
               echo "::warning::run-end env-sync attempt $a failed rc=$sync_rc (75=lock busy); retrying"
-              sleep 20
+              sleep 5
             done
             if [ "$SYNC_OK" = 1 ]; then
               echo "run-end env-sync pushed; the env-sync branch now holds the final state"
@@ -757,10 +760,6 @@ jobs:
             --exclude='./work' \
             --exclude='./.cache' \
             --exclude='./.opencode/bin' \
-            --exclude='./.opencode/tg.env' \
-            --exclude='./.opencode/tg-bot*.env' \
-            --exclude='./.config/opencode/tg.env' \
-            --exclude='./.config/opencode/tg-bot*.env' \
             --exclude='./.ssh' \
             --exclude='./.config/gh' \
             --exclude='./.gitconfig' \

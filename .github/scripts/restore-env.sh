@@ -264,10 +264,19 @@ if [ ! -s "$REG" ] && [ -f "$ENV_SRC/templates/tg-bots.json" ]; then
 fi
 if [ ! -s "$REG" ]; then printf '{"bots":[{"id":"primary","label":"CI","envFile":"%s/.opencode/tg.env"}]}\n' "$HOME" > "$REG"; fi
 chmod 600 "$REG" 2>/dev/null || true
-: > "$HOME/.opencode/tg.env"
-if [ -n "${TG_BOT_TOKEN:-}" ]; then printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.opencode/tg.env"; fi
-if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
-if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
+if [ -n "${TG_BOT_TOKEN:-}" ]; then
+  : > "$HOME/.opencode/tg.env"
+  printf 'TG_BOT_TOKEN=%s\n' "$TG_BOT_TOKEN" >> "$HOME/.opencode/tg.env"
+  if [ -n "${TG_ALLOWED_CHAT:-}" ]; then printf 'TG_ALLOWED_CHAT=%s\n' "$TG_ALLOWED_CHAT" >> "$HOME/.opencode/tg.env"; fi
+  if [ -n "${TG_PUSH_CHAT:-}" ]; then printf 'TG_PUSH_CHAT=%s\n' "$TG_PUSH_CHAT" >> "$HOME/.opencode/tg.env"; fi
+else
+  # R2543：token 应跨 CI 保存。本轮若没有 secret，保留环境包恢复出来的
+  # tg.env（旧行为会 `: >` 清空 token，主 Bot 直接失联）。
+  [ -f "$HOME/.opencode/tg.env" ] || : > "$HOME/.opencode/tg.env"
+  if [ ! -s "$HOME/.opencode/tg.env" ]; then
+    echo "::warning::TG_BOT_TOKEN missing and no restored primary tg.env; primary bot will run without a token"
+  fi
+fi
 chmod 600 "$HOME/.opencode/tg.env"
 # bot env files + registry merge (2026-10-23): add bots **without touching code**.
 # Sources, in order:
@@ -275,7 +284,8 @@ chmod 600 "$HOME/.opencode/tg.env"
 #   • TG_BOTS_EXTRA: one JSON secret with an array of {id,label,token,allowedChat?,pushChat?}
 #     — add/rotate any number of bots in one place.
 #   • any pre-existing tg-bot<id>.env file (restored from the environment snapshot)
-# Every token is written to a 0600 env file (excluded from packages), then the registry
+# Every token is written to a 0600 env file (R2543: now included in private
+# environment packages so tokens survive across CI runs), then the registry
 # is merged atomically instead of being overwritten. Entry discovery in the bridge entry
 # additionally picks up tg-bot*.env files, so a single dropped file is enough.
 export TG_BOTS_EXTRA="${TG_BOTS_EXTRA:-}"
