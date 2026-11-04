@@ -724,20 +724,32 @@ jobs:
           SKIP_ENV_PACK=0
           if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
             SYNC_OK=0
+            SYNC_LOG="$RUNNER_TEMP/env-sync-run-end.log"
+            : > "$SYNC_LOG"
             for a in 1 2; do
               # R2518: WAIT_LOCK makes run-end wait for the bridge interval sync
               # instead of silently skipping (rc=75 = still locked → retry).
               # R2543: cap each wait at 8s (boot sync can hold the lock for
               # minutes); the release pack below still captures the final state.
+              # R2545: keep the per-attempt output. The old `>/dev/null 2>&1`
+              # meant a failed lock wait left no evidence in the run log at all.
+              sync_t0=$(date +%s)
               ENV_SYNC_WHY=run-end ENV_SYNC_TIMEOUT=180 ENV_SYNC_WAIT_LOCK=1 \
                 ENV_SYNC_WAIT_SECONDS=8 \
-                timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >/dev/null 2>&1
+                timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >>"$SYNC_LOG" 2>&1
               sync_rc=$?
+              sync_took=$(( $(date +%s) - sync_t0 ))
               if [ "$sync_rc" = 0 ]; then
-                SYNC_OK=1; break
+                SYNC_OK=1
+                echo "run-end env-sync attempt $a ok in ${sync_took}s"
+                break
               fi
-              echo "::warning::run-end env-sync attempt $a failed rc=$sync_rc (75=lock busy); retrying"
-              sleep 5
+              echo "::warning::run-end env-sync attempt $a failed rc=$sync_rc after ${sync_took}s (75=lock busy); retrying"
+              # R2545: show why it failed. Without this the operator only saw the
+              # final "packing the env release" line and could not tell whether
+              # the lock was busy or the push failed.
+              tail -6 "$SYNC_LOG" | sed 's/^/  env-sync: /'
+              sleep 2
             done
             if [ "$SYNC_OK" = 1 ]; then
               echo "run-end env-sync pushed; the env-sync branch now holds the final state"

@@ -97,6 +97,78 @@ env_try_staged() {
 # 分支 tip 则让位 release；否则取分支（两者中较新者）。任一不满足即整体回落
 # 原 release 三层链（env → stage-env → env-safe → bootstrap），语义不变。
 ENV_SYNC_MAX_AGE_MIN="${ENV_SYNC_MAX_AGE_MIN:-1440}"
+# R2545（token 跨 CI 保存的兜底）：env-sync 分支被拒（release 更新 / 分支过旧）时，
+# 分支里仍可能持有 release 包**缺失**的 bot token（典型：某个 release 仍由旧排除集
+# 生成，bot5 只在分支上）。这里只补“目标不存在或为空”的文件，绝不覆盖 release
+# 已还原的更新 token；注册表只追加缺失的 bot 条目，保留本地已有条目。
+BOT_TOKEN_BRANCH=""
+bot_token_overlay_from_branch() {
+  local d="$1" src base dest added=0
+  [ -d "$d/payload" ] || return 0
+  mkdir -p "$HOME/.opencode" "$HOME/.config/opencode"
+  for src in "$d/payload/.opencode/tg.env" \
+             "$d"/payload/.opencode/tg-bot*.env \
+             "$d/payload/.config/opencode/tg.env" \
+             "$d"/payload/.config/opencode/tg-bot*.env; do
+    [ -s "$src" ] || continue
+    base=$(basename "$src")
+    case "$src" in
+      */payload/.opencode/*) dest="$HOME/.opencode/$base" ;;
+      *) dest="$HOME/.config/opencode/$base" ;;
+    esac
+    [ -s "$dest" ] && continue
+    cp -pf "$src" "$dest" 2>/dev/null && added=$((added + 1))
+  done
+  if [ "$added" -gt 0 ] && [ -s "$d/payload/.config/opencode/tg-bots.json" ]; then
+    local reg="$HOME/.config/opencode/tg-bots.json"
+    [ -s "$reg" ] || printf '{"bots":[]}\n' > "$reg"
+    python3 - "$reg" "$d/payload/.config/opencode/tg-bots.json" "$HOME" <<'PY' || true
+import json, os, sys
+reg, branch, home = sys.argv[1:4]
+def load(p):
+    try:
+        j = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return {"bots": []}
+    if not isinstance(j, dict):
+        return {"bots": []}
+    if not isinstance(j.get("bots"), list):
+        j["bots"] = []
+    return j
+cur, br = load(reg), load(branch)
+have = {str(b.get("id", "")) for b in cur["bots"] if isinstance(b, dict)}
+added = 0
+for b in br["bots"]:
+    if not isinstance(b, dict):
+        continue
+    bid = str(b.get("id", ""))
+    if not bid or bid in have:
+        continue
+    base = os.path.basename(str(b.get("envFile", "")))
+    if not (base == "tg.env" or (base.startswith("tg-bot") and base.endswith(".env"))):
+        continue
+    if not (os.path.exists(os.path.join(home, ".config", "opencode", base))
+            or os.path.exists(os.path.join(home, ".opencode", base))):
+        continue
+    cur["bots"].append(b)
+    have.add(bid)
+    added += 1
+if added:
+    tmp = reg + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cur, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp, reg)
+    print(f"bot registry merged: +{added} entr(y/ies) from env-sync branch")
+PY
+    chmod 600 "$reg" 2>/dev/null || true
+  fi
+  if [ "$added" -gt 0 ]; then
+    echo "::notice::rescued $added bot credential file(s) from env-sync branch (release was newer/older)"
+  fi
+  return 0
+}
+
 env_sync_try() {
   local repo="${SESSIONS_REPO:-Xiaobei09/opencode-sessions}"
   local d="/tmp/envsync-restore" json epoch age dbfmt dbexp dbsz
@@ -117,6 +189,9 @@ env_sync_try() {
   age=$(( ( $(date +%s) - epoch ) / 60 ))
   if [ "$age" -gt "$ENV_SYNC_MAX_AGE_MIN" ]; then
     echo "::warning::env-sync branch too old (${age}min > ${ENV_SYNC_MAX_AGE_MIN}min cap); using release packages"
+    # R2545: the branch is stale, but tokens rarely rotate; fill only missing files
+    # (applied after the release restore, see the call site below).
+    BOT_TOKEN_BRANCH="$d"
     return 1
   fi
   gh release download "$ENV_TAG" --repo "$repo" --pattern 'meta.json' --dir "$d" --clobber >/dev/null 2>&1 || true
@@ -130,6 +205,10 @@ env_sync_try() {
     rel_epoch=$(date -u -d "$rel_at" +%s 2>/dev/null || true)
     if [ -n "$rel_epoch" ] && [ "$rel_epoch" -gt "$epoch" ]; then
       echo "::warning::release env (packed ${rel_at}) is newer than the branch tip; using release packages"
+      # R2545: don't lose bot creds that only exist on the branch. The overlay is
+      # applied AFTER the release restore — doing it here would be overwritten by
+      # the release's own tg-bots.json.
+      BOT_TOKEN_BRANCH="$d"
       return 1
     fi
   fi
@@ -177,6 +256,14 @@ elif [ "$FALLBACK_TAG" != "$ENV_TAG" ] && env_try "$FALLBACK_TAG"; then
   echo "::warning::primary env package '$ENV_TAG' unusable; restored the insurance generation '$FALLBACK_TAG'"
 else
   echo "no usable environment package; bootstrapping from the repository baseline"
+fi
+
+# R2545: token rescue runs AFTER the restore decision. Doing it inside
+# env_sync_try would let the release's tg-bots.json overwrite the merged
+# registry, silently dropping bots whose token only lived on the branch.
+if [ -n "${BOT_TOKEN_BRANCH:-}" ] && [ -d "$BOT_TOKEN_BRANCH/payload" ]; then
+  bot_token_overlay_from_branch "$BOT_TOKEN_BRANCH"
+  rm -rf "$BOT_TOKEN_BRANCH" 2>/dev/null
 fi
 
 # 2. The repository is the clean baseline and stays authoritative for the
