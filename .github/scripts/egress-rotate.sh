@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Move the local CONNECT proxy to the next candidate that passes the real
-# inference preflight with HTTP 200. The current candidate is blacklisted for a
-# while first, so a quota-exhausted relay is not retried immediately.
+# inference preflight with HTTP 200. The current candidate is skipped first, so
+# a quota-exhausted relay is not retried immediately.
 #
 # Usage: egress-rotate.sh [--reason quota|transport|http]
 #
@@ -21,7 +21,7 @@ export EGRESS_PROBE_MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
 REASON="${1:-quota}"
 [ "$REASON" = "--reason" ] && REASON="${2:-quota}"
 case "$REASON" in
-  quota)     TTL=1800 ;;  # 30m: quota is usually account/model-wide, not IP-wide
+  quota)     TTL=1800 ;;  # 30m: anonymous free quota is IP-scoped; cool the limited IP down
   transport) TTL=1800 ;;  # 30m for dead relays
   *)         TTL=3600  ;;
 esac
@@ -52,18 +52,26 @@ case "$CUR_KIND" in
   *)      CUR_KEY="$CUR_UP" ;;
 esac
 
-# R2509: quota follows the account/model, not the egress IP (measured: direct +
-# 48 relays all 429). Do not blacklist the current route for quota, and only
-# sample a few relays before keeping it; transport failures still use the full
-# candidate budget.
+# R2546（运营者：没有登录账号、使用匿名，429 不可能是账号限制）：免费额度按
+# **出口 IP** 计。实测 05:15:25 relay 126.217.78.118 → 429，05:15:34 换到
+# 114.204.39.195，05:16:25 即 healthy turn（新 IP ⇒ 新额度）。因此同一轮内
+# 绝不能反复探测已经 quota 的 IP：用 run-scoped 列表记住它们，每次 rotate 都
+# 往后面的新鲜候选推进。新 run 的 RUNNER_TEMP/egress 是新目录，列表自动清空。
+# transport 失败仍走原有黑名单/全量候选预算。
 MAX_TRIES=${EGRESS_SELECT_MAX:-12}
 [ "$REASON" = "quota" ] && MAX_TRIES=${EGRESS_QUOTA_PROBE_MAX:-4}
+
+QUOTA_BLOCKED_FILE="$EGRESS_STATE_DIR/quota-blocked.txt"
+touch "$QUOTA_BLOCKED_FILE" 2>/dev/null || true
+quota_blocked() { grep -Fxq "$1" "$QUOTA_BLOCKED_FILE" 2>/dev/null; }
+quota_block_add() { quota_blocked "$1" || printf '%s\n' "$1" >> "$QUOTA_BLOCKED_FILE"; }
 
 # Mark the current egress as unusable for a while. For a relay/http candidate
 # the key is the entry address; the preflight that just failed was the same one.
 CUR_EGRESS=$(jq -r '.egress_ip // empty' "$EGRESS_STATE_FILE" 2>/dev/null || true)
 if [ "$REASON" = "quota" ]; then
-  echo "rotate: quota is account-wide; keeping $CUR_KEY eligible (not blacklisted)"
+  quota_block_add "$CUR_KEY"
+  echo "rotate: quota is anonymous/IP-scoped; skipping $CUR_KEY for the rest of this run (run-scoped, not persistent)"
 else
   egress_bl_add "$CUR_KEY" "$CUR_EGRESS" "$REASON" "$TTL" || true
   if [ "$EGRESS_BLACKLIST_ENABLED" = "1" ]; then
@@ -76,6 +84,7 @@ fi
 tries=0
 quota_fails=0
 other_fails=0
+skipped_quota=0
 while IFS=$'\t' read -r kind target source; do
   [ -n "${kind:-}" ] || continue
   case "$kind" in
@@ -86,6 +95,12 @@ while IFS=$'\t' read -r kind target source; do
   esac
 
   [ "$up" = "$CUR_UP" ] && continue
+  # R2546: never re-probe an IP that already answered quota earlier in this run.
+  if [ "$REASON" = "quota" ] && quota_blocked "$key"; then
+    echo "rotate: skip quota-limited $key (already tried this run)"
+    skipped_quota=$((skipped_quota + 1))
+    continue
+  fi
   if egress_bl_has "$key"; then
     echo "rotate: skip blacklisted $key"
     continue
@@ -127,7 +142,12 @@ while IFS=$'\t' read -r kind target source; do
   else
     failed_egress=""
   fi
-  if [ "$why" = "quota" ]; then quota_fails=$((quota_fails + 1)); else other_fails=$((other_fails + 1)); fi
+  if [ "$why" = "quota" ]; then
+    quota_fails=$((quota_fails + 1))
+    quota_block_add "$key"
+  else
+    other_fails=$((other_fails + 1))
+  fi
   egress_bl_add "$key" "$failed_egress" "$why" "$TTL" || true
   if [ "$EGRESS_BLACKLIST_ENABLED" = "1" ]; then
     echo "rotate: candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${TTL}s)"
@@ -137,12 +157,21 @@ while IFS=$'\t' read -r kind target source; do
 done < "$EGRESS_CANDIDATES_FILE"
 
 # No alternative passed. The egress we were already using is still the best
-# choice we have, so undo its blacklist entry instead of leaving the runner
-# with no usable route (and a 30m hole in the candidate list). Quota failures
-# are almost always account/model-wide: rotating IPs cannot buy quota back.
+# choice we have, so undo its persistent blacklist entry instead of leaving the
+# runner with no usable route. Quota failures are anonymous/IP-scoped: the
+# run-scoped quota-blocked list keeps the exhausted IPs out of the next
+# rotation this run, and a new run starts with a fresh list + fresh selection.
 egress_bl_del "$CUR_KEY"
-echo "rotate: no candidate passed the preflight; keeping current egress and unblacklisting $CUR_KEY (quota_fails=$quota_fails other_fails=$other_fails)"
+echo "rotate: no candidate passed the preflight; keeping current egress and unblacklisting $CUR_KEY (quota_fails=$quota_fails other_fails=$other_fails skipped_quota=$skipped_quota)"
+echo "rotate: quota-blocked this run: $(paste -sd, "$QUOTA_BLOCKED_FILE" 2>/dev/null || echo none)"
 if [ "$quota_fails" -gt 0 ] && [ "$other_fails" -eq 0 ]; then
+  exit 2
+fi
+# R2546: every remaining candidate was already quota-limited earlier this run.
+# The watcher must still count this as an all-quota rotation (not a transport
+# rotation failure) so the 3-strike stop/relay semantics stay correct.
+if [ "$quota_fails" -eq 0 ] && [ "$other_fails" -eq 0 ] && [ "$skipped_quota" -gt 0 ]; then
+  echo "rotate: all remaining candidates were already quota-limited this run"
   exit 2
 fi
 exit 1

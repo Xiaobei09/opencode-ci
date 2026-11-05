@@ -38,8 +38,10 @@ last_rotate_ok_at=0
 # 只统计 watcher 运行期的 rotate（不含启动时 select-proxy 的首次选择）。
 reselections=0
 RESELECT_LIMIT=3
-# 全候选都返回 quota 的连续次数：账号级额度耗尽时，重选 IP 不会恢复额度。
-# 连续 3 次仍全 quota 就受控停本轮，避免每 4 分钟 relay 一次的空转。
+# 全候选都返回 quota 的连续次数：匿名免费额度按出口 IP 计（实测 05:15:25
+# relay 429 → 05:15:34 换 IP → 05:16:25 healthy turn）。egress-rotate 用
+# run-scoped 列表避免同一轮反复探测已 quota 的 IP；连续 3 次仍全 quota 则受控
+# 停本轮，新 run 重新选新鲜 IP。
 quota_streak=0
 
 log() { echo "$(egress_iso) $*" >> "$WATCH_LOG"; }
@@ -107,16 +109,17 @@ rotate() {
     state=$(jq -c '{kind,upstream,egress_ip}' "$EGRESS_STATE_FILE" 2>/dev/null || echo '{}')
     log "rotate ok $state"
   elif [ "$rc" -eq 2 ]; then
-    # Every candidate answered quota. This is account-wide: retrying another IP
-    # cannot buy quota back. Count consecutive all-quota rotations and stop the
-    # round after 3 (operator rule: any failure 3x => controlled stop), with a
-    # short 30s backoff so the 3 attempts can fit inside one run.
+    # Every probed candidate answered quota. Quota is anonymous/IP-scoped, but
+    # this run has exhausted its fresh-IP probe budget (egress-rotate's
+    # run-scoped quota-blocked list). Count consecutive all-quota rotations and
+    # stop the round after 3 (operator rule: any failure 3x => controlled stop),
+    # then relay a fresh run that re-selects fresh egress IPs.
     quota_streak=$((quota_streak + 1))
     last_rotate_ok_at=0
     fail_until=$((last + 30))
-    log "rotate skipped: all candidates quota-limited (streak=$quota_streak/3); keeping current egress (backoff 30s)"
+    log "rotate skipped: all probed candidates quota-limited (streak=$quota_streak/3); keeping current egress (backoff 30s)"
     if [ "$quota_streak" -ge 3 ]; then
-      stop_run "three consecutive all-candidate quota rotations; ending this round (relay unless 3 consecutive rounds without success)"
+      stop_run "three consecutive all-candidate quota rotations; ending this round (anonymous quota is IP-scoped; relay gives the next run fresh egress IPs)"
     fi
   else
     rotate_fail_streak=$((rotate_fail_streak + 1))
@@ -163,7 +166,7 @@ while IFS= read -r line; do
         log "preflight false positive: 200 then quota after $((now - last_rotate_ok_at))s (streak=$probe_false_streak/3)"
         last_rotate_ok_at=0
         if [ "$probe_false_streak" -ge 3 ]; then
-          stop_run "three consecutive preflight false positives (200 then quota); free quota is account-wide, so a new exit proxy may not restore it"
+          stop_run "three consecutive preflight false positives (200 then quota); anonymous free quota is IP-scoped, but this egress IP still hit quota within 120s; ending the round so the next run selects fresh IPs"
         fi
       fi
       if [ "$now" -lt "$fail_until" ] || [ $((now - last)) -lt 20 ]; then

@@ -47,10 +47,10 @@ SELECT_BUDGET="${EGRESS_SELECT_BUDGET:-120}"
 SELECT_MAX="${EGRESS_SELECT_MAX:-12}"
 PARALLEL="${EGRESS_PARALLEL:-1}"
 PREFLIGHT_TMO="${EGRESS_PREFLIGHT_TIMEOUT:-20}"
-# R2509: quota is account/model-wide (measured 2026-10-25: direct + 48 proxyip
-# relays all answered 429 quota). Once direct itself answers quota, probing the
-# whole relay list only delays startup; sample a few relays and then fall back
-# to direct. Transport failures still use the full budget.
+# R2509/R2546: 每次失败的 preflight 都可能是匿名免费额度（按出口 IP 计）。
+# 2026-10-25 曾观测 direct + 48 relay 全 429，因此一旦 direct 也 quota，不必
+# 把整张 relay 表探完——采样几个 relay 后直接回退 direct，节省启动时间；新 run
+# 会重新选一批新鲜 IP。transport 失败仍用完整预算。
 QUOTA_PROBE_MAX="${EGRESS_QUOTA_PROBE_MAX:-4}"
 quota_fails=0
 direct_quota=0
@@ -255,8 +255,9 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     else
       failed_egress=""
     fi
-    # R2509: never blacklist direct for quota — it is the fallback route and
-    # quota follows the account, not this runner's IP.
+    # R2509/R2546: never persistently blacklist direct for quota — it stays the
+    # fallback route; anonymous quota is IP-scoped and the next run gets a fresh
+    # runner/egress IP anyway.
     if [ "$kind" = "direct" ] && [ "$why" = "quota" ]; then
       log "candidate direct failed code=$code reason=quota egress=${failed_egress:-?} (kept as fallback)"
     else
@@ -269,7 +270,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     fi
   done
   if [ "$direct_quota" = 1 ] && [ "$quota_fails" -ge "$QUOTA_PROBE_MAX" ] && [ -z "$SELECTED_KIND" ]; then
-    log "quota on direct + $quota_fails relay(s): account-wide quota, stop probing (budget ${QUOTA_PROBE_MAX} relays)"
+    log "quota on direct + $quota_fails relay(s): anonymous/IP-scoped; stop probing (budget ${QUOTA_PROBE_MAX} relays; next run re-selects fresh IPs)"
     break
   fi
 done
