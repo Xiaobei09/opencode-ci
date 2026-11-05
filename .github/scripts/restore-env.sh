@@ -410,7 +410,18 @@ def put(bot):
     if not bid or len(bid) > 24:
         return
     bot["id"] = bid
-    by[bid] = bot
+    # R2549（D4）：**合并**而非整条替换。旧实现 `by[bid] = bot` 会把恢复/早先写入的
+    # `queueCardOwner: false` 丢掉；判据侧缺字段默认 True（见 tg-bridge registerBot），
+    # 于是 bot3/bot4 token 一旦有效，两个 Bot 都会建队列置顶卡 → 同一聊天两条卡互相 400。
+    # 保留既有字段，仅用本次显式提供的字段覆盖。
+    merged = dict(by.get(bid) or {})
+    merged.update(bot)
+    # 防御：注册表是索引，不是凭据库；旧版本若误把 token 写进来，合并时清掉。
+    merged.pop("token", None)
+    # 非主 Bot 默认不拥有队列卡；显式值优先（TG_BOTS_EXTRA 可传 queueCardOwner）。
+    if bid != "primary" and "queueCardOwner" not in merged:
+        merged["queueCardOwner"] = False
+    by[bid] = merged
 
 def write_env(path, token, allowed_chat, push_chat, label=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -463,7 +474,11 @@ if raw:
         envp = os.path.expanduser(item.get("envFile") or f"{home}/.config/opencode/tg-bot{file_id}.env")
         label = str(item.get("label") or bid)
         write_env(envp, str(item["token"]).strip(), str(item.get("allowedChat") or allowed), str(item.get("pushChat") or push), label)
-        put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
+        entry = {"id": bid, "label": label, "envFile": envp, "noFallback": True}
+        # R2549：允许一次性接入多个 Bot 时显式指定队列卡归属；缺省由 put() 设为 False。
+        if isinstance(item.get("queueCardOwner"), bool):
+            entry["queueCardOwner"] = item["queueCardOwner"]
+        put(entry)
         print(f"bot {bid} secret env written (TG_BOTS_EXTRA)")
 
 
