@@ -171,7 +171,7 @@ PY
 
 env_sync_try() {
   local repo="${SESSIONS_REPO:-Xiaobei09/opencode-sessions}"
-  local d="/tmp/envsync-restore" json epoch age dbfmt dbexp dbsz
+  local d="/tmp/envsync-restore" json epoch age dbfmt dbexp dbsz sha
   local carried rel_at rel_epoch
   rm -rf "$d" 2>/dev/null
   if ! git clone --depth 1 --single-branch --branch env-sync \
@@ -179,6 +179,7 @@ env_sync_try() {
     echo "::warning::env-sync branch not available; using release packages"
     return 1
   fi
+  sha=$(git -C "$d" rev-parse --short HEAD 2>/dev/null || echo unknown)
   json="$d/env-sync.json"
   if [ ! -s "$json" ] || [ ! -d "$d/payload/.config/opencode" ]; then
     echo "::warning::env-sync payload missing or incomplete; using release packages"
@@ -243,7 +244,7 @@ env_sync_try() {
     return 1
   fi
   rm -rf "$d" 2>/dev/null
-  echo "environment restored from env-sync branch (age=${age}min, db=${dbfmt} ${dbsz} bytes)"
+  echo "environment restored from env-sync branch (commit=${sha}, age=${age}min, db=${dbfmt} ${dbsz} bytes)"
   return 0
 }
 if env_sync_try; then
@@ -318,6 +319,10 @@ fi
 # the plugin boots the **snapshot's** old code and every repo fix looks
 # like it did nothing — a failure mode that costs whole restart cycles
 # to diagnose. Compare byte-for-byte and fail loudly instead.
+# R2547: also log the success fingerprint. Without it a successful sync is
+# invisible in the run log, so "did the new commit actually go live?" still
+# needs a manual sha256sum.
+sync_checked=0
 for d in "$HOME/.config/opencode/v2lib" "$HOME/.opencode/v2lib"; do
   [ -f "$ENV_SRC/config/v2lib/auto-continue.ts" ] || break
   [ -d "$d" ] || continue
@@ -333,7 +338,10 @@ for d in "$HOME/.config/opencode/v2lib" "$HOME/.opencode/v2lib"; do
     echo "::error::v2lib code sync mismatch at $d/_v2compat.ts (repo != runtime)"
     exit 1
   fi
+  sync_checked=$((sync_checked + 1))
+  echo "v2lib code sync ok: $d/auto-continue.ts matches repo (sha=$(sha256sum "$d/auto-continue.ts" | cut -c1-12))"
 done
+[ "$sync_checked" -gt 0 ] || echo "::warning::v2lib code sync not verified (source or runtime dir missing)"
 
 if [ ! -d "$HOME/.config/opencode/plugins" ]; then
   echo "::warning::bridge plugins missing; continuing without them"
