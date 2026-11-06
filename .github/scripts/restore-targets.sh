@@ -26,6 +26,15 @@ tgt_try() {
     echo "::warning::$tag targets package incomplete ($bytes of $expect bytes, $pages page(s)); refusing to apply a partial restore"
     return 1
   fi
+  # R2560（D6）：与 env 读侧同口径，meta 有 sha256 时必须校验拼接包哈希。
+  expect_sha=$(jq -r '.targets.sha256 // empty' "$dl/meta.json" 2>/dev/null || true)
+  if [ -n "$expect_sha" ]; then
+    got_sha=$(cat $vols 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [ "$got_sha" != "$expect_sha" ]; then
+      echo "::warning::$tag targets package checksum mismatch (got ${got_sha:0:12} expect ${expect_sha:0:12}, $pages page(s)); refusing to apply"
+      return 1
+    fi
+  fi
   hdr=$(head -c 6 "$(echo "$vols" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$hdr" in
     1f8b*)        tflag="-z" ;;
@@ -35,7 +44,7 @@ tgt_try() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$SESSIONS_DIR" $tflag 2>/dev/null; then
-    echo "target workspace package restored from '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified})"
+    echo "target workspace package restored from '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified})"
     return 0
   fi
   echo "::warning::$tag target workspace package failed to extract (tar ${tflag:-plain}, $bytes bytes)"
@@ -61,6 +70,15 @@ tgt_try_staged() {
     echo "::warning::$tag staged targets incomplete ($bytes of $expect bytes, $pages page(s)); refusing"
     return 1
   fi
+  # R2560（D6）：stage 代同样校验 sha256（meta 缺失时跳过）。
+  expect_sha=$(jq -r '.targets.sha256 // empty' "$dl/stage-meta.json" 2>/dev/null || true)
+  if [ -n "$expect_sha" ]; then
+    got_sha=$(cat $vols 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [ "$got_sha" != "$expect_sha" ]; then
+      echo "::warning::$tag staged targets checksum mismatch (got ${got_sha:0:12} expect ${expect_sha:0:12}, $pages page(s)); refusing"
+      return 1
+    fi
+  fi
   hdr=$(head -c 6 "$(echo "$vols" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$hdr" in
     1f8b*)        tflag="-z" ;;
@@ -70,7 +88,7 @@ tgt_try_staged() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$SESSIONS_DIR" $tflag 2>/dev/null; then
-    echo "target workspace package restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain})"
+    echo "target workspace package restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified})"
     return 0
   fi
   echo "::warning::$tag staged targets failed to extract ($pages page(s), $bytes bytes)"
@@ -167,13 +185,20 @@ if bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$EN
   REXP=$(jq -r '.records.bytes // empty' "$RDL/meta.json" 2>/dev/null || true)
   RVOLS=$(ls "$RDL"/records.tar.gz* 2>/dev/null | sort -V)
   RBYTES=$(cat $RVOLS 2>/dev/null | wc -c)
-  if [ -n "$REXP" ] && [ "$RBYTES" = "$REXP" ]; then
+  # R2560（D6）：records 同样按 meta sha256 校验；缺失时保持旧包兼容。
+  REXP_SHA=$(jq -r '.records.sha256 // empty' "$RDL/meta.json" 2>/dev/null || true)
+  RSHA_OK=1
+  if [ -n "$REXP_SHA" ]; then
+    RGOT_SHA=$(cat $RVOLS 2>/dev/null | sha256sum | cut -d' ' -f1)
+    [ "$RGOT_SHA" = "$REXP_SHA" ] || RSHA_OK=0
+  fi
+  if [ -n "$REXP" ] && [ "$RBYTES" = "$REXP" ] && [ "$RSHA_OK" = "1" ]; then
     RX=/tmp/rec-x; rm -rf "$RX"; mkdir -p "$RX"
     if cat $RVOLS | tar -xzf - -C "$RX" 2>/dev/null \
        && [ -d "$RX/state" ] && [ -d "$RX/tasks" ] && [ -d "$RX/sessions" ]; then
       rm -rf "$SESSIONS_DIR/state" "$SESSIONS_DIR/tasks" "$SESSIONS_DIR/sessions" "$SESSIONS_DIR/loop-state.md"
       cp -a "$RX"/. "$SESSIONS_DIR"/ 2>/dev/null
-      echo "records overlaid from the standalone records asset ($RBYTES bytes)"
+      echo "records overlaid from the standalone records asset ($RBYTES bytes${REXP_SHA:+, sha-verified})"
     else
       echo "::warning::records asset incomplete (state/tasks/sessions missing); keeping the embedded copy"
     fi

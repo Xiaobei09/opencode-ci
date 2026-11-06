@@ -37,6 +37,16 @@ env_try() {
     echo "::warning::$tag package incomplete ($bytes of $expect bytes, $pages page(s)); refusing to apply a partial restore"
     return 1
   fi
+  # R2560（D6）：meta 已提供 sha256，旧读侧只比字节数——同长度损坏或换装窗口
+  # 的错配代会被当作完好包铺进 $HOME。有 sha 就必须校验；缺失则保持向后兼容。
+  expect_sha=$(jq -r '.env.sha256 // empty' "$dl/meta.json" 2>/dev/null || true)
+  if [ -n "$expect_sha" ]; then
+    got_sha=$(cat $vols 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [ "$got_sha" != "$expect_sha" ]; then
+      echo "::warning::$tag package checksum mismatch (got ${got_sha:0:12} expect ${expect_sha:0:12}, $pages page(s)); refusing to apply"
+      return 1
+    fi
+  fi
   hdr=$(head -c 6 "$(echo "$vols" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$hdr" in
     1f8b*)        tflag="-z" ;;
@@ -46,7 +56,7 @@ env_try() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$HOME" $tflag 2>/dev/null; then
-    echo "environment restored from release '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified})"
+    echo "environment restored from release '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified})"
     return 0
   fi
   echo "::warning::$tag package failed to extract (tar ${tflag:-plain}, $bytes bytes)"
@@ -75,6 +85,15 @@ env_try_staged() {
     echo "::warning::$tag staged generation incomplete ($bytes of $expect bytes, $pages page(s)); refusing"
     return 1
   fi
+  # R2560（D6）：stage 代同样校验 sha256（meta 缺失时跳过，保持旧包兼容）。
+  expect_sha=$(jq -r '.env.sha256 // empty' "$dl/stage-meta.json" 2>/dev/null || true)
+  if [ -n "$expect_sha" ]; then
+    got_sha=$(cat $vols 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [ "$got_sha" != "$expect_sha" ]; then
+      echo "::warning::$tag staged generation checksum mismatch (got ${got_sha:0:12} expect ${expect_sha:0:12}, $pages page(s)); refusing"
+      return 1
+    fi
+  fi
   hdr=$(head -c 6 "$(echo "$vols" | head -1)" 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$hdr" in
     1f8b*)        tflag="-z" ;;
@@ -84,7 +103,7 @@ env_try_staged() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$HOME" $tflag 2>/dev/null; then
-    echo "environment restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain})"
+    echo "environment restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified})"
     return 0
   fi
   echo "::warning::$tag staged generation failed to extract ($pages page(s), $bytes bytes)"
