@@ -425,6 +425,9 @@ jobs:
           done
           if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ] || [ "$RC" -eq 143 ]; then
             echo "opencode hit the time budget; treated as success so the loop continues."
+            # R2550（D5）：预算耗尽是没有正常回合但**合法**的结束方式，需单独标记；
+            # failure_guard 的 success 分支不能仅凭 exit 0 就清零失败计数。
+            echo "soft_success=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$RC" -ne 0 ]; then
@@ -443,6 +446,7 @@ jobs:
           outcome="${{ steps.run_opencode.outcome }}"
           watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
           round_success="${{ steps.run_opencode.outputs.round_success }}"
+          soft_success="${{ steps.run_opencode.outputs.soft_success }}"
           allow=false
           if [ "$watcher_stop" = "true" ]; then
             # R2521：本轮如果出现过正常回合（200/正常产出），失败计数清零；
@@ -475,9 +479,31 @@ jobs:
           # transient failure — increment streak, do NOT pause. `cancelled` is
           # an operator signal — pause immediately.
           elif [ "$outcome" = "success" ]; then
-            gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
-            allow=true
-            echo "run succeeded; reset CI_FAIL_STREAK"
+            # R2550（D5）：exit 0 不等于本轮有正常回合。旧实现无条件清零 streak，
+            # 于是插件未注入/进程静默退出时会无限接力且永远不触发 3 连败暂停。
+            # 判据与 watcher 分支一致：本进程写过 round-had-success，或确属时间预算耗尽。
+            if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$soft_success" = "true" ]; then
+              gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+              allow=true
+              echo "run succeeded; reset CI_FAIL_STREAK"
+            else
+              echo "::warning::opencode exited 0 but produced no healthy turn this run; counting it as a failed round"
+              echo "silent_exit=true" >> "$GITHUB_OUTPUT"
+              cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
+              case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+              next=$((cur + 1))
+              if gh variable set CI_FAIL_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1; then
+                if [ "$next" -ge 3 ]; then
+                  gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+                  echo "::error::three consecutive rounds without a healthy turn (last: silent exit 0); CI_LOOP_PAUSED=true, no successor"
+                else
+                  allow=true
+                  echo "::notice::silent exit without a healthy turn; CI_FAIL_STREAK=$next/3, will relay a fresh round"
+                fi
+              else
+                echo "::error::could not update CI_FAIL_STREAK; refusing to relay blindly"
+              fi
+            fi
           elif [ "$outcome" = "failure" ] || [ "$outcome" = "skipped" ]; then
             cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
             case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
@@ -558,9 +584,12 @@ jobs:
           outcome="${{ steps.run_opencode.outcome }}"
           watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
           reason="${{ steps.run_opencode.outputs.watcher_reason }}"
+          silent_exit="${{ steps.failure_guard.outputs.silent_exit }}"
           if [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
+          elif [ "$outcome" = "success" ] && [ "$silent_exit" = "true" ]; then
+            reason="opencode 退出但本轮无健康回合（无 200），按失败计数后接力新 run"
           elif [ "$outcome" = "success" ]; then
             reason="opencode 正常结束（预算耗尽或正常收尾），已接力新 run"
           elif [ "$outcome" = "failure" ]; then
