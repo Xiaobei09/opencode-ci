@@ -512,19 +512,30 @@ jobs:
               fi
             fi
           elif [ "$outcome" = "failure" ] || [ "$outcome" = "skipped" ]; then
-            cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
-            case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
-            next=$((cur + 1))
-            if gh variable set CI_FAIL_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1; then
-              if [ "$next" -ge 3 ]; then
-                gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-                echo "::error::three consecutive failed/skipped runs (last outcome=$outcome); CI_LOOP_PAUSED=true, no successor"
-              else
-                allow=true
-                echo "run outcome=$outcome; CI_FAIL_STREAK=$next/3, will retry"
-              fi
+            # R2559（D5，运营者规则：只有连续 3 轮没有任何 200 才停循环）：
+            # watcher/success 分支都按 round-had-success 清零；failure 分支旧实现
+            # 忽略该标记，导致“本轮已有 200、随后进程崩溃”的轮次被算成无成功轮，
+            # 3 次即误停循环。有 200 就必须复位 streak；仍接力新 run（崩溃不该拖住循环）。
+            if [ -f "$RUNNER_TEMP/round-had-success" ]; then
+              gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+              allow=true
+              echo "healthy_failure=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::run outcome=$outcome after a healthy turn (200); reset CI_FAIL_STREAK; will relay a fresh round"
             else
-              echo "::error::could not update CI_FAIL_STREAK; refusing to relay blindly"
+              cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
+              case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+              next=$((cur + 1))
+              if gh variable set CI_FAIL_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1; then
+                if [ "$next" -ge 3 ]; then
+                  gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+                  echo "::error::three consecutive failed/skipped runs (last outcome=$outcome); CI_LOOP_PAUSED=true, no successor"
+                else
+                  allow=true
+                  echo "run outcome=$outcome; CI_FAIL_STREAK=$next/3, will retry"
+                fi
+              else
+                echo "::error::could not update CI_FAIL_STREAK; refusing to relay blindly"
+              fi
             fi
           elif [ "$outcome" = "cancelled" ]; then
             gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
@@ -592,6 +603,7 @@ jobs:
           watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
           reason="${{ steps.run_opencode.outputs.watcher_reason }}"
           silent_exit="${{ steps.failure_guard.outputs.silent_exit }}"
+          healthy_failure="${{ steps.failure_guard.outputs.healthy_failure }}"
           if [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
@@ -599,6 +611,8 @@ jobs:
             reason="opencode 退出但本轮无健康回合（无 200），按失败计数后接力新 run"
           elif [ "$outcome" = "success" ]; then
             reason="opencode 正常结束（预算耗尽或正常收尾），已接力新 run"
+          elif [ "$outcome" = "failure" ] && [ "$healthy_failure" = "true" ]; then
+            reason="opencode 异常结束，但本轮有健康回合（200），已复位失败计数并接力新 run"
           elif [ "$outcome" = "failure" ]; then
             reason="opencode 失败（outcome=failure），已按失败计数接力重试"
           else
