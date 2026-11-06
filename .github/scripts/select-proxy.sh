@@ -215,16 +215,29 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     [ -n "$why" ] || why=transport
     if [ "$code" = "200" ] && [ "$why" = "ok" ]; then
       if [ -z "$SELECTED_KIND" ]; then
+        # R2551: preflight 200 只证明“那一次连接”的出口 IP 有额度。relay 若
+        # 每次 CONNECT 轮换出口 IP，真实会话可能落到另一个已 quota 的 IP
+        # （实测 58.27.117.24: 210.19.219.99 ↔ 入口 IP），于是 200 后仍 429。
+        stable_egress=""
+        if [ "$kind" = "relay" ] || [ "$kind" = "http" ]; then
+          if ! egress_trace_stable "$kind" "$target" 8 > "$EGRESS_STATE_DIR/stable-select.$$"; then
+            log "candidate $kind $target passed preflight but egress rotates (saw ${EGRESS_TRACE_SEEN:-?}); skipping: preflight cannot validate the IP the real session will use"
+            egress_bl_add "$key" "" "unstable-egress" 1800 || true
+            continue
+          fi
+          stable_egress=$(cat "$EGRESS_STATE_DIR/stable-select.$$")
+          rm -f "$EGRESS_STATE_DIR/stable-select.$$"
+        fi
         SELECTED_KIND="$kind"; SELECTED_TARGET="$target"; SELECTED_SOURCE="$source"; SELECTED_UP="$up"
         case "$kind" in
           direct) SELECTED_EGRESS="${DIRECT_IP:-unknown}" ;;
-          relay)  SELECTED_EGRESS=$(egress_trace_relay "$target") ;;
-          http)   SELECTED_EGRESS=$(egress_trace_http "$target") ;;
+          relay|http) SELECTED_EGRESS="$stable_egress" ;;
         esac
         [ -n "$SELECTED_EGRESS" ] || SELECTED_EGRESS="unknown"
         egress_bl_del "$key"
         why_note=""
         [ "$kind" = "direct" ] && why_note=" (direct-first: candidate #1 passed)"
+        [ -n "$stable_egress" ] && why_note="$why_note (egress sticky over 8 parallel traces)"
         log "selected $kind $target egress=$SELECTED_EGRESS source=$SELECTED_SOURCE code=200${why_note} (batch=$batch_start)"
       fi
       # Stop paying for lower-priority probes as soon as the winner is known.

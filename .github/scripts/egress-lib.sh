@@ -139,28 +139,89 @@ egress_write_state() {
   chmod 600 "$EGRESS_STATE_FILE" 2>/dev/null || true
 }
 
-# egress_trace_relay <ip:port>
+# egress_trace_relay <ip:port> [timeout]
 egress_trace_relay() {
-  local hp="$1" ip port
+  local hp="$1" tmo="${2:-10}" ip port
   ip=${hp%:*}; port=${hp##*:}
-  curl -sS -m 10 --noproxy '*' --connect-to "www.cloudflare.com:443:$ip:$port" \
+  curl -sS -m "$tmo" --noproxy '*' --connect-to "www.cloudflare.com:443:$ip:$port" \
     https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
     | awk -F= '/^ip=/{print $2; exit}'
 }
 
-# egress_trace_http <host:port>
+# egress_trace_http <host:port> [timeout]
 egress_trace_http() {
-  local hp="$1"
-  curl -sS -m 10 -x "http://$hp" \
+  local hp="$1" tmo="${2:-10}"
+  curl -sS -m "$tmo" -x "http://$hp" \
     https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
     | awk -F= '/^ip=/{print $2; exit}'
 }
 
-# egress_trace_direct
+# egress_trace_direct [timeout]
 egress_trace_direct() {
-  curl -sS -m 10 --noproxy '*' \
+  curl -sS -m "${1:-10}" --noproxy '*' \
     https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
     | awk -F= '/^ip=/{print $2; exit}'
+}
+
+# R2551（运营者：zengate 显示 200 后仍 429，会不会没走代理出口？）：
+# 部分 relay 每次 CONNECT 会从不同出口 IP 出去（实测 58.27.117.24 在
+# 210.19.219.99 与入口 IP 之间轮换，10 次 trace 为 4/6）。preflight 只验证
+# 它那一次连接所用的 IP；真实会话的下一条连接可能换成另一个已 quota 的 IP，
+# 于是出现“zengate 200 后仍 429”，错误卡显示的 egress 也会指错 IP。
+# 选择/轮换在 preflight 成功后必须再 trace samples 次，全部一致才接受，并把
+# 该稳定 IP 写入状态。退出码 0 + stdout=稳定 IP；1=不可达或 IP 轮换。
+# 观测序列放在 EGRESS_TRACE_SEEN（调用方不要用 $(...) 包裹，否则丢失）。
+EGRESS_TRACE_SEEN=""
+# 把逗号分隔的观测序列归并：只有一个唯一 IP 才算稳定。
+egress_trace_stable_from() {
+  local vals="$1" uniq
+  uniq=$(printf '%s\n' "$vals" | tr ',' '\n' | grep -v '^unreachable$' | grep -v '^$' | sort -u)
+  [ -n "$uniq" ] || return 1
+  [ "$(printf '%s\n' "$uniq" | wc -l)" -eq 1 ] || return 1
+  printf '%s\n' "$uniq"
+}
+egress_trace_stable() {
+  local kind="$1" target="${2:-}" samples="${3:-8}" tmo="${EGRESS_TRACE_TIMEOUT:-6}"
+  local i ip vals="" f tmpdir pids=() uniq
+  EGRESS_TRACE_SEEN=""
+  case "$kind" in
+    direct)
+      ip=$(egress_trace_direct "$tmo")
+      [ -n "$ip" ] || { EGRESS_TRACE_SEEN="unreachable"; return 1; }
+      EGRESS_TRACE_SEEN="$ip"
+      printf '%s\n' "$ip"
+      return 0
+      ;;
+    relay|http) ;;
+    *) return 1 ;;
+  esac
+  # 并行采样：轮换型 relay 在同一次成功 preflight 后，仍可能在后续 CONNECT
+  # 换 IP；顺序 3 次采样有约 28% 概率恰好全落在同一侧（实测 58.27.117.24
+  # 4:6 轮换）。并行 8 个新连接能稳定暴露轮换（实测两个 IP 必现）。
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/egress-trace.XXXXXX") || return 1
+  for i in $(seq 1 "$samples"); do
+    (
+      if [ "$kind" = "relay" ]; then
+        egress_trace_relay "$target" "$tmo"
+      else
+        egress_trace_http "$target" "$tmo"
+      fi
+    ) > "$tmpdir/$i" 2>/dev/null &
+    pids+=("$!")
+  done
+  for i in "${pids[@]}"; do wait "$i" 2>/dev/null || true; done
+  for f in "$tmpdir"/*; do
+    ip=$(cat "$f" 2>/dev/null || true)
+    if [ -z "$ip" ]; then
+      vals="${vals:+$vals,}unreachable"
+    else
+      vals="${vals:+$vals,}$ip"
+    fi
+  done
+  rm -rf "$tmpdir"
+  EGRESS_TRACE_SEEN="$vals"
+  uniq=$(egress_trace_stable_from "$vals") || return 1
+  printf '%s\n' "$uniq"
 }
 
 # egress_candidate_ip <direct|relay|http> <target>

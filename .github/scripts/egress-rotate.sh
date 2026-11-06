@@ -66,6 +66,13 @@ touch "$QUOTA_BLOCKED_FILE" 2>/dev/null || true
 quota_blocked() { grep -Fxq "$1" "$QUOTA_BLOCKED_FILE" 2>/dev/null; }
 quota_block_add() { quota_blocked "$1" || printf '%s\n' "$1" >> "$QUOTA_BLOCKED_FILE"; }
 
+# R2551: 出口 IP 会轮换的 relay 对“preflight 200”没有意义（下一次 CONNECT
+# 可能换到另一个已 quota 的 IP）。同一轮里记住它们，后续 rotate 不再重试。
+UNSTABLE_BLOCKED_FILE="$EGRESS_STATE_DIR/unstable-blocked.txt"
+touch "$UNSTABLE_BLOCKED_FILE" 2>/dev/null || true
+unstable_blocked() { grep -Fxq "$1" "$UNSTABLE_BLOCKED_FILE" 2>/dev/null; }
+unstable_block_add() { unstable_blocked "$1" || printf '%s\n' "$1" >> "$UNSTABLE_BLOCKED_FILE"; }
+
 # Mark the current egress as unusable for a while. For a relay/http candidate
 # the key is the entry address; the preflight that just failed was the same one.
 CUR_EGRESS=$(jq -r '.egress_ip // empty' "$EGRESS_STATE_FILE" 2>/dev/null || true)
@@ -101,6 +108,11 @@ while IFS=$'\t' read -r kind target source; do
     skipped_quota=$((skipped_quota + 1))
     continue
   fi
+  # R2551: 已在同一轮被判定出口轮换的 relay，不再浪费 preflight 预算。
+  if unstable_blocked "$key"; then
+    echo "rotate: skip unstable-egress $key (already rejected this run)"
+    continue
+  fi
   if egress_bl_has "$key"; then
     echo "rotate: skip blacklisted $key"
     continue
@@ -122,16 +134,29 @@ while IFS=$'\t' read -r kind target source; do
   [ -n "$why" ] || why=transport
 
   if [ "$code" = "200" ] && [ "$why" = "ok" ]; then
+    # R2551: 与 select-proxy 同一判据——relay 出口 IP 若轮换，preflight 的 200
+    # 不能代表真实会话将使用的 IP，必须跳过，避免“200 后仍 429”。
+    stable_egress=""
+    if [ "$kind" = "relay" ] || [ "$kind" = "http" ]; then
+      if ! egress_trace_stable "$kind" "$target" 8 > "$EGRESS_STATE_DIR/stable-rotate.$$"; then
+        echo "rotate: candidate $kind $target passed preflight but egress rotates (saw ${EGRESS_TRACE_SEEN:-?}); skipping: preflight cannot validate the IP the real session will use"
+        other_fails=$((other_fails + 1))
+        unstable_block_add "$key"
+        egress_bl_add "$key" "" "unstable-egress" "$TTL" || true
+        continue
+      fi
+      stable_egress=$(cat "$EGRESS_STATE_DIR/stable-rotate.$$")
+      rm -f "$EGRESS_STATE_DIR/stable-rotate.$$"
+    fi
     egress_write_upstream "$up"
     case "$kind" in
       direct) egress="$DIRECT_IP" ;;
-      relay)  egress=$(egress_trace_relay "$target") ;;
-      http)   egress=$(egress_trace_http "$target") ;;
+      relay|http) egress="$stable_egress" ;;
     esac
     [ -n "$egress" ] || egress="unknown"
     egress_write_state "$kind" "$up" "$egress" "$source" "$DIRECT_IP"
     egress_bl_del "$key"
-    echo "rotate: switched to $kind $target egress=$egress (source=$source)"
+    echo "rotate: switched to $kind $target egress=$egress (source=$source$( [ -n "$stable_egress" ] && echo ', egress sticky over 8 parallel traces' ))"
     exit 0
   fi
 
@@ -164,6 +189,7 @@ done < "$EGRESS_CANDIDATES_FILE"
 egress_bl_del "$CUR_KEY"
 echo "rotate: no candidate passed the preflight; keeping current egress and unblacklisting $CUR_KEY (quota_fails=$quota_fails other_fails=$other_fails skipped_quota=$skipped_quota)"
 echo "rotate: quota-blocked this run: $(paste -sd, "$QUOTA_BLOCKED_FILE" 2>/dev/null || echo none)"
+echo "rotate: unstable-egress this run: $(paste -sd, "$UNSTABLE_BLOCKED_FILE" 2>/dev/null || echo none)"
 if [ "$quota_fails" -gt 0 ] && [ "$other_fails" -eq 0 ]; then
   exit 2
 fi
