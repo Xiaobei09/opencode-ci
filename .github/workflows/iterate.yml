@@ -139,7 +139,13 @@ jobs:
           set -euo pipefail
           mkdir -p "$TARGETS_DIR"
 
-      - name: Restore workspace snapshots and environment (parallel)
+      - name: Setup Node 24
+        if: steps.lock.outputs.acquired == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Restore workspace snapshots, environment and toolchain (parallel)
         id: restore_ws
         if: steps.lock.outputs.acquired == 'true'
         env:
@@ -155,14 +161,45 @@ jobs:
           p_t=$!
           bash "$GITHUB_WORKSPACE/.github/scripts/restore-env.sh" > /tmp/restore-env.log 2>&1 &
           p_e=$!
+          # R2554: the toolchain install used to be a separate 12s step after the
+          # restore finished. It only writes $HOME/.opencode/bin (excluded from
+          # the env snapshot) and the node prefix, so it is safe to run beside
+          # the two restores; this removes 12s from the pre-opencode budget.
+          install_toolchain() {
+            set -euo pipefail
+            # R2520: the opencode.ai installer can transiently 404 while the latest
+            # release asset is propagating (run 41143504097 died here and the
+            # skipped prerequisite counted toward the 3-strike pause). Retry the
+            # whole installer before burning a loop slot.
+            installed=0
+            for attempt in 1 2 3; do
+              if curl -fsSL --retry 2 --retry-delay 2 https://opencode.ai/v2/install | bash; then
+                installed=1
+                break
+              fi
+              echo "::warning::opencode install attempt ${attempt}/3 failed"
+              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+            done
+            if [ "$installed" -ne 1 ]; then
+              echo "::error::opencode install failed after 3 attempts (upstream 404?)"
+              return 1
+            fi
+            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+            npm install -g workferry zengate@1.3.1
+          }
+          install_toolchain > /tmp/install-toolchain.log 2>&1 &
+          p_i=$!
           wait "$p_t"; rc_t=$?
           wait "$p_e"; rc_e=$?
+          wait "$p_i"; rc_i=$?
           echo "== restore-targets.log =="
           cat /tmp/restore-targets.log 2>/dev/null
           echo "== restore-env.log =="
           cat /tmp/restore-env.log 2>/dev/null
-          if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ]; then
-            echo "::error::restore failed (targets rc=$rc_t env rc=$rc_e)"
+          echo "== install-toolchain.log =="
+          cat /tmp/install-toolchain.log 2>/dev/null
+          if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ] || [ "$rc_i" != 0 ]; then
+            echo "::error::parallel setup failed (targets rc=$rc_t env rc=$rc_e toolchain rc=$rc_i)"
             exit 1
           fi
           for p in "$HOME/.config/opencode"/*.json \
@@ -171,37 +208,7 @@ jobs:
                    "$HOME/.opencode"/*.env; do
             [ -f "$p" ] && chmod 600 "$p" 2>/dev/null || true
           done
-          echo "targets and environment restored in parallel"
-
-      - name: Setup Node 24
-        if: steps.lock.outputs.acquired == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: Install OpenCode 2, workferry and zengate
-        if: steps.lock.outputs.acquired == 'true'
-        run: |
-          set -euo pipefail
-          # R2520: the opencode.ai installer can transiently 404 while the latest
-          # release asset is propagating (run 41143504097 died here and the
-          # skipped prerequisite counted toward the 3-strike pause). Retry the
-          # whole installer before burning a loop slot.
-          installed=0
-          for attempt in 1 2 3; do
-            if curl -fsSL --retry 2 --retry-delay 2 https://opencode.ai/v2/install | bash; then
-              installed=1
-              break
-            fi
-            echo "::warning::opencode install attempt ${attempt}/3 failed"
-            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
-          done
-          if [ "$installed" -ne 1 ]; then
-            echo "::error::opencode install failed after 3 attempts (upstream 404?)"
-            exit 1
-          fi
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          npm install -g workferry zengate@1.3.1
+          echo "targets, environment and toolchain restored in parallel"
 
       - name: Select egress proxy
         # R2513/R2512（运营者：先禁用黑名单机制）：free-limit 是按账号/模型计，
@@ -749,6 +756,17 @@ jobs:
           else
             TAR_COMP=(tar -czf -)
           fi
+          # R2554: the targets bundle is the bulk of the snapshot (51 MB with
+          # pigz -1). zstd -10 packs it to ~21 MB in the same ~4s, and the
+          # restore side already detects the 28b52ffd magic. env/records keep
+          # pigz because their readers are unchanged and env is mostly carried.
+          if command -v zstd >/dev/null 2>&1; then
+            TGT_TAR_COMP=(tar -I 'zstd -10 -T4 -q' -cf -)
+          elif command -v pigz >/dev/null 2>&1; then
+            TGT_TAR_COMP=(tar -I 'pigz -1 -p4' -cf -)
+          else
+            TGT_TAR_COMP=(tar -czf -)
+          fi
           SNAP_T0=$(date +%s)
           SKIP_ENV_PACK=0
           if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
@@ -861,7 +879,7 @@ jobs:
                 [ -n "$sd" ] && SLIM_EXCLUDES+=("--exclude=$sd/.git" "--exclude=$sd/.git/*")
               done < <(jq -r '.snapshots[]? | select(.mode == "dirtar-slim") | .dir // empty' "$IDX" 2>/dev/null)
             fi
-            ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
+            ( cd "$SESSIONS_DIR" && "${TGT_TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
               | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
               || echo "::warning::target workspace package failed"
             echo "snapshot timing: targets pack $(( $(date +%s) - TGT_PACK_T0 ))s, $(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c) bytes"
