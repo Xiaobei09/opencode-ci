@@ -211,37 +211,49 @@ jobs:
           echo "targets, environment and toolchain restored in parallel"
 
       - name: Select egress proxy
-        # R2513/R2512（运营者：先禁用黑名单机制）：free-limit 是按账号/模型计，
-        # 不是按出口 IP 计；把 relay 拉黑只会让下一轮少一批可用出口。保持禁用，
-        # 让每次旋转都重新实测真实 OpenCode 预检。若未来要恢复，改回 "1" 并同步
-        # 更新 egress-lib.sh 的默认值与注释。
+        id: select_egress
+        # R2562（运营者最新指令）：整个 run 只在这里选一次出口。
+        # - 黑名单启用，失败候选 6h 内不再重复探测；
+        # - 不限制候选数量、不设 quota 提前停止，探测到 200 为止；
+        # - 没有 200 时不做 direct 兜底，直接非零退出让本轮失败并通知原因。
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
           EGRESS_ALLOW_PUBLIC_HTTP: "0"
-          EGRESS_BLACKLIST_ENABLED: "0"
-          EGRESS_SELECT_MAX: "12"
-          EGRESS_SELECT_BUDGET: "120"
+          EGRESS_BLACKLIST_ENABLED: "1"
+          EGRESS_SELECT_MAX: "0"
+          EGRESS_SELECT_BUDGET: "0"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
         run: |
           set +e
           bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
-          echo "select-proxy rc=${PIPESTATUS[0]}"
+          rc=${PIPESTATUS[0]}
+          echo "select-proxy rc=$rc"
+          if [ "$rc" -ne 0 ]; then
+            # Do not leave a stale selection behind: the next run must select
+            # afresh, and the failure notification must not claim an egress.
+            rm -f "$HOME/.config/opencode/exit-proxy.json" "$RUNNER_TEMP/exit-proxy.env" \
+                  "$RUNNER_TEMP/egress/upstream" "$RUNNER_TEMP/egress/candidates.tsv"
+            echo "reason=no egress candidate answered 200 (select-proxy rc=$rc)" >> "$GITHUB_OUTPUT"
+            echo "::error::egress selection failed: no candidate answered 200; refusing direct fallback and ending this run"
+            exit 1
+          fi
+          if [ ! -s "$HOME/.config/opencode/exit-proxy.json" ]; then
+            echo "reason=egress selection reported success but exit-proxy state is missing" >> "$GITHUB_OUTPUT"
+            echo "::error::egress selection reported success but exit-proxy state is missing; ending this run"
+            exit 1
+          fi
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
-            if [ -s "$HOME/.config/opencode/exit-proxy.json" ]; then
-              # R2520：与 TG 错误卡 exitProxySummary() 使用完全相同的键名/顺序：
-              # kind → upstream → local → egress → direct。旧格式 `CI egress: direct direct`
-              # 与错误卡的 `exit proxy: http://127.0.0.1:8089 ...` 对不上。
-              KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-              UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-              SCHEME=$(jq -r '.scheme // "http"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-              PROXY=$(jq -r '.proxy // "127.0.0.1:8089"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-              EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-              MSG="exit proxy: kind=${KIND} upstream=${UP} local=${SCHEME}://${PROXY} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
-            else
-              MSG="exit proxy: none (state missing; direct connection)"
-            fi
+            # R2520：与 TG 错误卡 exitProxySummary() 使用完全相同的键名/顺序：
+            # kind → upstream → local → egress → direct。旧格式 `CI egress: direct direct`
+            # 与错误卡的 `exit proxy: http://127.0.0.1:8089 ...` 对不上。
+            KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+            UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+            SCHEME=$(jq -r '.scheme // "http"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+            PROXY=$(jq -r '.proxy // "127.0.0.1:8089"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+            EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+            MSG="exit proxy: kind=${KIND} upstream=${UP} local=${SCHEME}://${PROXY} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \
               >/dev/null 2>&1 || echo "::warning::could not send the exit-proxy notice to telegram"
@@ -259,7 +271,7 @@ jobs:
           TARGETS_DIR: /home/runner/work/targets
           TG_BRIDGE_FORCE_SERVE: "1"
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
-          EGRESS_BLACKLIST_ENABLED: "0"
+          EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
         run: |
           set +e
@@ -418,11 +430,11 @@ jobs:
             grep -aE 'target=opencode\.ai|epoch [0-9]+:' "$EGRESS_DIR/proxy.log" | tail -8 || true
           fi
           if [ -f "$EGRESS_DIR/watch.log" ]; then
-            # R2520：reselection 行会被 rotate 的多行输出挤出 tail -8，单独再打一遍。
+            # R2562：watcher 不再轮换；诊断单轮内的连续失败与停止原因。
             echo "egress watch (last 40):"
             tail -40 "$EGRESS_DIR/watch.log" 2>/dev/null || true
-            echo "egress watch reselections/stops:"
-            grep -aE 'reselection|STOP:' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -20 || true
+            echo "egress watch failures/stops:"
+            grep -aE 'egress failure|STOP:|blacklisted|selected egress answered 200' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -20 || true
           fi
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             jq -c '{iocount, paused, selfmute, halted:(.halted|length), qlen:((.queue//[])|length), pqlen:((.pinqueue//[])|length)}' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true
@@ -454,6 +466,8 @@ jobs:
           watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
           round_success="${{ steps.run_opencode.outputs.round_success }}"
           soft_success="${{ steps.run_opencode.outputs.soft_success }}"
+          select_outcome="${{ steps.select_egress.outcome }}"
+          select_reason="${{ steps.select_egress.outputs.reason }}"
           allow=false
           if [ "$watcher_stop" = "true" ]; then
             # R2521：本轮如果出现过正常回合（200/正常产出），失败计数清零；
@@ -516,6 +530,12 @@ jobs:
             # watcher/success 分支都按 round-had-success 清零；failure 分支旧实现
             # 忽略该标记，导致“本轮已有 200、随后进程崩溃”的轮次被算成无成功轮，
             # 3 次即误停循环。有 200 就必须复位 streak；仍接力新 run（崩溃不该拖住循环）。
+            # R2562：Select egress proxy 失败时 run_opencode 为 skipped；把真实
+            # 原因传给结束通知，避免写成含糊的 outcome=skipped。
+            if [ "$select_outcome" = "failure" ]; then
+              echo "select_failed=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::egress selection failed; ${select_reason:-no candidate answered 200}"
+            fi
             if [ -f "$RUNNER_TEMP/round-had-success" ]; then
               gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               allow=true
@@ -604,7 +624,11 @@ jobs:
           reason="${{ steps.run_opencode.outputs.watcher_reason }}"
           silent_exit="${{ steps.failure_guard.outputs.silent_exit }}"
           healthy_failure="${{ steps.failure_guard.outputs.healthy_failure }}"
-          if [ "$watcher" = "true" ]; then
+          select_failed="${{ steps.failure_guard.outputs.select_failed }}"
+          select_reason="${{ steps.select_egress.outputs.reason }}"
+          if [ "$select_failed" = "true" ]; then
+            reason="出口选择失败（本轮没有 200）：${select_reason:-no candidate answered 200}；已按失败计数接力新 run"
+          elif [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
           elif [ "$outcome" = "success" ] && [ "$silent_exit" = "true" ]; then
@@ -644,10 +668,21 @@ jobs:
           outcome="${{ steps.run_opencode.outcome }}"
           relay_out="${{ steps.relay.outcome }}"
           watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
+          select_failed="${{ steps.failure_guard.outputs.select_failed }}"
+          select_reason="${{ steps.select_egress.outputs.reason }}"
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
           reason="本轮结束（opencode=$outcome）"
-          if [ "$watcher" = "true" ]; then
+          if [ "$select_failed" = "true" ]; then
+            reason="出口选择失败（本轮没有 200）：${select_reason:-no candidate answered 200}"
+            if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
+              reason="$reason；连续失败 ${streak} 次，循环已暂停"
+            elif [ "$relay_out" = "failure" ]; then
+              reason="$reason；接力失败，没有后继 run"
+            else
+              reason="$reason；未接力"
+            fi
+          elif [ "$watcher" = "true" ]; then
             wr=$(tr '\n' ' ' < "$RUNNER_TEMP/egress/stop" 2>/dev/null | cut -c1-300)
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
               reason="连续 3 轮无成功，循环已暂停（last: ${wr:-watcher stop}）"

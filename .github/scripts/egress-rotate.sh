@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# R2562 (operator): DEPRECATED for CI. The workflow selects the egress exactly
+# once in "Select egress proxy" and egress-watch.sh no longer calls this script.
+# Single-run rotation is intentionally disabled. This file is kept only for
+# manual diagnostics; do not wire it back into the workflow without an explicit
+# operator decision.
+#
 # Move the local CONNECT proxy to the next candidate that passes the real
 # inference preflight with HTTP 200. The current candidate is skipped first, so
 # a quota-exhausted relay is not retried immediately.

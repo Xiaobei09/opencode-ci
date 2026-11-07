@@ -5,10 +5,15 @@
 # session per candidate through a candidate-specific local CONNECT proxy. This
 # avoids treating a synthetic curl 429 as proof that the IP is exhausted.
 #
+# R2562 (operator): the egress is selected ONCE here for the whole run. The
+# watcher no longer rotates. Probe the candidate pool until one answers 200;
+# there is no quota-based early stop and no direct fallback. If no candidate
+# answers 200 the script exits non-zero and the run fails with a clear reason.
+#
 # Outputs:
 #   $RUNNER_TEMP/egress/upstream        direct | relay:ip:port | http:host:port
-#   $RUNNER_TEMP/egress/candidates.tsv  ordered fallbacks for runtime rotation
-#                                       (direct + proxyip relays; public HTTP
+#   $RUNNER_TEMP/egress/candidates.tsv  ordered candidates (diagnostics only;
+#                                       direct + proxyip relays; public HTTP
 #                                       only with EGRESS_ALLOW_PUBLIC_HTTP=1)
 #   $RUNNER_TEMP/exit-proxy.env         HTTP_PROXY=http://127.0.0.1:8089
 #   $HOME/.config/opencode/exit-proxy.json
@@ -31,29 +36,15 @@ echo 0 > "$EGRESS_EPOCH_FILE"
 egress_bl_init
 egress_bl_prune
 
-# R2501 (2026-10-23): time-to-first-good-egress is what delays the OpenCode step.
-# Three changes keep the same correctness (every candidate still has to pass the
-# REAL inference preflight) while cutting the worst case:
-#   1. probe up to 4 candidates concurrently, in candidate order (so a good
-#      direct IP still wins); failures are blacklisted exactly as before.
-#   2. 8s per attempt instead of 12s — a healthy inference call returns in 1-3s;
-#      12s only made dead relays slower to discard.
-#   3. 48 candidates / 180s budget (was 80 / 240s). The reputation list is
-#      ordered, and 48 misses in a row means the pool is unhealthy anyway.
-#   4. the previous run's working relay is re-probed in the first batch even if
-#      it is not near the head of the list (kills the "known-good but buried"
-#      regression after a rotation).
-SELECT_BUDGET="${EGRESS_SELECT_BUDGET:-120}"
-SELECT_MAX="${EGRESS_SELECT_MAX:-12}"
+# R2562 (operator): probe until a 200 is found. SELECT_MAX=0 means no cap;
+# SELECT_BUDGET=0 means no wall-clock cap. Keep the ordered candidate list and
+# stop immediately on the first real preflight success. A 200 from zengate is
+# still re-checked for egress stickiness below, because some relays rotate the
+# egress IP on every CONNECT (the operator-reported "200 then 429").
+SELECT_BUDGET="${EGRESS_SELECT_BUDGET:-0}"
+SELECT_MAX="${EGRESS_SELECT_MAX:-0}"
 PARALLEL="${EGRESS_PARALLEL:-1}"
 PREFLIGHT_TMO="${EGRESS_PREFLIGHT_TIMEOUT:-20}"
-# R2509/R2546: 每次失败的 preflight 都可能是匿名免费额度（按出口 IP 计）。
-# 2026-10-25 曾观测 direct + 48 relay 全 429，因此一旦 direct 也 quota，不必
-# 把整张 relay 表探完——采样几个 relay 后直接回退 direct，节省启动时间；新 run
-# 会重新选一批新鲜 IP。transport 失败仍用完整预算。
-QUOTA_PROBE_MAX="${EGRESS_QUOTA_PROBE_MAX:-4}"
-quota_fails=0
-direct_quota=0
 # A killed probe must not leave its curl/inference child running for the full
 # timeout after we already picked a winner; timeout forwards TERM to the child.
 PROBE_TIMEOUT=$((PREFLIGHT_TMO + 2))
@@ -158,7 +149,7 @@ for line in "${CAND_LINES[@]}"; do
   IFS=$'\t' read -r k t s <<< "$line"
   [ -n "${k:-}" ] || continue
   case "$k" in direct|relay|http) ;; *) continue ;; esac
-  [ ${#KIND[@]} -ge "$SELECT_MAX" ] && break
+  [ "$SELECT_MAX" -gt 0 ] && [ ${#KIND[@]} -ge "$SELECT_MAX" ] && break
   KIND+=("$k"); TARGET+=("${t:-}"); SOURCE+=("${s:-}")
 done
 log "selection plan: ${#KIND[@]} candidate(s), parallel=$PARALLEL, timeout=${PREFLIGHT_TMO}s"
@@ -166,7 +157,10 @@ log "selection plan: ${#KIND[@]} candidate(s), parallel=$PARALLEL, timeout=${PRE
 i=0
 while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
   now=$(egress_now)
-  [ $((now - START)) -ge "$SELECT_BUDGET" ] && { log "selection budget exhausted"; break; }
+  if [ "$SELECT_BUDGET" -gt 0 ] && [ $((now - START)) -ge "$SELECT_BUDGET" ]; then
+    log "selection budget exhausted (${SELECT_BUDGET}s); no 200 found"
+    break
+  fi
   B_REC=(); B_KEYS=()
   batch_start=$i
   while [ "$i" -lt "${#KIND[@]}" ] && [ ${#B_REC[@]} -lt "$PARALLEL" ]; do
@@ -222,7 +216,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
         if [ "$kind" = "relay" ] || [ "$kind" = "http" ]; then
           if ! egress_trace_stable "$kind" "$target" 8 > "$EGRESS_STATE_DIR/stable-select.$$"; then
             log "candidate $kind $target passed preflight but egress rotates (saw ${EGRESS_TRACE_SEEN:-?}); skipping: preflight cannot validate the IP the real session will use"
-            egress_bl_add "$key" "" "unstable-egress" 1800 || true
+            egress_bl_add "$key" "" "unstable-egress" 21600 || true
             continue
           fi
           stable_egress=$(cat "$EGRESS_STATE_DIR/stable-select.$$")
@@ -253,12 +247,6 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
       break
     fi
     ttl=21600
-    [ "$why" = "transport" ] && ttl=1800
-    [ "$why" = "quota" ] && ttl=1800
-    if [ "$why" = "quota" ]; then
-      quota_fails=$((quota_fails + 1))
-      [ "$kind" = "direct" ] && direct_quota=1
-    fi
     if [ "$kind" = "direct" ]; then
       failed_egress="${DIRECT_IP:-}"
     elif [ "$why" = "quota" ] || [ "$why" = "body_error" ]; then
@@ -268,30 +256,22 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     else
       failed_egress=""
     fi
-    # R2509/R2546: never persistently blacklist direct for quota — it stays the
-    # fallback route; anonymous quota is IP-scoped and the next run gets a fresh
-    # runner/egress IP anyway.
-    if [ "$kind" = "direct" ] && [ "$why" = "quota" ]; then
-      log "candidate direct failed code=$code reason=quota egress=${failed_egress:-?} (kept as fallback)"
+    # R2562 (operator): blacklist every failed candidate for 6h. Direct keys are
+    # runner-IP scoped, so they naturally never match a future runner; they are
+    # written for diagnostics and to keep one code path.
+    egress_bl_add "$key" "$failed_egress" "$why" "$ttl" || true
+    if [ "$EGRESS_BLACKLIST_ENABLED" = "1" ]; then
+      log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${ttl}s)"
     else
-      egress_bl_add "$key" "$failed_egress" "$why" "$ttl" || true
-      if [ "$EGRESS_BLACKLIST_ENABLED" = "1" ]; then
-        log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${ttl}s)"
-      else
-        log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist disabled)"
-      fi
+      log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist disabled)"
     fi
   done
-  if [ "$direct_quota" = 1 ] && [ "$quota_fails" -ge "$QUOTA_PROBE_MAX" ] && [ -z "$SELECTED_KIND" ]; then
-    log "quota on direct + $quota_fails relay(s): anonymous/IP-scoped; stop probing (budget ${QUOTA_PROBE_MAX} relays; next run re-selects fresh IPs)"
-    break
-  fi
 done
 
 if [ -z "$SELECTED_KIND" ]; then
-  log "no candidate passed; falling back to direct (the next run gets a fresh runner IP)"
-  SELECTED_KIND="direct"; SELECTED_TARGET="-"; SELECTED_SOURCE="fallback-direct"
-  SELECTED_UP="direct"; SELECTED_EGRESS="${DIRECT_IP:-unknown}"
+  log "ERROR: no candidate passed the real preflight (no 200); refusing direct fallback"
+  echo "::error::egress selection failed: no candidate answered 200 (the operator disabled the direct fallback)"
+  exit 1
 fi
 
 egress_write_upstream "$SELECTED_UP"

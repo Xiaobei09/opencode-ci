@@ -9,10 +9,10 @@ set -uo pipefail
 
 EGRESS_STATE_DIR="${EGRESS_STATE_DIR:-${RUNNER_TEMP:-/tmp}/egress}"
 EGRESS_BLACKLIST="${EGRESS_BLACKLIST:-$HOME/.config/opencode/egress-blacklist.json}"
-# Disabled by default while the egress scheme is being revalidated with
-# zengate. The file is still left untouched; set EGRESS_BLACKLIST_ENABLED=1 to
-# restore the old skip/persist behavior.
-EGRESS_BLACKLIST_ENABLED="${EGRESS_BLACKLIST_ENABLED:-0}"
+# R2562 (operator): enable the persistent blacklist by default. Failed
+# candidates are skipped for 6h so a new run does not immediately re-probe the
+# same exhausted egress. Set EGRESS_BLACKLIST_ENABLED=0 only for diagnostics.
+EGRESS_BLACKLIST_ENABLED="${EGRESS_BLACKLIST_ENABLED:-1}"
 EGRESS_UPSTREAM_FILE="$EGRESS_STATE_DIR/upstream"
 EGRESS_EPOCH_FILE="$EGRESS_STATE_DIR/epoch"
 EGRESS_CANDIDATES_FILE="$EGRESS_STATE_DIR/candidates.tsv"
