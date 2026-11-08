@@ -140,8 +140,25 @@ blacklist_selected() {
 
 # handle_quota <line>
 handle_quota() {
-  local line="$1" now err_up err_at
+  local line="$1" now err_up err_at msg_at msg_at_epoch
   now=$(egress_now)
+
+  # R2564 (operator priority: preflight 200 then 429): auto-continue re-logs
+  # restored pre-run errors on startup. Those are NOT evidence about this run's
+  # egress. The plugin now tags every quota line with this_run/msg_at; ignore
+  # restored ones here (defense in depth even if the plugin-side gate regresses).
+  if printf '%s' "$line" | grep -q 'this_run=false'; then
+    log "stale quota line from restored session (this_run=false); ignoring"
+    return 0
+  fi
+  msg_at=$(printf '%s' "$line" | sed -nE 's/.*msg_at=([^ ,)]+).*/\1/p' | head -1)
+  if [ -n "$msg_at" ] && [ "$msg_at" != "?" ] && [ "$selected_at" -gt 0 ]; then
+    msg_at_epoch=$(date -u -d "$msg_at" +%s 2>/dev/null || true)
+    if [ -n "$msg_at_epoch" ] && [ "$msg_at_epoch" -lt "$selected_at" ]; then
+      log "stale quota line msg_at=$msg_at predates selection (selected=$selected_at); ignoring"
+      return 0
+    fi
+  fi
 
   # Delayed lines from an upstream other than the one this run selected are
   # not evidence about the current egress.
