@@ -17,6 +17,13 @@ EGRESS_UPSTREAM_FILE="$EGRESS_STATE_DIR/upstream"
 EGRESS_EPOCH_FILE="$EGRESS_STATE_DIR/epoch"
 EGRESS_CANDIDATES_FILE="$EGRESS_STATE_DIR/candidates.tsv"
 EGRESS_STATE_FILE="$HOME/.config/opencode/exit-proxy.json"
+EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
+# R2565: anonymous free quota is per egress IP. Reusing the same relay across
+# runs means paying with a partially consumed bucket; the provider's 429
+# retry-after was observed at ~12.9h, longer than the 6h failure blacklist.
+# Successful relays are therefore avoided for 13h by default, so every run
+# starts on a fresh IP (the operator's "new run -> new egress -> new quota").
+EGRESS_REUSE_WINDOW="${EGRESS_REUSE_WINDOW:-46800}"
 EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
 
 egress_now() { date +%s; }
@@ -106,6 +113,90 @@ egress_bl_del() {
   else
     rm -f "$tmp"
   fi
+}
+
+# ---- successful-egress usage history -------------------------------------
+# The failure blacklist is not enough to guarantee a fresh quota bucket: a
+# relay can pass a tiny preflight, then the real (large-context) session sends
+# a much larger request and hits the remainder of that IP's free budget. Keep a
+# separate, longer-lived history of relays/IPs we actually selected so a new
+# run prefers an unused egress.
+egress_usage_init() {
+  mkdir -p "$(dirname "$EGRESS_USAGE")"
+  if [ ! -s "$EGRESS_USAGE" ]; then
+    printf '%s\n' '{"version":1,"entries":{}}' > "$EGRESS_USAGE"
+  fi
+  chmod 600 "$EGRESS_USAGE" 2>/dev/null || true
+}
+
+egress_usage_prune() {
+  local now tmp
+  now=$(egress_now)
+  [ -s "$EGRESS_USAGE" ] || return 0
+  tmp=$(mktemp "${EGRESS_USAGE}.XXXXXX") || return 0
+  if jq --argjson now "$now" --argjson win "$EGRESS_REUSE_WINDOW" \
+       '.entries |= with_entries(select((.value.last_used // 0) > ($now - $win)))' \
+       "$EGRESS_USAGE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$EGRESS_USAGE"
+    chmod 600 "$EGRESS_USAGE" 2>/dev/null || true
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# egress_usage_has_key <candidate-key>
+egress_usage_has_key() {
+  local key="$1" now
+  now=$(egress_now)
+  jq -e --arg k "$key" --argjson now "$now" --argjson win "$EGRESS_REUSE_WINDOW" \
+    '(.entries[$k].last_used // 0) > ($now - $win)' "$EGRESS_USAGE" >/dev/null 2>&1
+}
+
+# egress_usage_has_ip <observed-egress-ip>
+egress_usage_has_ip() {
+  local ip="$1" now
+  [ -n "$ip" ] && [ "$ip" != "unknown" ] || return 1
+  now=$(egress_now)
+  jq -e --arg ip "$ip" --argjson now "$now" --argjson win "$EGRESS_REUSE_WINDOW" \
+    '[.entries[] | select(.egress == $ip and (.last_used // 0) > ($now - $win))] | length > 0' \
+    "$EGRESS_USAGE" >/dev/null 2>&1
+}
+
+# egress_usage_add <candidate-key> <observed-egress-ip> <source>
+egress_usage_add() {
+  local key="$1" egress="$2" source="$3" now at tmp
+  now=$(egress_now)
+  at=$(egress_iso)
+  tmp=$(mktemp "${EGRESS_USAGE}.XXXXXX") || return 1
+  if jq --arg k "$key" --arg e "$egress" --arg s "$source" \
+        --argjson now "$now" --arg at "$at" \
+        '.entries[$k] = {egress:$e, source:$s, last_used:$now, at:$at}' \
+        "$EGRESS_USAGE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$EGRESS_USAGE"
+    chmod 600 "$EGRESS_USAGE" 2>/dev/null || true
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# Seed the previous run's selected relay into the history on first deployment
+# (the usage file did not exist before R2565). Do not seed if the state is old.
+egress_usage_seed_previous() {
+  local up picked picked_epoch egress
+  [ -s "$EGRESS_STATE_FILE" ] || return 0
+  up=$(jq -r '.upstream // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
+  case "$up" in
+    relay:*|http:*) ;;
+    *) return 0 ;;
+  esac
+  picked=$(jq -r '.picked_at // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
+  [ -n "$picked" ] || return 0
+  picked_epoch=$(date -u -d "$picked" +%s 2>/dev/null || echo 0)
+  [ "$picked_epoch" -gt 0 ] || return 0
+  [ $(( $(egress_now) - picked_epoch )) -le "$EGRESS_REUSE_WINDOW" ] || return 0
+  egress=$(jq -r '.egress_ip // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
+  egress_usage_add "$up" "$egress" "previous-run" || true
 }
 
 egress_epoch_bump() {

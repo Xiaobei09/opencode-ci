@@ -1137,6 +1137,7 @@ jobs:
                 opencode/config/loop-sessions.json opencode/config/model-windows.json \
                 opencode/config/abort-events.json opencode/config/inject-card-*.json \
                 opencode/config/botname-*.json opencode/config/egress-blacklist.json \
+                opencode/config/egress-usage.json \
                 opencode/config/exit-proxy.json
           {
             echo '# Runtime state lives in the env release, not in git.'
@@ -1159,6 +1160,7 @@ jobs:
             echo 'opencode/config/halt-release.json*'
             echo 'opencode/config/botname-*.json*'
             echo 'opencode/config/egress-blacklist.json*'
+            echo 'opencode/config/egress-usage.json*'
             echo 'opencode/config/exit-proxy.json*'
             echo 'opencode/config/service.json*'
             echo 'opencode/config/tg-bot*.env'

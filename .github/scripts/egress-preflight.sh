@@ -16,7 +16,9 @@ TARGET="${2:-}"
 TMO="${3:-15}"
 
 BODY=$(mktemp)
-trap 'rm -f "$BODY"' EXIT
+HDR=$(mktemp)
+trap 'rm -f "$BODY" "$HDR"' EXIT
+META="${EGRESS_PREFLIGHT_META:-}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy
 
@@ -44,7 +46,7 @@ case "$KIND" in
   *) echo -e "000\tbad_kind"; exit 64 ;;
 esac
 
-code=$(curl -sS -o "$BODY" -w '%{http_code}' -m "$TMO" "${ARGS[@]}" \
+code=$(curl -sS -o "$BODY" -D "$HDR" -w '%{http_code}' -m "$TMO" "${ARGS[@]}" \
   -X POST "https://opencode.ai/inference/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "User-Agent: opencode/1.18.32" \
@@ -52,6 +54,17 @@ code=$(curl -sS -o "$BODY" -w '%{http_code}' -m "$TMO" "${ARGS[@]}" \
   -H "x-opencode-session: $(make_sid)" \
   -d "$PAYLOAD" 2>/dev/null)
 [ -n "$code" ] || code=000
+
+# R2565: keep the provider's Retry-After for the selector's blacklist TTL.
+ra=""
+raw_ra=$(awk 'tolower($1)=="retry-after:" {gsub("\r",""); print $2}' "$HDR" 2>/dev/null | tail -1)
+case "$raw_ra" in
+  ''|*[!0-9]*) ;;
+  *) ra="$raw_ra" ;;
+esac
+if [ -n "$META" ]; then
+  printf 'retry_after=%s\n' "$ra" > "$META" 2>/dev/null || true
+fi
 
 reason="ok"
 if [ "$code" = "429" ]; then

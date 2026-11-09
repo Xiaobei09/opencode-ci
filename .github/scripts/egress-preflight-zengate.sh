@@ -19,6 +19,12 @@ TMO="${3:-20}"
 # session immediately fails with provider.free-limit.
 MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
 echo "zengate preflight model=$MODEL" >&2
+META="${EGRESS_PREFLIGHT_META:-}"
+# R2565: a cache/proxy that replays a canned "OK" must not pass as a real
+# provider completion. Ask for a fresh nonce and verify it appears in the
+# content; this also proves the request traversed the candidate tunnel.
+NONCE="$(date +%s%N)-${RANDOM}"
+WANT="OK-${NONCE}"
 
 case "$KIND" in
   direct) UP="direct" ;;
@@ -34,9 +40,11 @@ printf '%s\n' "$epoch" > "$PROBE_DIR/epoch"
 # next request so it cannot reuse the previous candidate's provider connection.
 sleep 0.8
 
-body=$(jq -nc --arg m "$MODEL" \
-  '{model:$m,stream:false,max_tokens:24,messages:[{role:"user",content:"Reply with exactly: OK"}]}')
-raw=$(curl -sS -m "$TMO" --noproxy '*' -w '\n%{http_code}' \
+HDR=$(mktemp)
+trap 'rm -f "$HDR"' EXIT
+body=$(jq -nc --arg m "$MODEL" --arg want "$WANT" \
+  '{model:$m,stream:false,max_tokens:32,messages:[{role:"user",content:("Reply with exactly: " + $want)}]}')
+raw=$(curl -sS -m "$TMO" --noproxy '*' -D "$HDR" -w '\n%{http_code}' \
   -H 'Content-Type: application/json' -d "$body" \
   "http://127.0.0.1:${ZG_PORT}/v1/chat/completions" 2>/dev/null || true)
 code=${raw##*$'\n'}
@@ -46,8 +54,34 @@ content=$(printf '%s' "$js" | jq -r '.choices[0].message.content // empty' 2>/de
 err=$(printf '%s' "$js" | jq -r '.error.message // empty' 2>/dev/null || true)
 all="$js $err"
 
+# R2565: preserve the provider's Retry-After so the selector can blacklist an
+# exhausted egress for the real reset window instead of a fixed 6h.
+ra=""
+if [ -s "$HDR" ]; then
+  raw_ra=$(awk 'tolower($1)=="retry-after:" {gsub("\r",""); print $2}' "$HDR" | tail -1)
+  if [ -n "$raw_ra" ]; then
+    case "$raw_ra" in
+      *[!0-9]*)
+        _e=$(date -u -d "$raw_ra" +%s 2>/dev/null || true)
+        if [ -n "$_e" ]; then
+          ra=$((_e - $(egress_now)))
+          [ "$ra" -lt 0 ] && ra=0
+        fi
+        ;;
+      *) ra="$raw_ra" ;;
+    esac
+  fi
+fi
+if [ -n "$META" ]; then
+  {
+    printf 'retry_after=%s\n' "${ra:-}"
+    printf 'nonce=%s\n' "$NONCE"
+    printf 'code=%s\n' "$code"
+  } > "$META" 2>/dev/null || true
+fi
+
 reason=ok
-if [ "$code" = "200" ] && [ -n "$content" ]; then
+if [ "$code" = "200" ] && printf '%s' "$content" | grep -qF "$NONCE"; then
   reason=ok
 elif [ "$code" = "429" ] || printf '%s' "$all" | grep -qiE 'FreeUsageLimit|free usage limit|free-limit|provider\.free-limit|quota|rate.?limit'; then
   reason=quota

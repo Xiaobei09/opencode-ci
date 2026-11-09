@@ -115,12 +115,13 @@ record_failure() {
   fi
 }
 
-# blacklist_selected <reason>
-# Persist the selected candidate for 6h. Direct keys include the runner egress
+# blacklist_selected <reason> [ttl-seconds]
+# Persist the selected candidate for at least 6h (or the provider's Retry-After,
+# whichever is longer). Direct keys include the runner egress
 # IP so they never match a future runner, which is intended: the direct path is
 # still allowed, but this exact exhausted IP must not be reused in this run.
 blacklist_selected() {
-  local reason="$1" key=""
+  local reason="$1" ttl="${2:-21600}" key=""
   case "$CUR_UP" in
     relay:*) key="$CUR_UP" ;;
     http:*)  key="$CUR_UP" ;;
@@ -130,8 +131,8 @@ blacklist_selected() {
     log "cannot blacklist selected egress: upstream=$CUR_UP has no candidate key"
     return 1
   fi
-  if egress_bl_add "$key" "${selected_egress:-}" "$reason" 21600; then
-    log "blacklisted $key for 21600s reason=$reason egress=${selected_egress:-?}"
+  if egress_bl_add "$key" "${selected_egress:-}" "$reason" "$ttl"; then
+    log "blacklisted $key for ${ttl}s reason=$reason egress=${selected_egress:-?}"
   else
     log "warning: failed to persist blacklist entry for $key reason=$reason"
     return 1
@@ -140,7 +141,7 @@ blacklist_selected() {
 
 # handle_quota <line>
 handle_quota() {
-  local line="$1" now err_up err_at msg_at msg_at_epoch
+  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl
   now=$(egress_now)
 
   # R2564 (operator priority: preflight 200 then 429): auto-continue re-logs
@@ -177,14 +178,26 @@ handle_quota() {
 
   # Operator priority: a candidate that passed the real 200 preflight but hits
   # anonymous free quota within 120s is exhausted. Do not rotate inside the
-  # run; blacklist it for 6h and let the next run select a fresh egress.
+  # run; blacklist it for at least 6h and let the next run select a fresh
+  # egress. R2565: the provider's Retry-After was observed at ~12.9h; honoring
+  # it avoids retrying the same exhausted IP before its bucket resets.
+  retry_after=$(printf '%s' "$line" | sed -nE 's/.*retry_after_s=([0-9]+).*/\1/p' | head -1)
+  ttl=21600
+  if [ -n "$retry_after" ] && [ "$retry_after" -gt "$ttl" ] 2>/dev/null; then ttl="$retry_after"; fi
   if [ "$selected_at" -gt 0 ] && [ $((now - selected_at)) -le "$PROBE_FALSE_WINDOW" ]; then
-    log "selected egress answered 200 in preflight but hit quota after $((now - selected_at))s (upstream=$CUR_UP); stopping this round and blacklisting for 6h"
-    blacklist_selected "quota-after-preflight-200" || true
-    stop_run "selected egress $CUR_UP answered 200 in preflight but hit quota after $((now - selected_at))s; blacklisted for 21600s; ending this round so the next run selects a fresh egress"
+    log "selected egress answered 200 in preflight but hit quota after $((now - selected_at))s (upstream=$CUR_UP, retry_after=${retry_after:-?}s); stopping this round and blacklisting for ${ttl}s"
+    blacklist_selected "quota-after-preflight-200" "$ttl" || true
+    stop_run "selected egress $CUR_UP answered 200 in preflight but hit quota after $((now - selected_at))s; blacklisted for ${ttl}s; ending this round so the next run selects a fresh egress"
   fi
 
-  log "quota error detected (upstream=$CUR_UP)"
+  log "quota error detected (upstream=$CUR_UP, retry_after=${retry_after:-?}s)"
+  # A quota error after the 120s preflight window still means this egress IP is
+  # exhausted (possibly after a long healthy run). Keep it out of future
+  # selection for the provider's reset window too; the current run keeps its
+  # tunnel and follows the normal 3-consecutive-error policy.
+  if [ "$selected_at" -gt 0 ] && [ $((now - selected_at)) -gt "$PROBE_FALSE_WINDOW" ]; then
+    blacklist_selected "quota-after-healthy-window" "$ttl" || true
+  fi
   record_failure quota "$line"
 }
 

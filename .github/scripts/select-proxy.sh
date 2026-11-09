@@ -18,6 +18,7 @@
 #   $RUNNER_TEMP/exit-proxy.env         HTTP_PROXY=http://127.0.0.1:8089
 #   $HOME/.config/opencode/exit-proxy.json
 #   $HOME/.config/opencode/egress-blacklist.json (persisted, 0600)
+#   $HOME/.config/opencode/egress-usage.json     (persisted, 0600; 13h success history)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +36,14 @@ mkdir -p "$EGRESS_STATE_DIR"
 echo 0 > "$EGRESS_EPOCH_FILE"
 egress_bl_init
 egress_bl_prune
+# R2565: remember recently selected relays/IPs across runs. The free bucket is
+# per egress IP; a tiny preflight 200 does not prove enough quota remains for
+# the resumed (large-context) session. Prefer a relay not used in the last
+# EGRESS_REUSE_WINDOW (13h default); fall back to a used one only if every fresh
+# candidate fails.
+egress_usage_init
+egress_usage_prune
+egress_usage_seed_previous
 
 # R2562 (operator): probe until a 200 is found. SELECT_MAX=0 means no cap;
 # SELECT_BUDGET=0 means no wall-clock cap. Keep the ordered candidate list and
@@ -123,36 +132,48 @@ awk -F'\t' '!seen[$1 FS $2]++' "$EGRESS_CANDIDATES_FILE" > "$EGRESS_CANDIDATES_F
   && mv "$EGRESS_CANDIDATES_FILE.tmp" "$EGRESS_CANDIDATES_FILE"
 log "candidates: $(wc -l < "$EGRESS_CANDIDATES_FILE")"
 
-# ---- prioritize the previous run's working relay (after direct) ------------
-LAST_UP=$(jq -r '.upstream // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
-if [ "${LAST_UP#relay:}" != "$LAST_UP" ] && [ -n "${LAST_UP#relay:}" ]; then
-  last_target="${LAST_UP#relay:}"
-  # Keep direct first (fresh runner IP is still the preferred egress), then put
-  # the known-good relay second. It may be buried deep in the reputation list;
-  # this moves it (or inserts it when the list changed).
-  awk -F'\t' -v OFS='\t' -v t="$last_target" '
-    NR == 1 { print; print "relay", t, "last-good-relay"; next }
-    $1 == "relay" && $2 == t { next }
-    { print }
-  ' "$EGRESS_CANDIDATES_FILE" > "$EGRESS_CANDIDATES_FILE.tmp" \
-    && mv "$EGRESS_CANDIDATES_FILE.tmp" "$EGRESS_CANDIDATES_FILE"
-  log "previous relay promoted: $last_target"
-fi
+# ---- order fresh candidates before recently used ones ---------------------
+# R2565 (operator priority): the old code promoted the previous run's relay to
+# slot #2. Because the candidate list is otherwise static, every run selected
+# the same egress until its free bucket was partially consumed; the tiny
+# preflight still answered 200, then the resumed session's large request hit
+# the remaining quota (observed 429 retry-after ~12.9h). Never promote the
+# previous relay. The recently-used history below moves it to the back.
+# (The ranking is applied after the candidate arrays are built.)
 
 # ---- pick the first candidate that passes the real preflight --------------
 SELECTED_KIND=""; SELECTED_TARGET=""; SELECTED_SOURCE=""; SELECTED_UP=""; SELECTED_EGRESS=""
 # Snapshot the ordered list, then probe small batches in parallel. We still pick
 # the earliest candidate in list order that succeeds, so priority is unchanged.
 mapfile -t CAND_LINES < "$EGRESS_CANDIDATES_FILE"
-KIND=(); TARGET=(); SOURCE=()
+KIND=(); TARGET=(); SOURCE=(); PREUSED=()
 for line in "${CAND_LINES[@]}"; do
   IFS=$'\t' read -r k t s <<< "$line"
   [ -n "${k:-}" ] || continue
   case "$k" in direct|relay|http) ;; *) continue ;; esac
   [ "$SELECT_MAX" -gt 0 ] && [ ${#KIND[@]} -ge "$SELECT_MAX" ] && break
-  KIND+=("$k"); TARGET+=("${t:-}"); SOURCE+=("${s:-}")
+  case "$k" in
+    direct) ukey="direct:${DIRECT_IP:-unknown}" ;;
+    *)      ukey="$k:${t:-}" ;;
+  esac
+  used=0
+  egress_usage_has_key "$ukey" && used=1
+  KIND+=("$k"); TARGET+=("${t:-}"); SOURCE+=("${s:-}"); PREUSED+=("$used")
 done
-log "selection plan: ${#KIND[@]} candidate(s), parallel=$PARALLEL, timeout=${PREFLIGHT_TMO}s"
+# Stable partition: fresh candidates first, recently used candidates last.
+nK=(); nT=(); nS=(); nU=()
+for want in 0 1; do
+  for j in "${!KIND[@]}"; do
+    [ "${PREUSED[$j]}" = "$want" ] || continue
+    nK+=("${KIND[$j]}"); nT+=("${TARGET[$j]}"); nS+=("${SOURCE[$j]}"); nU+=("${PREUSED[$j]}")
+  done
+done
+if [ ${#KIND[@]} -gt 0 ]; then
+  KIND=("${nK[@]}"); TARGET=("${nT[@]}"); SOURCE=("${nS[@]}"); PREUSED=("${nU[@]}")
+fi
+fresh_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^0$' || true)
+used_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^1$' || true)
+log "selection plan: ${#KIND[@]} candidate(s), fresh=$fresh_count recently-used=$used_count reuse-window=${EGRESS_REUSE_WINDOW}s, parallel=$PARALLEL, timeout=${PREFLIGHT_TMO}s"
 
 i=0
 while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
@@ -176,18 +197,22 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
       continue
     fi
     pf="$EGRESS_STATE_DIR/preflight.$$.$idx"
-    rm -f "$pf"
+    meta="$pf.meta"
+    rm -f "$pf" "$meta"
     if [ "$PROBE_ENGINE" = "zengate" ]; then
+      EGRESS_PREFLIGHT_META="$meta" \
       timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
         bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$([ "$kind" = direct ] && echo "" || echo "$target")" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
     elif [ "$kind" = "direct" ]; then
+      EGRESS_PREFLIGHT_META="$meta" \
       timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
         bash "$SCRIPT_DIR/egress-preflight.sh" direct "" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
     else
+      EGRESS_PREFLIGHT_META="$meta" \
       timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
         bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$target" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
     fi
-    B_REC+=("$idx|$kind|$target|$source|$key|$up|$pf|$!")
+    B_REC+=("$idx|$kind|$target|$source|$key|$up|$pf|$!|${PREUSED[$idx]}")
     B_KEYS+=("$key")
   done
   # Process the batch in list order, but do not wait for lower-priority probes
@@ -199,10 +224,15 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
   # run) — correctness of the chosen egress is unaffected.
   pos=0
   for rec in "${B_REC[@]+"${B_REC[@]}"}"; do
-    IFS='|' read -r idx kind target source key up pf pid <<< "$rec"
+    IFS='|' read -r idx kind target source key up pf pid used <<< "$rec"
     pos=$((pos + 1))
     if [ -n "${pid:-}" ]; then wait "$pid" 2>/dev/null || true; fi
     out=$(cat "$pf" 2>/dev/null || true); rm -f "$pf"
+    ra=""
+    if [ -f "$pf.meta" ]; then
+      ra=$(sed -n 's/^retry_after=//p' "$pf.meta" 2>/dev/null | head -1)
+      rm -f "$pf.meta"
+    fi
     code=${out%%$'\t'*}
     why=${out##*$'\t'}
     [ -n "$code" ] || code=000
@@ -222,16 +252,28 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
           stable_egress=$(cat "$EGRESS_STATE_DIR/stable-select.$$")
           rm -f "$EGRESS_STATE_DIR/stable-select.$$"
         fi
+        # R2565: a different relay can share the same exhausted egress IP. Only
+        # a fresh candidate is rejected here; after all fresh candidates fail,
+        # the used group is allowed as a deliberate fallback.
+        if [ "$used" = "0" ] && [ -n "$stable_egress" ] && egress_usage_has_ip "$stable_egress"; then
+          log "candidate $kind $target preflight 200 but egress=$stable_egress was used recently (reuse-window=${EGRESS_REUSE_WINDOW}s); skipping to keep a fresh quota bucket"
+          continue
+        fi
         SELECTED_KIND="$kind"; SELECTED_TARGET="$target"; SELECTED_SOURCE="$source"; SELECTED_UP="$up"
+        [ "$used" = "1" ] && SELECTED_SOURCE="${source}-reused"
         case "$kind" in
           direct) SELECTED_EGRESS="${DIRECT_IP:-unknown}" ;;
           relay|http) SELECTED_EGRESS="$stable_egress" ;;
         esac
         [ -n "$SELECTED_EGRESS" ] || SELECTED_EGRESS="unknown"
         egress_bl_del "$key"
+        egress_usage_add "$key" "$SELECTED_EGRESS" "$SELECTED_SOURCE" \
+          || log "warning: failed to record usage for $key"
         why_note=""
         [ "$kind" = "direct" ] && why_note=" (direct-first: candidate #1 passed)"
         [ -n "$stable_egress" ] && why_note="$why_note (egress sticky over 8 parallel traces)"
+        [ "$PROBE_ENGINE" = "zengate" ] && why_note="$why_note (nonce-verified)"
+        [ "$used" = "1" ] && why_note="$why_note (reused after all fresh candidates failed)"
         log "selected $kind $target egress=$SELECTED_EGRESS source=$SELECTED_SOURCE code=200${why_note} (batch=$batch_start)"
       fi
       # Stop paying for lower-priority probes as soon as the winner is known.
@@ -247,6 +289,10 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
       break
     fi
     ttl=21600
+    # R2565: honor the provider's Retry-After. A free-tier 429 was observed with
+    # retry-after ~12.9h; a fixed 6h blacklist would retry that exhausted egress
+    # too early. Use the longer of the operator's 6h floor and the provider hint.
+    if [ -n "$ra" ] && [ "$ra" -gt "$ttl" ] 2>/dev/null; then ttl="$ra"; fi
     if [ "$kind" = "direct" ]; then
       failed_egress="${DIRECT_IP:-}"
     elif [ "$why" = "quota" ] || [ "$why" = "body_error" ]; then
@@ -256,12 +302,12 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     else
       failed_egress=""
     fi
-    # R2562 (operator): blacklist every failed candidate for 6h. Direct keys are
-    # runner-IP scoped, so they naturally never match a future runner; they are
-    # written for diagnostics and to keep one code path.
+    # R2562 (operator): blacklist every failed candidate for at least 6h. Direct
+    # keys are runner-IP scoped, so they naturally never match a future runner;
+    # they are written for diagnostics and to keep one code path.
     egress_bl_add "$key" "$failed_egress" "$why" "$ttl" || true
     if [ "$EGRESS_BLACKLIST_ENABLED" = "1" ]; then
-      log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${ttl}s)"
+      log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist ${ttl}s${ra:+ retry_after=${ra}s})"
     else
       log "candidate $kind $target failed code=$code reason=$why egress=${failed_egress:-?} (blacklist disabled)"
     fi
