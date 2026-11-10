@@ -10,6 +10,13 @@
 # there is no quota-based early stop and no direct fallback. If no candidate
 # answers 200 the script exits non-zero and the run fails with a clear reason.
 #
+# R2578 (operator priority: "现在是直连"): direct used to be candidate #1, so a
+# healthy fresh runner IP always won and the proxy list was never probed. The
+# run therefore never actually used a proxy egress. Direct is now an explicit
+# emergency opt-in (EGRESS_ALLOW_DIRECT=1) and is placed last; by default the
+# relay candidates are filtered and probed first, and no relay 200 means the
+# run fails instead of quietly using the runner IP.
+#
 # Outputs:
 #   $RUNNER_TEMP/egress/upstream        direct | relay:ip:port | http:host:port
 #   $RUNNER_TEMP/egress/candidates.tsv  ordered candidates (diagnostics only;
@@ -61,30 +68,38 @@ PROBE_TIMEOUT=$((PREFLIGHT_TMO + 2))
 [ "$PARALLEL" -le 8 ] 2>/dev/null || PARALLEL=8
 START=$(egress_now)
 
+# R2578 (operator): never select the runner IP unless this explicit opt-in is
+# set. The old direct-first ordering made every run look like a proxy selection
+# while the provider traffic actually left from the runner IP.
+EGRESS_ALLOW_DIRECT="${EGRESS_ALLOW_DIRECT:-0}"
+
 log() { echo "[egress-select] $*"; }
 
 PROBE_ENGINE=curl
-if bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
-  PROBE_ENGINE=zengate
-  PARALLEL=1
-  log "preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate)"
-  trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
-else
-  log "warning: zengate probe unavailable; falling back to curl preflight"
-fi
 
 DIRECT_IP=$(egress_trace_direct)
 DIRECT_COLO=$(curl -sS -m 10 --noproxy '*' "$EGRESS_TRACE_URL" 2>/dev/null | awk -F= '/^colo=/{print $2}')
 log "direct egress=${DIRECT_IP:-unknown} colo=${DIRECT_COLO:-?}"
 
 # ---- candidate list -------------------------------------------------------
-# 1) direct (a fresh runner IP is often the best bucket)
-printf 'direct\t-\tdirect\n' >> "$EGRESS_CANDIDATES_FILE"
-
-# 2) proxyip relay entries (non-CF ASN + CF edge ports; --connect-to relays TCP)
+# 1) proxyip relay entries FIRST (non-CF ASN + CF edge ports; --connect-to
+#    relays TCP). R2578: the operator wants provider traffic to leave through a
+#    proxy egress, so relays are the primary path, not a fallback.
 RELAY_SOURCE="${EGRESS_RELAY_SOURCE:-all_rep_verified.txt}"
 RELAY_URL="https://raw.githubusercontent.com/Xiaobei09/proxyip/main/data/valid/$RELAY_SOURCE"
-if curl -fsSL --retry 3 --retry-delay 2 --max-time 90 "$RELAY_URL" -o "$EGRESS_STATE_DIR/relays.txt"; then
+RELAY_FILE="${EGRESS_RELAY_FILE:-}"
+if [ -n "$RELAY_FILE" ] && [ -f "$RELAY_FILE" ]; then
+  cp -f "$RELAY_FILE" "$EGRESS_STATE_DIR/relays.txt"
+  RELAY_OK=1
+  RELAY_ORIGIN="local file $RELAY_FILE"
+elif curl -fsSL --retry 3 --retry-delay 2 --max-time 90 "$RELAY_URL" -o "$EGRESS_STATE_DIR/relays.txt"; then
+  RELAY_OK=1
+  RELAY_ORIGIN="$RELAY_SOURCE"
+else
+  RELAY_OK=0
+  RELAY_ORIGIN=""
+fi
+if [ "$RELAY_OK" = "1" ]; then
   # all_rep_verified is reputation-ordered. Keep the head; dedupe entries.
   head -n 220 "$EGRESS_STATE_DIR/relays.txt" \
     | tr -d '\r' \
@@ -93,14 +108,26 @@ if curl -fsSL --retry 3 --retry-delay 2 --max-time 90 "$RELAY_URL" -o "$EGRESS_S
     | awk '!seen[$0]++' \
     | while IFS= read -r hp; do printf 'relay\t%s\tproxyip\n' "$hp"; done \
     >> "$EGRESS_CANDIDATES_FILE"
-  log "relay candidates: $(grep -c '^relay' "$EGRESS_CANDIDATES_FILE" || true) from $RELAY_SOURCE"
+  log "relay candidates: $(grep -c '^relay' "$EGRESS_CANDIDATES_FILE" || true) from $RELAY_ORIGIN"
 else
   log "relay source unavailable: $RELAY_URL"
 fi
 
+# 2) direct is an explicit emergency opt-in only (R2578). It is placed LAST so
+#    even when enabled it cannot displace a working relay. When disabled, the
+#    selector fails if no relay answers 200 instead of silently using the
+#    runner IP (the operator's "取消回退到直连" rule).
+if [ "$EGRESS_ALLOW_DIRECT" = "1" ]; then
+  printf 'direct\t-\tdirect\n' >> "$EGRESS_CANDIDATES_FILE"
+  log "direct candidate enabled explicitly (EGRESS_ALLOW_DIRECT=1); kept last"
+else
+  log "direct candidate disabled (EGRESS_ALLOW_DIRECT=0): provider traffic must use a relay"
+fi
+
 # 3) public HTTP CONNECT proxies are DISABLED by default. They are untrusted,
 #    unstable, and can observe SNI metadata. Keep the code behind an explicit
-#    opt-in for experiments; production uses direct + proxyip relays only.
+#    opt-in for experiments; production uses relay candidates first (direct is
+#    disabled unless EGRESS_ALLOW_DIRECT=1).
 if [ "${EGRESS_ALLOW_PUBLIC_HTTP:-0}" = "1" ]; then
   HTTP_SOURCES=(
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
@@ -131,6 +158,77 @@ fi
 awk -F'\t' '!seen[$1 FS $2]++' "$EGRESS_CANDIDATES_FILE" > "$EGRESS_CANDIDATES_FILE.tmp" \
   && mv "$EGRESS_CANDIDATES_FILE.tmp" "$EGRESS_CANDIDATES_FILE"
 log "candidates: $(wc -l < "$EGRESS_CANDIDATES_FILE")"
+
+# ---- R2578: cheap relay prefilter ----------------------------------------
+# A real zengate preflight is expensive (a fresh OpenCode session per probe).
+# Walking 220 relays one by one could take longer than the whole 1-minute
+# non-OpenCode budget, especially when the first entries are dead. Filter the
+# head of the reputation list with parallel provider-egress traces first, keep
+# only reachable relays (bounded by EGRESS_RELAY_FILTER_KEEP), and let zengate
+# validate the actual model/quota on that short list.
+if [ "${EGRESS_SELECT_DRYRUN:-0}" != "1" ] && [ "${EGRESS_RELAY_FILTER_TOPN:-24}" -gt 0 ] 2>/dev/null; then
+  REL_FILTER_TOPN="${EGRESS_RELAY_FILTER_TOPN:-24}"
+  REL_FILTER_KEEP="${EGRESS_RELAY_FILTER_KEEP:-8}"
+  REL_FILTER_TMO="${EGRESS_RELAY_FILTER_TIMEOUT:-5}"
+  REL_FILTER_PAR="${EGRESS_RELAY_FILTER_PARALLEL:-12}"
+  [ "$REL_FILTER_PAR" -ge 1 ] 2>/dev/null || REL_FILTER_PAR=1
+  [ "$REL_FILTER_PAR" -le 24 ] 2>/dev/null || REL_FILTER_PAR=24
+  [ "$REL_FILTER_KEEP" -ge 1 ] 2>/dev/null || REL_FILTER_KEEP=1
+  REL_FILTER_DIR="$EGRESS_STATE_DIR/relay-filter"
+  rm -rf "$REL_FILTER_DIR"
+  mkdir -p "$REL_FILTER_DIR"
+  grep '^relay' "$EGRESS_CANDIDATES_FILE" 2>/dev/null | head -n "$REL_FILTER_TOPN" > "$REL_FILTER_DIR/in.tsv" || true
+  REL_N=$(wc -l < "$REL_FILTER_DIR/in.tsv")
+  if [ "${REL_N:-0}" -gt 0 ]; then
+    relay_filter_one() {
+      local line="$1" idx="$2" hp ip port got
+      IFS=$'\t' read -r _k hp _s <<< "$line"
+      ip=${hp%:*}; port=${hp##*:}
+      got=$(curl -sS -m "$REL_FILTER_TMO" --noproxy '*' \
+        --connect-to "opencode.ai:443:${ip}:${port}" "$EGRESS_TRACE_URL" 2>/dev/null \
+        | awk -F= '/^ip=/{print $2; exit}')
+      if [ -n "$got" ]; then
+        printf '%s\n' "$line" > "$REL_FILTER_DIR/ok.$idx"
+      fi
+    }
+    n=0
+    while IFS= read -r line; do
+      n=$((n + 1))
+      relay_filter_one "$line" "$n" &
+      while [ "$(jobs -rp | wc -l)" -ge "$REL_FILTER_PAR" ]; do
+        wait -n 2>/dev/null || sleep 0.2
+      done
+    done < "$REL_FILTER_DIR/in.tsv"
+    wait
+    kept=0
+    : > "$REL_FILTER_DIR/keep.tsv"
+    for i in $(seq 1 "$n"); do
+      if [ -s "$REL_FILTER_DIR/ok.$i" ]; then
+        cat "$REL_FILTER_DIR/ok.$i" >> "$REL_FILTER_DIR/keep.tsv"
+        kept=$((kept + 1))
+      fi
+    done
+    if [ "$kept" -gt 0 ]; then
+      head -n "$REL_FILTER_KEEP" "$REL_FILTER_DIR/keep.tsv" > "$REL_FILTER_DIR/keep-head.tsv"
+      log "relay prefilter: kept $kept/$n reachable (probe cap $REL_FILTER_KEEP); relays are probed before any other candidate"
+    else
+      head -n "$REL_FILTER_KEEP" "$REL_FILTER_DIR/in.tsv" > "$REL_FILTER_DIR/keep-head.tsv"
+      log "::warning::relay prefilter found no reachable relay among $n; probing the first $REL_FILTER_KEEP with zengate anyway"
+    fi
+    { cat "$REL_FILTER_DIR/keep-head.tsv"; grep -v '^relay' "$EGRESS_CANDIDATES_FILE" || true; } > "$EGRESS_CANDIDATES_FILE.tmp"
+    mv "$EGRESS_CANDIDATES_FILE.tmp" "$EGRESS_CANDIDATES_FILE"
+    rm -rf "$REL_FILTER_DIR"
+    log "candidates after relay prefilter: $(wc -l < "$EGRESS_CANDIDATES_FILE")"
+  fi
+fi
+
+# R2578: dry-run prints the final candidate order without probing or writing
+# state. Used by the regression suite to prove direct is gone/last.
+if [ "${EGRESS_SELECT_DRYRUN:-0}" = "1" ]; then
+  log "dry-run ordered candidate list (no probes, no state writes):"
+  cat "$EGRESS_CANDIDATES_FILE"
+  exit 0
+fi
 
 # ---- order fresh candidates before recently used ones ---------------------
 # R2565 (operator priority): the old code promoted the previous run's relay to
@@ -180,6 +278,20 @@ fi
 fresh_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^0$' || true)
 used_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^1$' || true)
 log "selection plan: ${#KIND[@]} candidate(s), fresh=$fresh_count recently-used=$used_count reuse-window=${EGRESS_REUSE_WINDOW}s, parallel=$PARALLEL, timeout=${PREFLIGHT_TMO}s"
+
+# ---- start the real-preflight engine lazily -------------------------------
+# R2578: dry-run exits above, so this cannot spend provider quota or bind the
+# probe ports when the regression suite only checks candidate ordering.
+if [ "$PROBE_ENGINE" = "curl" ]; then
+  if bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
+    PROBE_ENGINE=zengate
+    PARALLEL=1
+    log "preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate)"
+    trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
+  else
+    log "warning: zengate probe unavailable; falling back to curl preflight"
+  fi
+fi
 
 i=0
 while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
@@ -276,7 +388,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
         egress_usage_add "$key" "$SELECTED_EGRESS" "$SELECTED_SOURCE" \
           || log "warning: failed to record usage for $key"
         why_note=""
-        [ "$kind" = "direct" ] && why_note=" (direct-first: candidate #1 passed)"
+        [ "$kind" = "direct" ] && why_note=" (direct explicitly allowed: last-resort candidate)"
         [ -n "$stable_egress" ] && why_note="$why_note (egress sticky over 8 parallel traces)"
         [ "$PROBE_ENGINE" = "zengate" ] && why_note="$why_note (nonce-verified)"
         [ "$used" = "1" ] && why_note="$why_note (reused after all fresh candidates failed)"
@@ -341,8 +453,8 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
 done
 
 if [ -z "$SELECTED_KIND" ]; then
-  log "ERROR: no candidate passed the real preflight (no 200); refusing direct fallback"
-  echo "::error::egress selection failed: no candidate answered 200 (the operator disabled the direct fallback)"
+  log "ERROR: no relay candidate passed the real preflight (no 200); refusing to use the runner IP"
+  echo "::error::egress selection failed: no proxy relay answered 200 (direct is disabled; set EGRESS_ALLOW_DIRECT=1 only for emergency diagnostics)"
   exit 1
 fi
 
@@ -387,4 +499,6 @@ if ! grep -q '^HTTPS_PROXY=http://127\.0\.0\.1:' "$RUNNER_TEMP/exit-proxy.env"; 
 fi
 
 echo "[egress-select] upstream=$SELECTED_UP kind=$SELECTED_KIND egress=$SELECTED_EGRESS source=$SELECTED_SOURCE direct=${DIRECT_IP:-unknown}"
+[ "$EGRESS_ALLOW_DIRECT" = "1" ] && DIRECT_MODE="allowed" || DIRECT_MODE="disabled"
+echo "[egress-select] provider path summary: kind=$SELECTED_KIND egress=$SELECTED_EGRESS verified=200 nonce=yes direct_mode=$DIRECT_MODE"
 exit 0

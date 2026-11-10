@@ -213,18 +213,22 @@ jobs:
       - name: Select egress proxy
         id: select_egress
         # R2562（运营者最新指令）：整个 run 只在这里选一次出口。
+        # R2578（运营者："现在是直连"）：relay 优先，direct 默认关闭；
         # - 黑名单启用，失败候选 6h 内不再重复探测；
-        # - 不限制候选数量、不设 quota 提前停止，探测到 200 为止；
-        # - 没有 200 时不做 direct 兜底，直接非零退出让本轮失败并通知原因。
+        # - 先用并行 trace 过滤 relay，再用真实 OpenCode 预检前 8 个；
+        # - 没有 relay 返回 200 时不做 direct 兜底，直接非零退出让本轮失败。
         if: steps.lock.outputs.acquired == 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
           EGRESS_ALLOW_PUBLIC_HTTP: "0"
+          EGRESS_ALLOW_DIRECT: ${{ vars.EGRESS_ALLOW_DIRECT }}
           EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_SELECT_MAX: "0"
           EGRESS_SELECT_BUDGET: "0"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
+          EGRESS_RELAY_FILTER_TOPN: "24"
+          EGRESS_RELAY_FILTER_KEEP: "8"
         run: |
           set +e
           bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
@@ -236,7 +240,7 @@ jobs:
             rm -f "$HOME/.config/opencode/exit-proxy.json" "$RUNNER_TEMP/exit-proxy.env" \
                   "$RUNNER_TEMP/egress/upstream" "$RUNNER_TEMP/egress/candidates.tsv"
             echo "reason=no egress candidate answered 200 (select-proxy rc=$rc)" >> "$GITHUB_OUTPUT"
-            echo "::error::egress selection failed: no candidate answered 200; refusing direct fallback and ending this run"
+            echo "::error::egress selection failed: no proxy relay answered 200; direct is disabled and this run will not fall back to the runner IP"
             exit 1
           fi
           if [ ! -s "$HOME/.config/opencode/exit-proxy.json" ]; then
@@ -283,6 +287,7 @@ jobs:
           TG_BRIDGE_FORCE_SERVE: "1"
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
           EGRESS_BLACKLIST_ENABLED: "1"
+          EGRESS_ALLOW_DIRECT: ${{ vars.EGRESS_ALLOW_DIRECT }}
           EGRESS_PREFLIGHT_TIMEOUT: "20"
         run: |
           set +e

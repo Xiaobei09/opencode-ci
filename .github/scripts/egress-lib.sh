@@ -16,7 +16,7 @@ EGRESS_BLACKLIST_ENABLED="${EGRESS_BLACKLIST_ENABLED:-1}"
 EGRESS_UPSTREAM_FILE="$EGRESS_STATE_DIR/upstream"
 EGRESS_EPOCH_FILE="$EGRESS_STATE_DIR/epoch"
 EGRESS_CANDIDATES_FILE="$EGRESS_STATE_DIR/candidates.tsv"
-EGRESS_STATE_FILE="$HOME/.config/opencode/exit-proxy.json"
+EGRESS_STATE_FILE="${EGRESS_STATE_FILE:-$HOME/.config/opencode/exit-proxy.json}"
 EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
 # R2565: anonymous free quota is per egress IP. Reusing the same relay across
 # runs means paying with a partially consumed bucket; the provider's 429

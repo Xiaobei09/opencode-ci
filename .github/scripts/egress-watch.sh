@@ -154,6 +154,15 @@ current_egress_ip() {
     | sed -n 's/^ip=//p' | head -1
 }
 
+# R2578 (operator: "现在是直连"): direct is not a production egress. If a stale
+# state file, an old snapshot or an emergency override still selected direct,
+# stop before the first provider request instead of silently burning the
+# runner IP. EGRESS_ALLOW_DIRECT=1 is the only way to permit it.
+if [ "$CUR_UP" = "direct" ] && [ "${EGRESS_ALLOW_DIRECT:-0}" != "1" ]; then
+  log "CRITICAL: upstream=direct while EGRESS_ALLOW_DIRECT=0; refusing to run provider traffic from the runner IP"
+  stop_run "direct egress selected while direct is disabled (no proxy exit); refusing to run"
+fi
+
 # R2567 (operator priority): verify before the first turn that provider traffic
 # really leaves through the selected upstream. A relay selection that reports
 # the runner's own direct IP means the proxy bypassed the relay (silent direct);
@@ -267,7 +276,33 @@ handle_quota() {
   record_failure quota "$line"
 }
 
+# R2578 (operator: "200 后仍 429"): the startup check only proves the first
+# minute. A relay can rotate its exit (or silently bypass to the runner IP)
+# after the first provider turn. Re-check through the same local proxy every
+# EGRESS_WATCH_RECHECK_SECONDS (default 300s); a changed/leaked egress stops the
+# round and blacklists the candidate, so the next run selects a fresh relay.
+RECHECK_SECONDS="${EGRESS_WATCH_RECHECK_SECONDS:-300}"
+last_path_check=$(egress_now)
+
 while IFS= read -r line; do
+  now=$(egress_now)
+  if [ "${EGRESS_WATCH_SKIP_EGRESS_PROBE:-0}" != "1" ] \
+     && { [ "$selected_kind" = "relay" ] || [ "$selected_kind" = "http" ]; } \
+     && [ "${RECHECK_SECONDS:-0}" -gt 0 ] 2>/dev/null \
+     && [ $((now - last_path_check)) -ge "$RECHECK_SECONDS" ]; then
+    last_path_check=$now
+    cur=$(current_egress_ip 2>/dev/null || true)
+    if [ -n "$cur" ] && [ -n "$selected_direct_ip" ] && [ "$cur" = "$selected_direct_ip" ]; then
+      log "CRITICAL: provider egress during run equals the runner direct IP ($cur); the selected $selected_kind upstream was bypassed"
+      stop_run "provider traffic bypassed the selected $selected_kind upstream during the run (provider_egress=$cur equals direct_ip); refusing silent direct"
+    elif [ -n "$cur" ] && [ -n "$selected_egress" ] && [ "$cur" != "$selected_egress" ]; then
+      log "CRITICAL: provider egress changed during run (selected=$selected_egress current=$cur); stopping and blacklisting the candidate"
+      blacklist_selected "egress-rotation-during-run" 21600 || true
+      stop_run "selected $selected_kind upstream egress rotated during the run (selected=$selected_egress current=$cur); ending this round so the next run selects a fresh egress"
+    else
+      log "egress path recheck ok (kind=$selected_kind egress=${cur:-unreachable})"
+    fi
+  fi
   case "$line" in
     *"Free usage limit reached"*|*"FreeUsageLimitError"*|*"free usage limit reached"*|*"provider.free-limit"*)
       handle_quota "$line"
