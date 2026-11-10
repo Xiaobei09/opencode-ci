@@ -258,6 +258,27 @@ env_sync_try() {
     echo "::warning::env-sync db size mismatch (${dbsz} vs ${dbexp}); using release packages"
     return 1
   fi
+  # R2569 (D2): a same-size but corrupt SQLite file must never be applied. The
+  # env-sync manifest only carries db_bytes, so a truncated/corrupt branch copy
+  # could otherwise replace a healthy local DB and lose the whole session store.
+  # quick_check is cheap (measured ~0.04s on 67MB) and rejects before rsync.
+  if [ -f "$d/payload/.local/share/opencode/opencode.db" ]; then
+    if ! python3 - "$d/payload/.local/share/opencode/opencode.db" <<'PY'
+import sqlite3, sys
+try:
+    c = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+    row = c.execute("PRAGMA quick_check").fetchone()
+    c.close()
+    sys.exit(0 if row and row[0] == "ok" else 1)
+except Exception:
+    sys.exit(1)
+PY
+    then
+      echo "::warning::env-sync db quick_check failed (corrupt payload); using release packages"
+      rm -rf "$d" 2>/dev/null
+      return 1
+    fi
+  fi
   if ! rsync -a "$d"/payload/ "$HOME"/ 2>/dev/null; then
     echo "::warning::env-sync payload apply failed; using release packages"
     return 1
