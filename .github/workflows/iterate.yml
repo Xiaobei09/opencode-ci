@@ -875,7 +875,12 @@ jobs:
           echo "snapshot timing: env-sync $(( $(date +%s) - SNAP_T0 ))s (skip_pack=$SKIP_ENV_PACK)"
           if [ "$SKIP_ENV_PACK" != 1 ]; then
           find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null || true
-          "${TAR_COMP[@]}" -C "$HOME" \
+          # R2573（D6）：tar|split 是管线，bash 默认只看最后一个命令的退出码 ——
+          # tar 中途失败（文件消失/权限/磁盘）会被 split 的成功掩盖，随后 meta 的
+          # bytes/sha 恰好按“半包”计算，读侧校验全绿却永久少数据。必须在同一
+          # 子 shell 开 pipefail，失败就退出本步：旧 release 原样保留。
+          if ! ( set -o pipefail
+            "${TAR_COMP[@]}" -C "$HOME" \
             --exclude='./work' \
             --exclude='./.cache' \
             --exclude='./.opencode/bin' \
@@ -890,15 +895,22 @@ jobs:
             --exclude='./.rustup' \
             --exclude='./.dotnet' \
             --exclude='./.opencode/.v2lib-live' \
-            . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." \
-            || echo "::warning::environment package failed"
+            . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." ); then
+            echo "::error::environment package failed (tar/split returned nonzero); refusing to publish a partial env package (previous generation kept)"
+            exit 1
+          fi
           fi
           REC_OK=0
           REC_T0=$(date +%s)
-          ( cd "$SESSIONS_DIR" && "${TAR_COMP[@]}" state tasks sessions loop-state.md 2>/dev/null ) \
-            | split -b "$SPLIT_SIZE" - "$OUT/records.tar.gz." \
-            && ls "$OUT"/records.tar.gz.* >/dev/null 2>&1 && REC_OK=1 \
-            || echo "::warning::records package failed; readers will use the copy embedded in the targets package"
+          if ( set -o pipefail; cd "$SESSIONS_DIR" || exit 1; "${TAR_COMP[@]}" state tasks sessions loop-state.md 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/records.tar.gz." ) \
+             && ls "$OUT"/records.tar.gz.* >/dev/null 2>&1; then
+            REC_OK=1
+          else
+            # R2573（D6）：半包不得留在 $OUT 被后续 stage/upload 当成“最新 records”
+            # 发出去。删掉它，meta 不写 records，读侧继续用 targets 内嵌副本。
+            echo "::warning::records package failed (tar/split nonzero); dropping the partial asset; readers will use the copy embedded in the targets package"
+            rm -f "$OUT"/records.tar.gz.* 2>/dev/null || true
+          fi
           echo "snapshot timing: records pack $(( $(date +%s) - REC_T0 ))s, $(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c) bytes"
           TGT_FP=""; TGT_MODE=""
           IDX="$SESSIONS_DIR/workspace-snapshots/index.json"
@@ -939,9 +951,20 @@ jobs:
                 [ -n "$sd" ] && SLIM_EXCLUDES+=("--exclude=$sd/.git" "--exclude=$sd/.git/*")
               done < <(jq -r '.snapshots[]? | select(.mode == "dirtar-slim") | .dir // empty' "$IDX" 2>/dev/null)
             fi
-            ( cd "$SESSIONS_DIR" && "${TGT_TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null ) \
-              | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." \
-              || echo "::warning::target workspace package failed"
+            # R2573（D6）：与 env 同因 —— tar|split 默认只看 split 的退出码。
+            # 半包一旦发布，meta 的 bytes/sha 与半包一致，读侧“校验通过”；
+            # 缺失的目标目录会在下一代 save 时被移出 index，等于静默丢工作区。
+            # 失败即退出本步，保留上一代完整包。
+            if ! ( set -o pipefail
+              cd "$SESSIONS_DIR" || exit 1
+              "${TGT_TAR_COMP[@]}" "${SLIM_EXCLUDES[@]}" --exclude='*/.git/*.lock' workspace-snapshots state tasks sessions loop-state.md -C "$TARGETS_DIR" ${TGT_DIRS[@]+"${TGT_DIRS[@]}"} 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/targets.tar.gz." ); then
+              echo "::error::target workspace package failed (tar/split returned nonzero); refusing to publish a partial targets package (previous generation kept)"
+              exit 1
+            fi
+            if ! ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; then
+              echo "::error::target workspace package produced no volumes; refusing to publish (previous generation kept)"
+              exit 1
+            fi
             echo "snapshot timing: targets pack $(( $(date +%s) - TGT_PACK_T0 ))s, $(cat "$OUT"/targets.tar.gz.* 2>/dev/null | wc -c) bytes"
           fi
           UP_T0=$(date +%s)
