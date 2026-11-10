@@ -384,6 +384,21 @@ for d in "$HOME/.config/opencode/v2lib" "$HOME/.opencode/v2lib"; do
 done
 [ "$sync_checked" -gt 0 ] || echo "::warning::v2lib code sync not verified (source or runtime dir missing)"
 
+# R2571: multi-bot entry lives in config/plugins (copied by the loop above). If
+# that copy silently stops working, bot-id dedupe / duplicate-token diagnostics
+# stay on the old code and only show up as 409 or duplicate replies in Telegram.
+# Prove the entry is live, same as the v2lib fingerprint above.
+if [ -f "$ENV_SRC/config/plugins/tg-bridge-v2.ts" ] && [ -f "$HOME/.config/opencode/plugins/tg-bridge-v2.ts" ]; then
+  if cmp -s "$ENV_SRC/config/plugins/tg-bridge-v2.ts" "$HOME/.config/opencode/plugins/tg-bridge-v2.ts"; then
+    echo "plugin code sync ok: tg-bridge-v2.ts matches repo (sha=$(sha256sum "$HOME/.config/opencode/plugins/tg-bridge-v2.ts" | cut -c1-12))"
+  else
+    echo "::error::plugin code sync mismatch at $HOME/.config/opencode/plugins/tg-bridge-v2.ts (repo != runtime)"
+    exit 1
+  fi
+else
+  echo "::warning::plugin code sync not verified (source or runtime entry missing)"
+fi
+
 if [ ! -d "$HOME/.config/opencode/plugins" ]; then
   echo "::warning::bridge plugins missing; continuing without them"
   exit 0
