@@ -139,26 +139,51 @@ blacklist_selected() {
   fi
 }
 
+# current_egress_ip: ask the same proxy the OpenCode process uses. Used only to
+# make a 200->quota stop auditable (relays can rotate their exit IP).
+current_egress_ip() {
+  if [ "${EGRESS_WATCH_SKIP_EGRESS_PROBE:-0}" = "1" ]; then
+    echo "skipped"
+    return 0
+  fi
+  curl -sS -m 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    | sed -n 's/^ip=//p' | head -1
+}
+
 # handle_quota <line>
 handle_quota() {
-  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl
+  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl cur_egress
   now=$(egress_now)
 
-  # R2564 (operator priority: preflight 200 then 429): auto-continue re-logs
-  # restored pre-run errors on startup. Those are NOT evidence about this run's
-  # egress. The plugin now tags every quota line with this_run/msg_at; ignore
-  # restored ones here (defense in depth even if the plugin-side gate regresses).
-  if printf '%s' "$line" | grep -q 'this_run=false'; then
-    log "stale quota line from restored session (this_run=false); ignoring"
+  # R2566 (operator priority: still widespread 429 after a 200 preflight):
+  # only the structured quota line emitted by auto-continue is evidence. Other
+  # plugin lines also contain the error name (`eval ... error=provider.free-limit
+  # -> RECOVER`, tg-bridge error cards), and treating them as quota made three
+  # fresh relays look exhausted at ~63s in R2565. Require the explicit source
+  # marker plus positive this_run=true; unverifiable lines are ignored.
+  if ! printf '%s' "$line" | grep -q 'src=auto-continue'; then
+    log "quota-like line without src=auto-continue; ignoring for stop/blacklist: ${line:0:220}"
+    return 0
+  fi
+  if ! printf '%s' "$line" | grep -q 'this_run=true'; then
+    log "stale/unattributed quota line (this_run!=true); ignoring"
     return 0
   fi
   msg_at=$(printf '%s' "$line" | sed -nE 's/.*msg_at=([^ ,)]+).*/\1/p' | head -1)
-  if [ -n "$msg_at" ] && [ "$msg_at" != "?" ] && [ "$selected_at" -gt 0 ]; then
-    msg_at_epoch=$(date -u -d "$msg_at" +%s 2>/dev/null || true)
-    if [ -n "$msg_at_epoch" ] && [ "$msg_at_epoch" -lt "$selected_at" ]; then
-      log "stale quota line msg_at=$msg_at predates selection (selected=$selected_at); ignoring"
-      return 0
-    fi
+  if [ -z "$msg_at" ] || [ "$msg_at" = "?" ]; then
+    # No timestamp means we cannot prove the error belongs to this run. The
+    # plugin's own 3-consecutive-error policy still ends a genuinely bad round.
+    log "quota line has no parseable msg_at; ignoring for stop/blacklist"
+    return 0
+  fi
+  msg_at_epoch=$(date -u -d "$msg_at" +%s 2>/dev/null || true)
+  if [ -z "$msg_at_epoch" ] || [ "$selected_at" -le 0 ]; then
+    log "quota line unverifiable (msg_at=$msg_at epoch=${msg_at_epoch:-?} selected_at=$selected_at); ignoring for stop/blacklist"
+    return 0
+  fi
+  if [ "$msg_at_epoch" -lt "$selected_at" ]; then
+    log "stale quota line msg_at=$msg_at predates selection (selected=$selected_at); ignoring"
+    return 0
   fi
 
   # Delayed lines from an upstream other than the one this run selected are
@@ -185,9 +210,14 @@ handle_quota() {
   ttl=21600
   if [ -n "$retry_after" ] && [ "$retry_after" -gt "$ttl" ] 2>/dev/null; then ttl="$retry_after"; fi
   if [ "$selected_at" -gt 0 ] && [ $((now - selected_at)) -le "$PROBE_FALSE_WINDOW" ]; then
-    log "selected egress answered 200 in preflight but hit quota after $((now - selected_at))s (upstream=$CUR_UP, retry_after=${retry_after:-?}s); stopping this round and blacklisting for ${ttl}s"
+    cur_egress=$(current_egress_ip || true)
+    [ -n "$cur_egress" ] || cur_egress="?"
+    log "selected egress answered 200 in preflight but hit quota after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); stopping this round and blacklisting for ${ttl}s"
+    if [ "$cur_egress" != "?" ] && [ -n "$selected_egress" ] && [ "$cur_egress" != "$selected_egress" ]; then
+      log "warning: relay egress rotated after selection (selected=$selected_egress current=$cur_egress); quota was hit on the current exit but the candidate entry stayed the same"
+    fi
     blacklist_selected "quota-after-preflight-200" "$ttl" || true
-    stop_run "selected egress $CUR_UP answered 200 in preflight but hit quota after $((now - selected_at))s; blacklisted for ${ttl}s; ending this round so the next run selects a fresh egress"
+    stop_run "selected egress $CUR_UP answered 200 in preflight but hit quota after $((now - selected_at))s (current_egress=$cur_egress); blacklisted for ${ttl}s; ending this round so the next run selects a fresh egress"
   fi
 
   log "quota error detected (upstream=$CUR_UP, retry_after=${retry_after:-?}s)"

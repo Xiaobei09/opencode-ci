@@ -143,6 +143,12 @@ log "candidates: $(wc -l < "$EGRESS_CANDIDATES_FILE")"
 
 # ---- pick the first candidate that passes the real preflight --------------
 SELECTED_KIND=""; SELECTED_TARGET=""; SELECTED_SOURCE=""; SELECTED_UP=""; SELECTED_EGRESS=""
+# R2566: a direct 429 with a short Retry-After is usually a burst window, not an
+# exhausted quota bucket. Retry direct exactly once instead of blacklisting the
+# runner IP for 6h (which forces the run onto shared relays and is suspected in
+# the "200 then 429" cluster).
+DIRECT_SHORT_RETRY_DONE=0
+EGRESS_SHORT_RETRY_MAX="${EGRESS_SHORT_RETRY_MAX:-300}"
 # Snapshot the ordered list, then probe small batches in parallel. We still pick
 # the earliest candidate in list order that succeeds, so priority is unchanged.
 mapfile -t CAND_LINES < "$EGRESS_CANDIDATES_FILE"
@@ -293,6 +299,26 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     # retry-after ~12.9h; a fixed 6h blacklist would retry that exhausted egress
     # too early. Use the longer of the operator's 6h floor and the provider hint.
     if [ -n "$ra" ] && [ "$ra" -gt "$ttl" ] 2>/dev/null; then ttl="$ra"; fi
+    # R2566: direct short-window 429. Do not treat `retry_after=30s` as a
+    # 6h-exhausted bucket; wait out (a capped part of) the hint and re-probe the
+    # same runner IP once. Only a second failure is blacklisted.
+    if [ "$kind" = "direct" ] && [ "$why" = "quota" ] && [ -n "$ra" ] \
+       && [ "$ra" -gt 0 ] 2>/dev/null && [ "$ra" -le "$EGRESS_SHORT_RETRY_MAX" ] 2>/dev/null \
+       && [ "$DIRECT_SHORT_RETRY_DONE" = "0" ]; then
+      DIRECT_SHORT_RETRY_DONE=1
+      # Keep the whole non-OpenCode phase under the operator's 1-minute target:
+      # honor at most 20s of the hint, then re-probe once.
+      wait_s="$ra"; [ "$wait_s" -gt 20 ] && wait_s=20
+      log "candidate direct short quota code=$code retry_after=${ra}s (<= ${EGRESS_SHORT_RETRY_MAX}s); retrying once in ${wait_s}s instead of blacklisting for ${ttl}s"
+      sleep "$wait_s"
+      # Put the retry immediately next in line; the rest of the ordered list is
+      # untouched.
+      KIND=("${KIND[@]:0:i}" "$kind" "${KIND[@]:i}")
+      TARGET=("${TARGET[@]:0:i}" "$target" "${TARGET[@]:i}")
+      SOURCE=("${SOURCE[@]:0:i}" "$source" "${SOURCE[@]:i}")
+      PREUSED=("${PREUSED[@]:0:i}" "0" "${PREUSED[@]:i}")
+      continue
+    fi
     if [ "$kind" = "direct" ]; then
       failed_egress="${DIRECT_IP:-}"
     elif [ "$why" = "quota" ] || [ "$why" = "body_error" ]; then
