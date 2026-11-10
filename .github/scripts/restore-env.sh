@@ -379,6 +379,16 @@ for d in "$HOME/.config/opencode/v2lib" "$HOME/.opencode/v2lib"; do
     echo "::error::v2lib code sync mismatch at $d/_v2compat.ts (repo != runtime)"
     exit 1
   fi
+  # R2572: halt-release.ts is imported by both tg-bridge.ts and auto-continue.ts.
+  # If it is missing/stale at runtime, the bridge can fail to load (or keep using
+  # the old state machine) while the rest of the sync looks green.
+  if [ -f "$ENV_SRC/config/v2lib/halt-release.ts" ]; then
+    if ! cmp -s "$ENV_SRC/config/v2lib/halt-release.ts" "$d/halt-release.ts"; then
+      echo "::error::v2lib code sync mismatch at $d/halt-release.ts (repo != runtime)"
+      exit 1
+    fi
+    echo "v2lib code sync ok: $d/halt-release.ts matches repo (sha=$(sha256sum "$d/halt-release.ts" | cut -c1-12))"
+  fi
   sync_checked=$((sync_checked + 1))
   echo "v2lib code sync ok: $d/auto-continue.ts matches repo (sha=$(sha256sum "$d/auto-continue.ts" | cut -c1-12))"
 done
