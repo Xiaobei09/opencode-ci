@@ -226,7 +226,13 @@ egress_write_upstream() {
 # egress_write_state <kind> <upstream> <egress_ip> <source> <direct_ip>
 egress_write_state() {
   local kind="$1" upstream="$2" egress="$3" source="$4" direct="$5"
-  mkdir -p "$(dirname "$EGRESS_STATE_FILE")"
+  local dir tmp
+  dir="$(dirname "$EGRESS_STATE_FILE")"
+  # R2575 (D8): a failed write used to leave an empty/partial exit-proxy.json
+  # while the caller carried on. Write atomically and let the caller fail
+  # closed: no state file means no egress proof for the next step.
+  mkdir -p "$dir" || return 1
+  tmp="$EGRESS_STATE_FILE.tmp.$$"
   jq -n \
     --arg proxy "127.0.0.1:${EGRESS_LOCAL_PORT}" \
     --arg scheme "http" \
@@ -238,8 +244,10 @@ egress_write_state() {
     --arg at "$(egress_iso)" \
     '{proxy:$proxy, scheme:$scheme, upstream:$upstream, kind:$kind,
       egress_ip:$egress, direct_ip:$direct, latency_s:"",
-      source:$source, picked_at:$at}' > "$EGRESS_STATE_FILE"
+      source:$source, picked_at:$at}' > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$EGRESS_STATE_FILE" || { rm -f "$tmp"; return 1; }
   chmod 600 "$EGRESS_STATE_FILE" 2>/dev/null || true
+  return 0
 }
 
 # egress_trace_relay <ip:port> [timeout]

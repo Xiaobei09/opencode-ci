@@ -244,6 +244,17 @@ jobs:
             echo "::error::egress selection reported success but exit-proxy state is missing; ending this run"
             exit 1
           fi
+          # R2575 (D8): the state file alone is not enough. Run OpenCode consumes
+          # this env handoff to start the local proxy; without it the round used
+          # to fall back to a direct connection while selection looked green.
+          if [ ! -s "$RUNNER_TEMP/exit-proxy.env" ] \
+             || ! grep -q '^HTTPS_PROXY=http://127\.0\.0\.1:' "$RUNNER_TEMP/exit-proxy.env"; then
+            rm -f "$HOME/.config/opencode/exit-proxy.json" "$RUNNER_TEMP/exit-proxy.env" \
+                  "$RUNNER_TEMP/egress/upstream" "$RUNNER_TEMP/egress/candidates.tsv"
+            echo "reason=egress selection reported success but the proxy handoff env is missing/incomplete" >> "$GITHUB_OUTPUT"
+            echo "::error::egress selection reported success but $RUNNER_TEMP/exit-proxy.env is missing/incomplete; ending this run (no direct fallback)"
+            exit 1
+          fi
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             # R2520：与 TG 错误卡 exitProxySummary() 使用完全相同的键名/顺序：
             # kind → upstream → local → egress → direct。旧格式 `CI egress: direct direct`
@@ -294,38 +305,66 @@ jobs:
             fi
           }
           trap cleanup_egress EXIT
-          if [ -f "$RUNNER_TEMP/exit-proxy.env" ]; then
-            set -a
-            # shellcheck disable=SC1091
-            . "$RUNNER_TEMP/exit-proxy.env"
-            set +a
-            python3 "$GITHUB_WORKSPACE/.github/scripts/egress-proxy.py" \
-              > "$EGRESS_DIR/proxy.log" 2>&1 &
-            PROXY_PID=$!
-            for _ in $(seq 1 12); do
-              if ! kill -0 "$PROXY_PID" 2>/dev/null; then break; fi
-              if curl -sS -m 4 -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
-                   -o /dev/null https://opencode.ai/cdn-cgi/trace 2>/dev/null; then
-                PROXY_READY=1
-                break
-              fi
-              sleep 0.25
-            done
-            if [ "$PROXY_READY" = 1 ]; then
-              echo "egress proxy: ${HTTPS_PROXY:-none} kind=$(jq -r '.kind // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null) upstream=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?') egress=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
-              bash "$GITHUB_WORKSPACE/.github/scripts/egress-watch.sh" "$RUN_LOG" \
-                >> "$EGRESS_DIR/watch.log" 2>&1 &
-              WATCH_PID=$!
-            else
-              # R2567 (operator): a failed local proxy must not silently fall
-              # back to direct; otherwise the run burns the runner IP's quota
-              # while the logs still claim a relay was selected.
-              echo "::error::local egress proxy is not ready (no provider trace through it); refusing direct fallback and ending this run"
-              tail -20 "$EGRESS_DIR/proxy.log" 2>/dev/null || true
+          # R2575 (D8): the old `else` branch treated a missing handoff as
+          # "direct connection" and started OpenCode with no proxy at all. Since
+          # selection always writes the handoff before this step, absence means
+          # selection/handoff failed: end the round instead of silently burning
+          # the runner IP's quota.
+          if [ ! -s "$RUNNER_TEMP/exit-proxy.env" ]; then
+            echo "::error::egress handoff $RUNNER_TEMP/exit-proxy.env is missing; refusing to start OpenCode without a verified egress (no direct fallback)"
+            exit 1
+          fi
+          # R2575 (D8): the watcher proves provider=selected using this state
+          # file; if it is missing the startup path check is skipped entirely.
+          if [ ! -s "$HOME/.config/opencode/exit-proxy.json" ]; then
+            echo "::error::egress state $HOME/.config/opencode/exit-proxy.json is missing; refusing to start OpenCode without a verifiable egress (no direct fallback)"
+            exit 1
+          fi
+          set -a
+          # shellcheck disable=SC1091
+          . "$RUNNER_TEMP/exit-proxy.env"
+          set +a
+          if [ -z "${HTTPS_PROXY:-}" ] || [ -z "${HTTP_PROXY:-}" ]; then
+            echo "::error::egress handoff $RUNNER_TEMP/exit-proxy.env is incomplete (HTTP(S)_PROXY unset); refusing to start OpenCode without a verified egress (no direct fallback)"
+            exit 1
+          fi
+          if [ ! -s "$EGRESS_DIR/upstream" ]; then
+            echo "::error::egress upstream $EGRESS_DIR/upstream is missing; refusing to start OpenCode without a verified egress (no direct fallback)"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/.github/scripts/egress-proxy.py" \
+            > "$EGRESS_DIR/proxy.log" 2>&1 &
+          PROXY_PID=$!
+          for _ in $(seq 1 12); do
+            if ! kill -0 "$PROXY_PID" 2>/dev/null; then break; fi
+            if curl -sS -m 4 -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
+                 -o /dev/null https://opencode.ai/cdn-cgi/trace 2>/dev/null; then
+              PROXY_READY=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$PROXY_READY" = 1 ]; then
+            echo "egress proxy: ${HTTPS_PROXY:-none} kind=$(jq -r '.kind // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null) upstream=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?') egress=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+            bash "$GITHUB_WORKSPACE/.github/scripts/egress-watch.sh" "$RUN_LOG" \
+              >> "$EGRESS_DIR/watch.log" 2>&1 &
+            WATCH_PID=$!
+            # R2575 (D8): a watcher that dies at startup leaves the round with
+            # no quota/failure monitoring. Its own pre-start rejection is
+            # handled by the stop marker below; any other early exit is fatal.
+            sleep 1
+            if ! kill -0 "$WATCH_PID" 2>/dev/null && [ ! -f "$EGRESS_DIR/stop" ]; then
+              echo "::error::egress watcher exited during startup without a stop marker; refusing to run OpenCode unmonitored"
+              tail -20 "$EGRESS_DIR/watch.log" 2>/dev/null || true
               exit 1
             fi
           else
-            echo "egress proxy: none (direct connection)"
+            # R2567 (operator): a failed local proxy must not silently fall
+            # back to direct; otherwise the run burns the runner IP's quota
+            # while the logs still claim a relay was selected.
+            echo "::error::local egress proxy is not ready (no provider trace through it); refusing direct fallback and ending this run"
+            tail -20 "$EGRESS_DIR/proxy.log" 2>/dev/null || true
+            exit 1
           fi
           BUDGET="${BUDGET_SECONDS:-19800}"
           SID=""

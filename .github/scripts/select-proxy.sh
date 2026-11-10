@@ -346,11 +346,23 @@ if [ -z "$SELECTED_KIND" ]; then
   exit 1
 fi
 
-egress_write_upstream "$SELECTED_UP"
-egress_write_state "$SELECTED_KIND" "$SELECTED_UP" "$SELECTED_EGRESS" "$SELECTED_SOURCE" "${DIRECT_IP:-unknown}"
+# R2575 (D8): the handoff files are the only proof the Run OpenCode step has
+# that an egress was selected. A write failure here used to leave selection
+# "green" while the next step found no exit-proxy.env and silently used the
+# runner's direct connection. Every write is checked and any failure ends
+# selection (fail closed, no direct fallback).
+egress_write_upstream "$SELECTED_UP" || {
+  echo "::error::failed to write egress upstream ($EGRESS_UPSTREAM_FILE); refusing to run without a verified egress"
+  exit 1
+}
+egress_write_state "$SELECTED_KIND" "$SELECTED_UP" "$SELECTED_EGRESS" "$SELECTED_SOURCE" "${DIRECT_IP:-unknown}" || {
+  echo "::error::failed to write egress state ($EGRESS_STATE_FILE); refusing to run without a verified egress"
+  exit 1
+}
 
 # ---- handoff to the Run OpenCode step ------------------------------------
 NO_PROXY_LIST="localhost,127.0.0.1,::1,api.telegram.org,github.com,api.github.com,objects.githubusercontent.com,release-assets.githubusercontent.com,raw.githubusercontent.com,codeload.github.com,registry.npmjs.org"
+HANDOFF_TMP="$RUNNER_TEMP/exit-proxy.env.tmp.$$"
 {
   echo "HTTP_PROXY=http://127.0.0.1:${EGRESS_LOCAL_PORT}"
   echo "HTTPS_PROXY=http://127.0.0.1:${EGRESS_LOCAL_PORT}"
@@ -358,8 +370,21 @@ NO_PROXY_LIST="localhost,127.0.0.1,::1,api.telegram.org,github.com,api.github.co
   echo "https_proxy=http://127.0.0.1:${EGRESS_LOCAL_PORT}"
   echo "NO_PROXY=${NO_PROXY_LIST}"
   echo "no_proxy=${NO_PROXY_LIST}"
-} > "$RUNNER_TEMP/exit-proxy.env"
+} > "$HANDOFF_TMP" || {
+  rm -f "$HANDOFF_TMP"
+  echo "::error::failed to write egress handoff ($RUNNER_TEMP/exit-proxy.env); refusing to run without a verified egress"
+  exit 1
+}
+mv -f "$HANDOFF_TMP" "$RUNNER_TEMP/exit-proxy.env" || {
+  rm -f "$HANDOFF_TMP"
+  echo "::error::failed to install egress handoff ($RUNNER_TEMP/exit-proxy.env); refusing to run without a verified egress"
+  exit 1
+}
 chmod 600 "$RUNNER_TEMP/exit-proxy.env" 2>/dev/null || true
+if ! grep -q '^HTTPS_PROXY=http://127\.0\.0\.1:' "$RUNNER_TEMP/exit-proxy.env"; then
+  echo "::error::egress handoff env is incomplete ($RUNNER_TEMP/exit-proxy.env); refusing to run without a verified egress"
+  exit 1
+fi
 
 echo "[egress-select] upstream=$SELECTED_UP kind=$SELECTED_KIND egress=$SELECTED_EGRESS source=$SELECTED_SOURCE direct=${DIRECT_IP:-unknown}"
 exit 0
