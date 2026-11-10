@@ -286,6 +286,10 @@ jobs:
           EGRESS_PREFLIGHT_TIMEOUT: "20"
         run: |
           set +e
+          # R2576 (D9): stamp the OpenCode phase so the snapshot step can report
+          # the real non-opencode wall time (setup + post-run) instead of only
+          # the setup half. OPENCODE_START_T0 is the boundary between the two.
+          echo "OPENCODE_START_T0=$(date +%s)" >> "$GITHUB_ENV"
           RUN_LOG="$RUNNER_TEMP/opencode-run.log"
           EGRESS_DIR="${EGRESS_STATE_DIR:-$RUNNER_TEMP/egress}"
           export EGRESS_STATE_DIR="$EGRESS_DIR"
@@ -511,6 +515,9 @@ jobs:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
         run: |
           set +e
+          # R2576 (D9): start of the post-opencode phase; paired with
+          # OPENCODE_START_T0 to report the non-opencode wall time at run end.
+          echo "POST_OPENCODE_T0=$(date +%s)" >> "$GITHUB_ENV"
           repo="${{ github.repository }}"
           outcome="${{ steps.run_opencode.outcome }}"
           watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
@@ -1190,6 +1197,23 @@ jobs:
             echo "::warning::environment package is empty"
           fi
           echo "snapshot timing: publish $(( $(date +%s) - UP_T0 ))s, total $(( $(date +%s) - SNAP_T0 ))s"
+          # R2576 (D9): report the complete non-opencode wall time for this run:
+          # setup (job start → OpenCode start) + post-run (failure policy +
+          # relay + notify + snapshot). Target <60s.
+          POST_T0="${POST_OPENCODE_T0:-0}"
+          OPEN_START_T0="${OPENCODE_START_T0:-0}"
+          if [ "$POST_T0" -gt 0 ] 2>/dev/null && [ "$OPEN_START_T0" -gt 0 ] 2>/dev/null \
+             && [ -n "${PRE_OPENCODE_T0:-}" ]; then
+            PRE_S=$(( OPEN_START_T0 - PRE_OPENCODE_T0 ))
+            POST_S=$(( $(date +%s) - POST_T0 ))
+            TOTAL_S=$(( PRE_S + POST_S ))
+            echo "non-opencode timing: total ${TOTAL_S}s (setup ${PRE_S}s + post-run ${POST_S}s; target <60s)"
+            if [ "$TOTAL_S" -gt 60 ]; then
+              echo "::warning::non-opencode CI time ${TOTAL_S}s exceeds the 60s target (setup ${PRE_S}s + post-run ${POST_S}s)"
+            fi
+          else
+            echo "::warning::non-opencode timing unavailable (missing PRE_OPENCODE_T0/OPENCODE_START_T0/POST_OPENCODE_T0)"
+          fi
           rm -rf "$OUT"
 
       - name: Rebuild repository baseline
