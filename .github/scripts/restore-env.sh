@@ -278,6 +278,7 @@ PY
       rm -rf "$d" 2>/dev/null
       return 1
     fi
+    echo "env-sync db quick_check ok (${dbsz} bytes)"
   fi
   if ! rsync -a "$d"/payload/ "$HOME"/ 2>/dev/null; then
     echo "::warning::env-sync payload apply failed; using release packages"
