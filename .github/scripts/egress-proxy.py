@@ -11,6 +11,12 @@ reads <state-dir>/upstream:
 Non-provider traffic always goes direct, so GitHub/Telegram are never routed
 through a public relay.
 
+R2567 (operator: never silently direct): provider traffic is only allowed when
+the upstream file explicitly says `direct`, `relay:` or `http:`. A missing or
+malformed upstream is a hard error (502), never an implicit direct connection;
+otherwise a broken proxy would quietly burn the runner IP's quota while the
+selector believed a relay was in use.
+
 TLS is end-to-end: this process only forwards bytes and never terminates TLS.
 
 Control files:
@@ -56,9 +62,9 @@ current_epoch = 0
 def read_upstream():
     try:
         with open(UPSTREAM_FILE, encoding="utf-8") as f:
-            return f.readline().strip() or "direct"
+            return f.readline().strip()
     except OSError:
-        return "direct"
+        return ""
 
 
 def read_epoch():
@@ -154,6 +160,7 @@ def open_http_proxy(proxy_hp, host, port):
 def handle(client):
     upstream = None
     target = "?"
+    up = "?"
     try:
         client.settimeout(20)
         head, rest = read_headers(client)
@@ -175,15 +182,25 @@ def handle(client):
         up = read_upstream()
         route_provider = provider_target(host) and port == PROVIDER_PORT
         extra = b""
-        if up.startswith("relay:") and route_provider:
+        if route_provider and up.startswith("relay:"):
             hp = up[len("relay:"):]
             ip, rport_s = hp.rsplit(":", 1)
             upstream = socket.create_connection((ip, int(rport_s)), timeout=15)
             label = hp
-        elif up.startswith("http:") and route_provider:
+        elif route_provider and up.startswith("http:"):
             hp = up[len("http:"):]
             upstream, extra = open_http_proxy(hp, host, port)
             label = hp
+        elif route_provider and up == "direct":
+            upstream = socket.create_connection((host, port), timeout=15)
+            label = "direct"
+        elif route_provider:
+            # R2567: never silently fall back to direct for provider traffic.
+            # Either the selection explicitly chose direct, or we fail closed.
+            raise OSError(
+                f"provider {host}:{port} has invalid/missing upstream {up!r}; "
+                "refusing implicit direct"
+            )
         else:
             upstream = socket.create_connection((host, port), timeout=15)
             label = "direct"
@@ -208,7 +225,7 @@ def handle(client):
         threading.Thread(target=pipe, args=(client, upstream, target), daemon=True).start()
         pipe(upstream, client, target)
     except Exception as exc:  # noqa: BLE001
-        print(f"error target={target} {exc}", flush=True)
+        print(f"error target={target} upstream={up!r} {exc}", flush=True)
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         except OSError:

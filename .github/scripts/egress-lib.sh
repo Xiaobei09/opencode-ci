@@ -25,6 +25,13 @@ EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
 # starts on a fresh IP (the operator's "new run -> new egress -> new quota").
 EGRESS_REUSE_WINDOW="${EGRESS_REUSE_WINDOW:-46800}"
 EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
+# R2567 (operator: is provider traffic really leaving through the selected
+# proxy?): the old probe used www.cloudflare.com, which the local CONNECT proxy
+# always sends direct, so a relay selection always looked like "direct" and the
+# check could not prove where provider traffic went. Probe a provider-owned
+# Cloudflare endpoint instead: opencode.ai is routed through the selected
+# upstream by the same rules as the real inference requests.
+EGRESS_TRACE_URL="${EGRESS_TRACE_URL:-https://opencode.ai/cdn-cgi/trace}"
 
 egress_now() { date +%s; }
 egress_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -206,8 +213,13 @@ egress_epoch_bump() {
 }
 
 # egress_write_upstream <direct|relay:ip:port|http:host:port>
+# The proxy reads this file on every CONNECT. Write atomically so it can never
+# observe a partially written value (which would be an invalid upstream and,
+# before R2567, silently fell back to direct).
 egress_write_upstream() {
-  printf '%s\n' "$1" > "$EGRESS_UPSTREAM_FILE"
+  local tmp="$EGRESS_UPSTREAM_FILE.tmp.$$"
+  printf '%s\n' "$1" > "$tmp" || return 1
+  mv -f "$tmp" "$EGRESS_UPSTREAM_FILE" || { rm -f "$tmp"; return 1; }
   egress_epoch_bump
 }
 
@@ -231,11 +243,13 @@ egress_write_state() {
 }
 
 # egress_trace_relay <ip:port> [timeout]
+# `--connect-to` keeps TLS SNI/Host = opencode.ai while the TCP connection goes
+# to the relay, exactly like the real inference traffic.
 egress_trace_relay() {
   local hp="$1" tmo="${2:-10}" ip port
   ip=${hp%:*}; port=${hp##*:}
-  curl -sS -m "$tmo" --noproxy '*' --connect-to "www.cloudflare.com:443:$ip:$port" \
-    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+  curl -sS -m "$tmo" --noproxy '*' --connect-to "opencode.ai:443:$ip:$port" \
+    "$EGRESS_TRACE_URL" 2>/dev/null \
     | awk -F= '/^ip=/{print $2; exit}'
 }
 
@@ -243,14 +257,14 @@ egress_trace_relay() {
 egress_trace_http() {
   local hp="$1" tmo="${2:-10}"
   curl -sS -m "$tmo" -x "http://$hp" \
-    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    "$EGRESS_TRACE_URL" 2>/dev/null \
     | awk -F= '/^ip=/{print $2; exit}'
 }
 
 # egress_trace_direct [timeout]
 egress_trace_direct() {
   curl -sS -m "${1:-10}" --noproxy '*' \
-    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    "$EGRESS_TRACE_URL" 2>/dev/null \
     | awk -F= '/^ip=/{print $2; exit}'
 }
 

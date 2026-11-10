@@ -74,7 +74,7 @@ else
 fi
 
 DIRECT_IP=$(egress_trace_direct)
-DIRECT_COLO=$(curl -sS -m 10 --noproxy '*' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^colo=/{print $2}')
+DIRECT_COLO=$(curl -sS -m 10 --noproxy '*' "$EGRESS_TRACE_URL" 2>/dev/null | awk -F= '/^colo=/{print $2}')
 log "direct egress=${DIRECT_IP:-unknown} colo=${DIRECT_COLO:-?}"
 
 # ---- candidate list -------------------------------------------------------

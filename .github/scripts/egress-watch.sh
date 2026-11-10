@@ -139,16 +139,52 @@ blacklist_selected() {
   fi
 }
 
-# current_egress_ip: ask the same proxy the OpenCode process uses. Used only to
-# make a 200->quota stop auditable (relays can rotate their exit IP).
+# current_egress_ip: ask the same proxy the OpenCode process uses. The probe
+# host must be a provider host: the local proxy only routes provider traffic
+# through the selected upstream, so www.cloudflare.com would always report the
+# runner's direct IP even when a relay is in use (R2567).
 current_egress_ip() {
   if [ "${EGRESS_WATCH_SKIP_EGRESS_PROBE:-0}" = "1" ]; then
     echo "skipped"
     return 0
   fi
-  curl -sS -m 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+  curl -sS -m "${EGRESS_WATCH_TRACE_TIMEOUT:-8}" \
+    -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
+    "$EGRESS_TRACE_URL" 2>/dev/null \
     | sed -n 's/^ip=//p' | head -1
 }
+
+# R2567 (operator priority): verify before the first turn that provider traffic
+# really leaves through the selected upstream. A relay selection that reports
+# the runner's own direct IP means the proxy bypassed the relay (silent direct);
+# a different non-direct IP means the relay rotated its exit after selection —
+# the known "preflight 200 but immediate 429" failure mode. Both cases end the
+# round instead of spending the remaining budget on an unverified path.
+provider_egress=""
+if [ "${EGRESS_WATCH_SKIP_EGRESS_PROBE:-0}" != "1" ]; then
+  provider_egress=$(current_egress_ip 2>/dev/null || true)
+fi
+log "egress path check kind=${selected_kind:-?} upstream=$CUR_UP selected_egress=${selected_egress:-?} provider_egress=${provider_egress:-unreachable} direct_ip=${selected_direct_ip:-?}"
+case "$selected_kind" in
+  relay|http)
+    if [ -n "$provider_egress" ] && [ -n "$selected_direct_ip" ] \
+       && [ "$provider_egress" = "$selected_direct_ip" ]; then
+      log "CRITICAL: provider egress equals the runner direct IP ($provider_egress); the selected $selected_kind upstream was bypassed — no silent direct allowed"
+      stop_run "provider traffic bypassed the selected $selected_kind upstream (provider_egress=$provider_egress equals direct_ip); refusing silent direct"
+    elif [ -n "$provider_egress" ] && [ -n "$selected_egress" ] \
+         && [ "$provider_egress" != "$selected_egress" ]; then
+      log "CRITICAL: provider egress rotated after selection (selected=$selected_egress provider=$provider_egress); blacklisting candidate for 21600s"
+      blacklist_selected "egress-rotation-before-run" 21600 || true
+      stop_run "selected $selected_kind upstream egress rotated before the first turn (selected=$selected_egress provider=$provider_egress); ending this round so the next run selects a fresh egress"
+    fi
+    ;;
+  direct)
+    if [ -n "$provider_egress" ] && [ -n "$selected_direct_ip" ] \
+       && [ "$provider_egress" != "$selected_direct_ip" ]; then
+      log "warning: direct egress changed after selection (selected=$selected_direct_ip provider=$provider_egress); keeping the run"
+    fi
+    ;;
+esac
 
 # handle_quota <line>
 handle_quota() {

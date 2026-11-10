@@ -302,14 +302,14 @@ jobs:
             python3 "$GITHUB_WORKSPACE/.github/scripts/egress-proxy.py" \
               > "$EGRESS_DIR/proxy.log" 2>&1 &
             PROXY_PID=$!
-            for _ in $(seq 1 50); do
+            for _ in $(seq 1 12); do
               if ! kill -0 "$PROXY_PID" 2>/dev/null; then break; fi
-              if curl -sS -m 2 -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
-                   -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+              if curl -sS -m 4 -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
+                   -o /dev/null https://opencode.ai/cdn-cgi/trace 2>/dev/null; then
                 PROXY_READY=1
                 break
               fi
-              sleep 0.2
+              sleep 0.25
             done
             if [ "$PROXY_READY" = 1 ]; then
               echo "egress proxy: ${HTTPS_PROXY:-none} kind=$(jq -r '.kind // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null) upstream=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?') egress=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
@@ -317,10 +317,12 @@ jobs:
                 >> "$EGRESS_DIR/watch.log" 2>&1 &
               WATCH_PID=$!
             else
-              echo "::warning::local egress proxy failed to start; falling back to direct"
-              kill "$PROXY_PID" 2>/dev/null
-              PROXY_PID=""
-              unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+              # R2567 (operator): a failed local proxy must not silently fall
+              # back to direct; otherwise the run burns the runner IP's quota
+              # while the logs still claim a relay was selected.
+              echo "::error::local egress proxy is not ready (no provider trace through it); refusing direct fallback and ending this run"
+              tail -20 "$EGRESS_DIR/proxy.log" 2>/dev/null || true
+              exit 1
             fi
           else
             echo "egress proxy: none (direct connection)"
@@ -380,9 +382,18 @@ jobs:
               echo "no bound session found; continuing the last session"
             fi
           fi
-          TERM=xterm-256color timeout --signal=TERM --kill-after=30s "$BUDGET" \
-            opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
-          RC=$?
+          if [ -f "$EGRESS_DIR/stop" ]; then
+            # R2567: the watcher can reject the selected path before OpenCode is
+            # even started (provider traffic bypassed the relay / relay rotated).
+            # pkill cannot catch a not-yet-started process, so honor the marker
+            # here and never start an unmonitored round.
+            echo "::error::egress watcher rejected the selected path before the round started: $(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)"
+            RC=0
+          else
+            TERM=xterm-256color timeout --signal=TERM --kill-after=30s "$BUDGET" \
+              opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
+            RC=$?
+          fi
           if [ -f "$EGRESS_DIR/stop" ]; then
             STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
