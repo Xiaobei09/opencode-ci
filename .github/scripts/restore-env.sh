@@ -452,11 +452,52 @@ chmod 600 "$HOME/.opencode/tg.env"
 export TG_BOTS_EXTRA="${TG_BOTS_EXTRA:-}"
 python3 - <<'PY'
 import json, os, re, tempfile
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 home = os.path.expanduser("~")
 reg_path = f"{home}/.config/opencode/tg-bots.json"
 allowed = os.environ.get("TG_ALLOWED_CHAT", "")
 push = os.environ.get("TG_PUSH_CHAT", "")
+# R2593（D4）：legacy TG_BOT3/4_TOKEN 曾无条件覆盖 env-sync 还原的 env 文件。
+# 运营者用 /addbots 换的新 token 会在下一轮被旧 secret 顶回去（bot3 Unauthorized
+# 就这么复现）。来源优先级改为：
+#   · 还原的 env 文件 = 运营者最近一次 /addbots 的状态，默认保留；
+#   · secret 与还原 token 不同时先做 getMe 校验：secret 明确可用才覆盖，
+#     被 Telegram 拒绝或网络不可达时保留还原 token；
+#   · TG_BOT_SECRET_OVERRIDE=1 强制 secret（运营者明确用 GitHub secret 轮换）；
+#   · TG_TOKEN_PROBE=0 关闭校验（测试/离线环境）。
+# TG_BOTS_EXTRA 是显式轮换入口，仍然无条��覆盖（见下方）。
+secret_override = os.environ.get("TG_BOT_SECRET_OVERRIDE", "").strip().lower() in ("1", "true", "yes", "on")
+probe_enabled = os.environ.get("TG_TOKEN_PROBE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+def probe_token(token):
+    """getMe：('valid', bot_id) / ('invalid', desc) / ('unknown', why)。"""
+    try:
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/getMe", method="GET")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            j = json.loads(r.read(65536))
+        if j.get("ok") and isinstance(j.get("result"), dict):
+            return ("valid", str(j["result"].get("id") or ""))
+        return ("invalid", str(j.get("description") or "not ok")[:80])
+    except urllib.error.HTTPError as e:
+        try:
+            j = json.loads(e.read(65536))
+            return ("invalid", str(j.get("description") or f"HTTP {e.code}")[:80])
+        except Exception:
+            return ("invalid", f"HTTP {e.code}")
+    except Exception as e:
+        return ("unknown", type(e).__name__)
+
+def read_env_token(path):
+    try:
+        for line in open(path, encoding="utf-8"):
+            if line.startswith("TG_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        return ""
+    return ""
 
 def read_json(p, default):
     try:
@@ -503,20 +544,64 @@ def write_env(path, token, allowed_chat, push_chat, label=None):
 
 put({"id": "primary", "label": by.get("primary", {}).get("label", "CI"), "envFile": f"{home}/.opencode/tg.env"})
 
+legacy = []
 for n in ("3", "4"):
     tok = os.environ.get(f"TG_BOT{n}_TOKEN", "").strip()
     bid = f"bot{n}"
     envp = f"{home}/.config/opencode/tg-bot{n}.env"
-    if tok:
-        label = str(by.get(bid, {}).get("label") or bid)
-        write_env(envp, tok, allowed, push, label)
+    legacy.append((n, bid, envp, tok, read_env_token(envp)))
+
+# 冲突 token 一次性并行探测（最多 4 个），避免 restore 被串行 5s 超时拖慢。
+to_probe = set()
+for n, bid, envp, tok, env_tok in legacy:
+    if tok and env_tok and tok != env_tok and not secret_override and probe_enabled:
+        to_probe.add(tok)
+        to_probe.add(env_tok)
+probes = {}
+if to_probe:
+    with ThreadPoolExecutor(max_workers=min(8, len(to_probe))) as ex:
+        for t, res in zip(to_probe, ex.map(probe_token, to_probe)):
+            probes[t] = res
+
+for n, bid, envp, tok, env_tok in legacy:
+    if not tok:
+        if os.path.isfile(envp):
+            print(f"bot{n} env present (no CI secret this run)")
+        else:
+            print(f"::warning::TG_BOT{n}_TOKEN missing; bot{n} will run without a token")
+            by.pop(bid, None)
+        continue
+    label = str(by.get(bid, {}).get("label") or bid)
+    keep_env = False
+    why = ""
+    if env_tok and env_tok != tok and not secret_override:
+        sk, sd = probes.get(tok, ("unknown", "probe disabled"))
+        ek, ed = probes.get(env_tok, ("unknown", "probe disabled"))
+        if not probe_enabled:
+            keep_env, why = True, "token probe disabled"
+        elif sk == "valid" and ek == "valid":
+            # 两个都可用：同一 Bot = 轮换后的新旧 token，保留运营者最近一次
+            # /addbots 的还原值；不同 Bot = 明确换号，尊重 secret。
+            if sd and ed and sd != ed:
+                keep_env, why = False, f"secret is a different bot ({sd} != {ed})"
+            else:
+                keep_env, why = True, "both valid; kept restored"
+        elif sk == "valid":
+            keep_env, why = False, f"restored token rejected ({ek}: {ed})"
+        elif sk == "invalid":
+            keep_env, why = True, f"secret rejected by Telegram ({sd})"
+        else:
+            keep_env, why = True, f"secret probe unavailable ({sd})"
+    if keep_env:
+        print(f"bot{n} token: kept restored env ({why}); set TG_BOT_SECRET_OVERRIDE=1 to force the secret")
         put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
-        print(f"bot{n} secret env written")
-    elif os.path.isfile(envp):
-        print(f"bot{n} env present (no CI secret this run)")
+        continue
+    write_env(envp, tok, allowed, push, label)
+    put({"id": bid, "label": label, "envFile": envp, "noFallback": True})
+    if env_tok and env_tok != tok:
+        print(f"bot{n} secret env written (replaced restored token: {why or 'override'})")
     else:
-        print(f"::warning::TG_BOT{n}_TOKEN missing; bot{n} will run without a token")
-        by.pop(bid, None)
+        print(f"bot{n} secret env written")
 
 raw = os.environ.get("TG_BOTS_EXTRA", "").strip()
 if raw:

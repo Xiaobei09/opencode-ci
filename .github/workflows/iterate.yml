@@ -201,6 +201,9 @@ jobs:
           TG_BOT3_TOKEN: ${{ secrets.TG_BOT3_TOKEN }}
           TG_BOT4_TOKEN: ${{ secrets.TG_BOT4_TOKEN }}
           TG_BOTS_EXTRA: ${{ secrets.TG_BOTS_EXTRA }}
+          # R2593（D4）：默认保留 env-sync 里 /addbots 写入的最新 token；
+          # 设为 1 可强制用上面的 legacy secret 覆盖（运营者明确轮换时用）。
+          TG_BOT_SECRET_OVERRIDE: ${{ vars.TG_BOT_SECRET_OVERRIDE }}
         run: |
           set +e
           bash "$GITHUB_WORKSPACE/.github/scripts/restore-targets.sh" > /tmp/restore-targets.log 2>&1 &
