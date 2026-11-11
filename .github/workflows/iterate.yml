@@ -519,6 +519,17 @@ jobs:
             RC=0
           fi
           echo "opencode exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null)"
+          # R2587（D7）：插件错误只写 /tmp/opencode/v2plugin.log，run 结束随
+          # runner 一起消失；旧诊断只 grep OpenCode 主日志，插件注入/桥失败在
+          # Actions 日志里看不到。这里把插件 error/warn 尾部打印出来。
+          if [ -s /tmp/opencode/v2plugin.log ]; then
+            PLUGIN_ERR=$(grep -aE ': (error|warn): ' /tmp/opencode/v2plugin.log 2>/dev/null | tail -40)
+            PLUGIN_N=$(printf '%s\n' "$PLUGIN_ERR" | grep -c . 2>/dev/null || echo 0)
+            echo "plugin error/warn lines: ${PLUGIN_N:-0} (last ${PLUGIN_N:-0} shown)"
+            if [ -n "$PLUGIN_ERR" ]; then
+              printf '%s\n' "$PLUGIN_ERR" | cut -c1-300 || true
+            fi
+          fi
           ERR_TXT="$RUNNER_TEMP/opencode-errors.txt"
           if [ -s "$RUN_LOG" ]; then
             tr '\r' '\n' < "$RUN_LOG" 2>/dev/null \
@@ -550,6 +561,7 @@ jobs:
           for pat in "pinject delivered" "pinject failed" "inject failed" "getUpdates failed" "loop stopped" "sendMessage chunked ok" "free tier" "FreeUsageLimitError" "provider.free-limit" "instance registered" "turnActuallyIdle" "loop skip" "loopskip"; do
             echo "diag '$pat' = $(grep -c -- "$pat" "$RUN_LOG" 2>/dev/null || echo 0)"
           done
+          echo "exit_code=$RC" >> "$GITHUB_OUTPUT"
           if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ] || [ "$RC" -eq 143 ]; then
             echo "opencode hit the time budget; treated as success so the loop continues."
             # R2550（D5）：预算耗尽是没有正常回合但**合法**的结束方式，需单独标记；
@@ -768,7 +780,19 @@ jobs:
             reason="opencode 结束（outcome=${outcome:-unknown}），已接力新 run"
           fi
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
-          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\nopencode：%s；streak：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$outcome" "$streak")
+          # R2587（D7）：结束通知必须带真实错误证据，而不只是 outcome。退出码
+          # 与本次 Run OpenCode 抓到的最后一条错误（已去 ANSI/CR）一并附上。
+          rc="${{ steps.run_opencode.outputs.exit_code }}"
+          err_line=""
+          if [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
+            err_line=$(head -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null | tr -d '\r' | cut -c1-200)
+          fi
+          detail="opencode：${outcome}"
+          [ -n "$rc" ] && detail="$detail（exit=$rc）"
+          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\n%s；streak：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$detail" "$streak")
+          if [ -n "$err_line" ]; then
+            text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
+          fi
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${text}" \
@@ -798,6 +822,14 @@ jobs:
           restore_failed="${{ steps.failure_guard.outputs.restore_failed }}"
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
+          # R2587（D7）：停止卡同样带退出码与最后一条错误证据。
+          rc="${{ steps.run_opencode.outputs.exit_code }}"
+          err_line=""
+          if [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
+            err_line=$(head -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null | tr -d '\r' | cut -c1-200)
+          fi
+          detail="opencode：${outcome}"
+          [ -n "$rc" ] && detail="$detail（exit=$rc）"
           reason="本轮结束（opencode=$outcome）"
           if [ "$restore_failed" = "true" ]; then
             reason="环境/工作区还原失败；已跳过 OpenCode（快照未被覆盖）"
@@ -833,7 +865,10 @@ jobs:
           elif [ "$paused" = "true" ]; then
             reason="循环已暂停（运营者停止或失败阈值），relay 已让路"
           fi
-          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\nopencode：%s；relay：%s；streak：%s；pause：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$outcome" "$relay_out" "$streak" "$paused")
+          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s；relay：%s；streak：%s；pause：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$detail" "$relay_out" "$streak" "$paused")
+          if [ -n "$err_line" ]; then
+            text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
+          fi
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${text}" \
