@@ -2,6 +2,9 @@
 # R573: extracted verbatim from iterate.yml "Restore workspace snapshots" so it can
 # run in parallel with the environment restore in a single step.
 set +e
+# R2589 (D9): one wall-clock measurement for the whole targets restore so the
+# run log shows where the non-opencode budget goes.
+RT_T0=$(date +%s)
 # Target workspace bundles also live in the release now (a whole tar of the
 # repo's runtime dirs), not in git, so the repository can stay a clean baseline.
 ENV_TAG="env"
@@ -138,6 +141,10 @@ done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) |
 # 做 depth-1 fetch（实测 proxyip 7.2s / PCB 1.3s，替代 1.58GB 历史包下载），
 # 再 update-ref + reset --mixed：索引指向快照 commit，工作树文件保持原样
 # （未提交修改直接是 unstaged），并创建 origin/<branch> 供下一代 slim 判定。
+# R2589（D9）：四个目标互不相干，fetch 串行曾是 restore 的长尾（proxyip 单仓
+# ~7s）。这里并行启动、统一 wait；日志顺序可能交错，但每行仍带目标名。
+SLIM_T0=$(date +%s)
+SLIM_PIDS=()
 while IFS=$'\t' read -r snap_name snap_repo snap_branch snap_commit; do
   [ -n "$snap_name" ] || continue
   target_dir="$TARGETS_DIR/$snap_name"
@@ -178,8 +185,13 @@ while IFS=$'\t' read -r snap_name snap_repo snap_branch snap_commit; do
         commit -q -m "slim restore fallback: remote fetch failed" 2>/dev/null
       echo "::warning::slim target $snap_name remote fetch failed; kept worktree as a local commit (next snapshots use full mode)"
     fi
-  )
+  ) &
+  SLIM_PIDS+=("$!")
 done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | [.dir, .repo, .branch, .commit] | @tsv' "$INDEX" 2>/dev/null)
+if [ ${#SLIM_PIDS[@]} -gt 0 ]; then
+  wait "${SLIM_PIDS[@]}" 2>/dev/null || true
+fi
+echo "target slim restore timing: ${#SLIM_PIDS[@]} target(s) in $(( $(date +%s) - SLIM_T0 ))s (parallel)"
 # R2580（D2 环境完美还原）：Save 步骤为每个 target 记录了 fp（head + branch +
 # 工作树文件路径/内容的 sha256）。解包/重置漏文件时 HEAD 仍可能匹配，
 # restore-monitor 的 HEAD 检查发现不了；这里在 OpenCode 启动前重算并比对，
@@ -301,4 +313,5 @@ for i in $(seq 0 $((COUNT - 1))); do
     fi
   )
 done
+echo "targets restore timing: total $(( $(date +%s) - RT_T0 ))s"
 
