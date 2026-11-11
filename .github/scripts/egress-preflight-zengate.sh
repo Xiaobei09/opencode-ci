@@ -77,6 +77,11 @@ if [ -n "$META" ]; then
     printf 'retry_after=%s\n' "${ra:-}"
     printf 'nonce=%s\n' "$NONCE"
     printf 'code=%s\n' "$code"
+    # R2582: the probe is NOT free. zengate injects the OpenCode system prompt,
+    # so even max_tokens=32 consumed ~4k prompt tokens in a live measurement.
+    # Record it so selection logs show how much of the daily bucket the probe
+    # itself spent ("200" only proves this much headroom existed).
+    printf 'tokens=%s\n' "$(printf '%s' "$js" | jq -r '.usage.total_tokens // empty' 2>/dev/null)"
   } > "$META" 2>/dev/null || true
 fi
 

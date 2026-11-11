@@ -154,14 +154,9 @@ current_egress_ip() {
     | sed -n 's/^ip=//p' | head -1
 }
 
-# R2578 (operator: "现在是直连"): direct is not a production egress. If a stale
-# state file, an old snapshot or an emergency override still selected direct,
-# stop before the first provider request instead of silently burning the
-# runner IP. EGRESS_ALLOW_DIRECT=1 is the only way to permit it.
-if [ "$CUR_UP" = "direct" ] && [ "${EGRESS_ALLOW_DIRECT:-0}" != "1" ]; then
-  log "CRITICAL: upstream=direct while EGRESS_ALLOW_DIRECT=0; refusing to run provider traffic from the runner IP"
-  stop_run "direct egress selected while direct is disabled (no proxy exit); refusing to run"
-fi
+# R2582 (operator rollback): direct is a supported production egress again.
+# Do NOT stop the run just because upstream=direct; the free quota is per
+# egress IP and a fresh runner IP is usually the freshest bucket.
 
 # R2567 (operator priority): verify before the first turn that provider traffic
 # really leaves through the selected upstream. A relay selection that reports

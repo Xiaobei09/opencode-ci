@@ -21,9 +21,10 @@ EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
 # R2565: anonymous free quota is per egress IP. Reusing the same relay across
 # runs means paying with a partially consumed bucket; the provider's 429
 # retry-after was observed at ~12.9h, longer than the 6h failure blacklist.
-# Successful relays are therefore avoided for 13h by default, so every run
-# starts on a fresh IP (the operator's "new run -> new egress -> new quota").
-EGRESS_REUSE_WINDOW="${EGRESS_REUSE_WINDOW:-46800}"
+# R2582: the bucket is a DAILY quota (48/48 recent 429s converge to the same
+# 00:44:19 UTC reset), so a 13h window can still land in the same bucket.
+# Successful relays are avoided for 24h; every run starts on a fresh IP.
+EGRESS_REUSE_WINDOW="${EGRESS_REUSE_WINDOW:-86400}"
 EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
 # R2567 (operator: is provider traffic really leaving through the selected
 # proxy?): the old probe used www.cloudflare.com, which the local CONNECT proxy
