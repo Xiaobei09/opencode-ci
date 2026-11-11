@@ -286,8 +286,18 @@ jobs:
             # afresh, and the failure notification must not claim an egress.
             rm -f "$HOME/.config/opencode/exit-proxy.json" "$RUNNER_TEMP/exit-proxy.env" \
                   "$RUNNER_TEMP/egress/upstream" "$RUNNER_TEMP/egress/candidates.tsv"
-            echo "reason=no egress candidate answered 200 (select-proxy rc=$rc)" >> "$GITHUB_OUTPUT"
-            echo "::error::egress selection failed: neither direct nor any relay answered 200; ending this run (no unverified egress)"
+            # R2588（D8）：失败原因必须区分。direct quota 耗尽时探测拿到的是
+            # 429（不是“没有 200”），而且是**有意**不切共享 relay（同桶已耗尽）。
+            # 旧文案把两种失败都写成“没有 200”，正好掩盖运营者关心的根因。
+            sel_err=$(grep -aE '^\[egress-select\] ERROR: ' "$RUNNER_TEMP/select-proxy.log" 2>/dev/null | tail -1 | sed -E 's/^\[egress-select\] ERROR: //' | cut -c1-240)
+            if printf '%s' "$sel_err" | grep -q 'direct free-quota exhausted'; then
+              reason="direct free-quota exhausted; shared relays deliberately not tried (their buckets are already consumed)"
+              echo "::error::egress selection failed: $reason; ending this run so the next fresh runner IP gets a new daily bucket"
+            else
+              reason="no egress candidate answered 200 (select-proxy rc=$rc)"
+              echo "::error::egress selection failed: neither direct nor any relay answered 200; ending this run (no unverified egress)"
+            fi
+            echo "reason=$reason" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           if [ ! -s "$HOME/.config/opencode/exit-proxy.json" ]; then
@@ -550,6 +560,10 @@ jobs:
           fi
           if [ -f "$EGRESS_DIR/watch.log" ]; then
             # R2562：watcher 不再轮换；诊断单轮内的连续失败与停止原因。
+            # R2588（D8）：last-40 里常混着“quota-like line ignoring”噪声，先给
+            # 一行计数汇总，让 200→429 / 轮换 / 停轮一眼可判。
+            cnt() { local n; n=$(grep -acE "$1" "$EGRESS_DIR/watch.log" 2>/dev/null); echo "${n:-0}"; }
+            echo "egress summary: upstream=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?') path_checks=$(cnt 'egress path check') rechecks=$(cnt 'egress path recheck ok') quota=$(cnt 'quota error detected') failures=$(cnt 'egress failure') blacklisted=$(cnt 'blacklisted') stops=$(cnt 'STOP:') ignored_quota=$(cnt 'ignoring')"
             echo "egress watch (last 40):"
             tail -40 "$EGRESS_DIR/watch.log" 2>/dev/null || true
             echo "egress watch failures/stops:"
@@ -764,7 +778,7 @@ jobs:
           if [ "$restore_failed" = "true" ]; then
             reason="环境/工作区还原失败；已跳过 OpenCode 并按失败计数接力新 run（快照未被覆盖）"
           elif [ "$select_failed" = "true" ]; then
-            reason="出口选择失败（本轮没有 200）：${select_reason:-no candidate answered 200}；已按失败计数接力新 run"
+            reason="出口选择失败：${select_reason:-no candidate answered 200}；已按失败计数接力新 run"
           elif [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
@@ -841,7 +855,7 @@ jobs:
               reason="$reason；未接力"
             fi
           elif [ "$select_failed" = "true" ]; then
-            reason="出口选择失败（本轮没有 200）：${select_reason:-no candidate answered 200}"
+            reason="出口选择失败：${select_reason:-no candidate answered 200}"
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
               reason="$reason；连续失败 ${streak} 次，循环已暂停"
             elif [ "$relay_out" = "failure" ]; then
