@@ -857,6 +857,11 @@ jobs:
           shopt -s nullglob
           for target_dir in "$TARGETS_DIR"/*/; do
             repo_dir="${target_dir%/}"
+            # R2586（D6）：只索引真实的目标目录。会话会在工作区里放指向别处的
+            # 符号链接（实测 `pcb -> PCB`，10:29 创建）；旧逻辑的 `[ -d ./.git ]`
+            # 会跟随链接，把同一个仓库再索引一次（fp 相同、restore 报 ok=5），
+            # 更糟的是链接若指向 $HOME 等大树，指纹会把外部内容也算进来。
+            [ -L "$repo_dir" ] && continue
             [ -d "$repo_dir/.git" ] || continue
             name=$(basename "$repo_dir")
             snap_dir="$SNAP/$name"
@@ -917,6 +922,23 @@ jobs:
             jq --argjson e "$ENTRY" '.snapshots += [$e]' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
             echo "target snapshot indexed: dir=$name commit=${COMMIT:0:12} mode=$MODE fp=${FP:0:12}"
           done
+          # R2586（D6）：旧 index 里若已存在符号链接条目（上一代旧代码写入的），
+          # 必须在本代修剪掉；否则 TGT_FP 永远包含它，包会被判定“未变化”而携带，
+          # 链接一代代被还原回来。只修剪符号链接，视觉上“消失”的目录保留条目
+          # （下一轮 restore 会从包里恢复它，宁可复活也不静默丢工作区）。
+          while IFS= read -r _sd; do
+            [ -n "$_sd" ] || continue
+            if [ -L "$TARGETS_DIR/$_sd" ]; then
+              _tmp=$(mktemp)
+              if jq --arg dir "$_sd" '.snapshots |= map(select(.dir != $dir))' "$INDEX" > "$_tmp" 2>/dev/null; then
+                mv "$_tmp" "$INDEX"
+                echo "target snapshot pruned: dir=$_sd (symlink, not a real workspace)"
+              else
+                rm -f "$_tmp"
+                echo "::warning::could not prune symlink target entry $_sd from the snapshot index"
+              fi
+            fi
+          done < <(jq -r '.snapshots[]?.dir // empty' "$INDEX" 2>/dev/null)
           echo "target snapshot index: $(jq -r '[.snapshots[]?] | length' "$INDEX" 2>/dev/null || echo 0) entries"
 
       - name: Snapshot environment to sessions repository
@@ -1068,6 +1090,8 @@ jobs:
             TGT_DIRS=()
             SLIM_EXCLUDES=()
             for d in "$TARGETS_DIR"/*/; do
+              # R2586：符号链接不是独立目标，不打包（避免重复条目/外部树）。
+              [ -L "${d%/}" ] && continue
               [ -d "${d%/}/.git" ] && TGT_DIRS+=("$(basename "$d")")
             done
             if [ -s "$IDX" ]; then

@@ -126,6 +126,10 @@ INDEX="$SESSIONS_DIR/workspace-snapshots/index.json"
 while IFS= read -r snap_name; do
   [ -n "$snap_name" ] || continue
   if [ -d "$SESSIONS_DIR/$snap_name" ] && [ ! -e "$TARGETS_DIR/$snap_name" ]; then
+    # R2586（D6）：符号链接不是独立工作区；照旧还原链接以保持会话现场，
+    # 但不让它进入指纹计数（旧代码会把它索引成第二个目标，restore 报 ok=5）。
+    [ -L "$SESSIONS_DIR/$snap_name" ] \
+      && echo "::warning::target snapshot $snap_name is a symlink; restored as a link but excluded from the fingerprint count"
     mv "$SESSIONS_DIR/$snap_name" "$TARGETS_DIR/$snap_name" \
       && echo "target workspace $snap_name restored from its directory snapshot"
   fi
@@ -138,6 +142,8 @@ while IFS=$'\t' read -r snap_name snap_repo snap_branch snap_commit; do
   [ -n "$snap_name" ] || continue
   target_dir="$TARGETS_DIR/$snap_name"
   [ -d "$target_dir" ] || continue
+  # R2586：符号链接不是独立工作区，跳过 slim 重建。
+  [ -L "$target_dir" ] && continue
   [ -e "$target_dir/.git" ] && continue
   (
     set +e
@@ -184,6 +190,11 @@ while IFS=$'\t' read -r snap_name snap_fp snap_commit; do
   [ -n "$snap_name" ] || continue
   [ -n "$snap_fp" ] || continue
   target_dir="$TARGETS_DIR/$snap_name"
+  # R2586：符号链接不是工作区，不参与指纹校验（旧 index 可能仍含这类条目）。
+  if [ -L "$target_dir" ]; then
+    echo "target restore fingerprint skipped: dir=$snap_name is a symlink (not a target workspace)"
+    continue
+  fi
   if [ ! -d "$target_dir" ]; then
     FP_BAD=$((FP_BAD + 1))
     echo "::error::target restore fingerprint mismatch: dir=$snap_name is missing (want=${snap_fp:0:12})"
