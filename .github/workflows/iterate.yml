@@ -97,9 +97,29 @@ jobs:
             echo "::warning::smoke run is allowed on a non-production ref ($REF_NAME)"
             exit 0
           fi
-          if [ "$REF_NAME" != "main" ] || [ "$DEFAULT_BRANCH" != "main" ]; then
-            echo "::error::production iterate run requires ref=main and default_branch=main; got ref=$REF_NAME default_branch=$DEFAULT_BRANCH (refusing to run the loop on stale code)"
+          if [ "$REF_NAME" != "main" ]; then
+            echo "::error::production iterate run requires ref=main; got ref=$REF_NAME (default_branch=$DEFAULT_BRANCH). Refusing to run the loop on stale code."
             exit 1
+          fi
+          if [ "$DEFAULT_BRANCH" != "main" ]; then
+            # R2579: relay/watchdog pin ref=main, so a run that got here was
+            # explicitly dispatched from main and is authoritative. Self-heal a
+            # hijacked default branch instead of only failing: otherwise the
+            # next schedule/relay would keep inheriting the stale branch.
+            repo="${{ github.repository }}"
+            echo "::warning::repository default branch is '$DEFAULT_BRANCH', not main; repairing to main (this run is pinned to ref=main)"
+            if gh api -X PATCH "repos/$repo" -f default_branch=main >/dev/null 2>&1; then
+              fixed=$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || echo "")
+              if [ "$fixed" = "main" ]; then
+                echo "::notice::repository default branch repaired to main"
+              else
+                echo "::error::default branch repair did not stick (now '$fixed'); refusing to run the loop"
+                exit 1
+              fi
+            else
+              echo "::error::default branch repair API call failed; refusing to run while default_branch=$DEFAULT_BRANCH"
+              exit 1
+            fi
           fi
 
       - name: Install GitHub CLI and configure git
