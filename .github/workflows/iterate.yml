@@ -263,7 +263,9 @@ jobs:
         # - 黑名单启用，失败候选 6h 内不再重复探测；
         # - 先用并行 trace 过滤 relay，再用真实 OpenCode 预检前 8 个；
         # - 没有 relay 返回 200 时不做 direct 兜底，直接非零退出让本轮失败。
-        if: steps.lock.outputs.acquired == 'true'
+        # R2580（D2）：restore 失败时不选出口/不跑 OpenCode，避免残缺环境
+        # 被桥的 interval env-sync 写回，覆盖上一份好快照。
+        if: steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
@@ -326,7 +328,10 @@ jobs:
 
       - name: Run OpenCode
         id: run_opencode
-        if: steps.lock.outputs.acquired == 'true'
+        # R2580（D2）：环境/工作区还原失败时绝不启动 OpenCode。否则桥的
+        # interval env-sync 可能把残缺环境写入 env-sync 分支；Save 步骤虽受
+        # restore 门控，但 interval 写回不受它控制。失败轮由 failure_guard 计数并接力。
+        if: steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         env:
           SESSIONS_DIR: /home/runner/work/sessions
           TARGETS_DIR: /home/runner/work/targets
@@ -576,7 +581,15 @@ jobs:
           soft_success="${{ steps.run_opencode.outputs.soft_success }}"
           select_outcome="${{ steps.select_egress.outcome }}"
           select_reason="${{ steps.select_egress.outputs.reason }}"
+          restore_outcome="${{ steps.restore_ws.outcome }}"
           allow=false
+          if [ "$restore_outcome" != "success" ]; then
+            # R2580（D2）：restore 失败时 OpenCode/Select 都被跳过；这里只记录真实
+            # 原因，后续 skipped 分支按一次失败轮计数并接力。绝不能启动 OpenCode
+            # 让 interval env-sync 把残缺环境写回。
+            echo "restore_failed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::workspace/environment restore failed (restore_ws=$restore_outcome); OpenCode was skipped so the incomplete environment cannot overwrite the snapshot"
+          fi
           if [ "$watcher_stop" = "true" ]; then
             # R2521：本轮如果出现过正常回合（200/正常产出），失败计数清零；
             # 只有真正"连续 3 轮没有任何成功"才暂停。END-ROUND-CI 的 marker
@@ -737,7 +750,10 @@ jobs:
           healthy_failure="${{ steps.failure_guard.outputs.healthy_failure }}"
           select_failed="${{ steps.failure_guard.outputs.select_failed }}"
           select_reason="${{ steps.select_egress.outputs.reason }}"
-          if [ "$select_failed" = "true" ]; then
+          restore_failed="${{ steps.failure_guard.outputs.restore_failed }}"
+          if [ "$restore_failed" = "true" ]; then
+            reason="环境/工作区还原失败；已跳过 OpenCode 并按失败计数接力新 run（快照未被覆盖）"
+          elif [ "$select_failed" = "true" ]; then
             reason="出口选择失败（本轮没有 200）：${select_reason:-no candidate answered 200}；已按失败计数接力新 run"
           elif [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
@@ -781,10 +797,20 @@ jobs:
           watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
           select_failed="${{ steps.failure_guard.outputs.select_failed }}"
           select_reason="${{ steps.select_egress.outputs.reason }}"
+          restore_failed="${{ steps.failure_guard.outputs.restore_failed }}"
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
           reason="本轮结束（opencode=$outcome）"
-          if [ "$select_failed" = "true" ]; then
+          if [ "$restore_failed" = "true" ]; then
+            reason="环境/工作区还原失败；已跳过 OpenCode（快照未被覆盖）"
+            if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
+              reason="$reason；连续失败 ${streak} 次，循环已暂停"
+            elif [ "$relay_out" = "failure" ]; then
+              reason="$reason；接力失败，没有后继 run"
+            else
+              reason="$reason；未接力"
+            fi
+          elif [ "$select_failed" = "true" ]; then
             reason="出口选择失败（本轮没有 200）：${select_reason:-no candidate answered 200}"
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
               reason="$reason；连续失败 ${streak} 次，循环已暂停"

@@ -174,6 +174,37 @@ while IFS=$'\t' read -r snap_name snap_repo snap_branch snap_commit; do
     fi
   )
 done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | [.dir, .repo, .branch, .commit] | @tsv' "$INDEX" 2>/dev/null)
+# R2580（D2 环境完美还原）：Save 步骤为每个 target 记录了 fp（head + branch +
+# 工作树文件路径/内容的 sha256）。解包/重置漏文件时 HEAD 仍可能匹配，
+# restore-monitor 的 HEAD 检查发现不了；这里在 OpenCode 启动前重算并比对，
+# 不匹配就 fail closed。Save 门控在 restore 成功上，因此坏工作树不会覆盖好快照。
+FP_OK=0
+FP_BAD=0
+while IFS=$'\t' read -r snap_name snap_fp snap_commit; do
+  [ -n "$snap_name" ] || continue
+  [ -n "$snap_fp" ] || continue
+  target_dir="$TARGETS_DIR/$snap_name"
+  if [ ! -d "$target_dir" ]; then
+    FP_BAD=$((FP_BAD + 1))
+    echo "::error::target restore fingerprint mismatch: dir=$snap_name is missing (want=${snap_fp:0:12})"
+    continue
+  fi
+  head=$(git -C "$target_dir" rev-parse HEAD 2>/dev/null || true)
+  branch=$(git -C "$target_dir" symbolic-ref --short HEAD 2>/dev/null || true)
+  wt=$( (cd "$target_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1) )
+  got=$(printf 'head=%s\nbranch=%s\nworktree=%s\n' "$head" "$branch" "$wt" | sha256sum | cut -d' ' -f1)
+  if [ "$got" = "$snap_fp" ]; then
+    FP_OK=$((FP_OK + 1))
+    echo "target restore fingerprint ok: dir=$snap_name commit=${snap_commit:0:12} fp=${got:0:12}"
+  else
+    FP_BAD=$((FP_BAD + 1))
+    echo "::error::target restore fingerprint mismatch: dir=$snap_name want=${snap_fp:0:12} got=${got:0:12} (worktree incomplete or changed; refusing to run)"
+  fi
+done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | [.dir, .fp // "", .commit // ""] | @tsv' "$INDEX" 2>/dev/null)
+echo "target restore fingerprint summary: ok=$FP_OK mismatch=$FP_BAD"
+if [ "$FP_BAD" -gt 0 ]; then
+  exit 1
+fi
 # R342（records 独立资产，每轮刷新）：targets 包内嵌一份 records（兼容旧读侧），
 # 另有独立 records 资产——targets 内容未变时会被原样沿用，records 却必须每轮
 # 更新。这里优先覆盖为独立资产的最新副本：先解到临时目录并验证完整，再替换；
