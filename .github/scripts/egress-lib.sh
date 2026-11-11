@@ -55,6 +55,34 @@ egress_probe_model() {
   printf '%s\n' "$m"
 }
 
+# R2584 (operator: "these exits all happen to have exactly one response left?"):
+# A zengate probe is one small request (~4k prompt tokens). A real resumed turn
+# carries the whole session context: live measurement over 24h gave p50≈107k,
+# p90≈162k, max≈170k tokens. So a relay bucket with only ~70k left can answer
+# the probe with 200, answer exactly one real turn, then 429 the next concurrent
+# turn. Log the observed real prompt size next to the probe so the mismatch is
+# visible in every selection (no need to re-derive it from the DB by hand).
+egress_real_prompt_stats() {
+  local db="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}" row avg="" max="" n="0"
+  if [ -s "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    row=$(sqlite3 -separator ' ' "$db" \
+      "select cast(avg(x) as int), max(x), count(*) from (
+         select coalesce(json_extract(data,'\$.tokens.input'),0)
+              + coalesce(json_extract(data,'\$.tokens.cache.read'),0)
+              + coalesce(json_extract(data,'\$.tokens.cache.write'),0) x
+           from session_message
+          where type='assistant' and json_extract(data,'\$.tokens') is not null
+            and json_extract(data,'\$.error.type') is null
+            and time_created > (strftime('%s','now')-86400)*1000);" 2>/dev/null | head -1)
+    read -r avg max n <<< "$row"
+  fi
+  if [ -n "${avg:-}" ] && [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+    printf 'avg=%s max=%s n=%s' "$avg" "$max" "$n"
+  else
+    printf 'unknown'
+  fi
+}
+
 egress_bl_init() {
   mkdir -p "$EGRESS_STATE_DIR"
   [ "$EGRESS_BLACKLIST_ENABLED" = "1" ] || return 0

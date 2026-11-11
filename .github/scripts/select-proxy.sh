@@ -186,6 +186,12 @@ fi
 fresh_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^0$' || true)
 used_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^1$' || true)
 log "selection plan: ${#KIND[@]} candidate(s), fresh=$fresh_count recently-used=$used_count reuse-window=${EGRESS_REUSE_WINDOW}s, parallel=$PARALLEL, timeout=${PREFLIGHT_TMO}s"
+# R2584: make the probe-vs-real-token mismatch explicit. The operator saw
+# "preflight 200 then the real request 429" and asked whether every relay exit
+# happens to have exactly one response left. It does not: one real turn is
+# ~27x larger than the probe, so a nearly-empty shared bucket can pass the
+# probe and serve one (or zero) real turns.
+log "real turn prompt (24h non-error): $(egress_real_prompt_stats) tokens; zengate probe is one small request (~4k tokens), so a probe 200 only proves probe-sized headroom"
 
 i=0
 # R2582 (operator: "直连 429 时代理也会 429"): once direct fails with a real
