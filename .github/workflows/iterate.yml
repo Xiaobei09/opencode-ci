@@ -76,6 +76,32 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Production ref check
+        # R2579: the loop silently ran old code for days because the repository's
+        # default branch had been repointed at an old commit branch. Every
+        # `gh workflow run` without --ref follows the default branch, so the
+        # R2578 relay-first fix never executed (provider traffic went direct).
+        # Relay/watchdog now pass --ref main explicitly; this guard makes a
+        # future default-branch hijack fail loudly instead of running
+        # production traffic on stale code. Smoke runs are exempt (they may be
+        # dispatched from a test branch and never relay).
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SMOKE: ${{ github.event.inputs.smoke }}
+          RELAY: ${{ github.event.inputs.relay }}
+        run: |
+          set -euo pipefail
+          echo "production ref check: event=${{ github.event_name }} ref=$REF_NAME default_branch=$DEFAULT_BRANCH smoke=${SMOKE:-false} relay=${RELAY:-false}"
+          if [ "$SMOKE" = "true" ]; then
+            echo "::warning::smoke run is allowed on a non-production ref ($REF_NAME)"
+            exit 0
+          fi
+          if [ "$REF_NAME" != "main" ] || [ "$DEFAULT_BRANCH" != "main" ]; then
+            echo "::error::production iterate run requires ref=main and default_branch=main; got ref=$REF_NAME default_branch=$DEFAULT_BRANCH (refusing to run the loop on stale code)"
+            exit 1
+          fi
+
       - name: Install GitHub CLI and configure git
         run: |
           set -euo pipefail
@@ -648,7 +674,10 @@ jobs:
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
           relayed=0
           for attempt in 1 2 3; do
-            out=$(gh workflow run iterate.yml -f resume=true -f relay=true --repo "$repo" 2>&1)
+            # R2579: never inherit the repository default branch. It was once
+            # repointed at an old commit branch, silently pinning every relayed
+            # run to stale workflow code (bypassing the relay-first egress fix).
+            out=$(gh workflow run iterate.yml -f resume=true -f relay=true --ref main --repo "$repo" 2>&1)
             rc=$?
             if [ "$rc" = "0" ]; then
               echo "relayed next run on attempt $attempt"

@@ -32,6 +32,11 @@ jobs:
         run: |
           set -euo pipefail
           repo="${{ github.repository }}"
+          # R2579: surface the branch this scheduled watcher actually sees. The
+          # repository default branch was once repointed at an old commit branch,
+          # so scheduled workflows executed stale code. The dispatch below is
+          # pinned to main regardless of the default branch.
+          echo "watchdog ref check: ref=${{ github.ref_name }} default_branch=${{ github.event.repository.default_branch }}"
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo false)
           if [ "$paused" = "true" ]; then
             echo "CI_LOOP_PAUSED=true; watchdog will not restart the loop"
@@ -66,7 +71,8 @@ jobs:
           fi
           echo "::notice::no iterate run in flight for >~10min; dispatching a successor"
           for attempt in 1 2 3; do
-            if gh workflow run iterate.yml -f resume=true --repo "$repo"; then
+            # R2579: pin to main; never follow a hijacked repository default branch.
+            if gh workflow run iterate.yml -f resume=true --ref main --repo "$repo"; then
               echo "watchdog dispatched iterate on attempt $attempt"
               exit 0
             fi
