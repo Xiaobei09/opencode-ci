@@ -523,7 +523,7 @@ jobs:
           # runner 一起消失；旧诊断只 grep OpenCode 主日志，插件注入/桥失败在
           # Actions 日志里看不到。这里把插件 error/warn 尾部打印出来。
           if [ -s /tmp/opencode/v2plugin.log ]; then
-            PLUGIN_ERR=$(grep -aE ': (error|warn): ' /tmp/opencode/v2plugin.log 2>/dev/null | tail -40)
+            PLUGIN_ERR=$(grep -aE '\] (error|warn): ' /tmp/opencode/v2plugin.log 2>/dev/null | tail -40)
             PLUGIN_N=$(printf '%s\n' "$PLUGIN_ERR" | grep -c . 2>/dev/null || echo 0)
             echo "plugin error/warn lines: ${PLUGIN_N:-0} (last ${PLUGIN_N:-0} shown)"
             if [ -n "$PLUGIN_ERR" ]; then
