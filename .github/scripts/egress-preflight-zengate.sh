@@ -41,11 +41,45 @@ printf '%s\n' "$epoch" > "$PROBE_DIR/epoch"
 sleep 0.8
 
 HDR=$(mktemp)
-trap 'rm -f "$HDR"' EXIT
-body=$(jq -nc --arg m "$MODEL" --arg want "$WANT" \
-  '{model:$m,stream:false,max_tokens:32,messages:[{role:"user",content:("Reply with exactly: " + $want)}]}')
-raw=$(curl -sS -m "$TMO" --noproxy '*' -D "$HDR" -w '\n%{http_code}' \
-  -H 'Content-Type: application/json' -d "$body" \
+BODY_FILE=$(mktemp)
+trap 'rm -f "$HDR" "$BODY_FILE"' EXIT
+REQ_TMO="$TMO"
+if [ "${EGRESS_PROBE_BIG:-0}" = "1" ]; then
+  # R2598 (D8): a 4k probe cannot prove that a shared relay has enough of its
+  # per-IP bucket left for one resumed turn (~100k prompt tokens). Live tests
+  # showed relays that answer the 4k probe with 200 but 429 the next real turn,
+  # while other relays served two consecutive ~86k-token requests. Send the
+  # same context size as a real turn so "200" means "can serve a turn".
+  #
+  # This costs one real provider request (~86k tokens in live measurement), so
+  # the selector only runs it after direct failed, at most
+  # EGRESS_RELAY_FALLBACK_MAX times.
+  FILLER="$PROBE_DIR/filler.txt"
+  WANT_BYTES="${EGRESS_BIG_PROBE_BYTES:-400000}"
+  if [ ! -s "$FILLER" ] || [ "$(wc -c < "$FILLER" 2>/dev/null || echo 0)" -lt "$WANT_BYTES" ]; then
+    python3 - "$FILLER" "$WANT_BYTES" <<'PY' 2>/dev/null || true
+import sys
+path, want = sys.argv[1], int(sys.argv[2])
+unit = "The quick brown fox jumps over the lazy dog while the CI runner waits for the provider. "
+with open(path, "w", encoding="utf-8") as f:
+    while f.tell() < want:
+        f.write(unit)
+PY
+  fi
+  if [ ! -s "$FILLER" ]; then
+    printf '000\tprobe_setup\n'
+    exit 1
+  fi
+  jq -nc --rawfile ctx "$FILLER" --arg m "$MODEL" --arg want "$WANT" \
+    '{model:$m,stream:false,max_tokens:32,messages:[{role:"user",content:("Long context (the repetition is intentional; it makes this request the same size as a real resumed turn):\n" + $ctx + "\nEnd of context. Reply with exactly: " + $want)}]}' > "$BODY_FILE"
+  REQ_TMO="${EGRESS_BIG_PROBE_REQUEST_TIMEOUT:-50}"
+  echo "zengate big preflight body=$(wc -c < "$BODY_FILE" 2>/dev/null || echo ?) bytes model=$MODEL" >&2
+else
+  jq -nc --arg m "$MODEL" --arg want "$WANT" \
+    '{model:$m,stream:false,max_tokens:32,messages:[{role:"user",content:("Reply with exactly: " + $want)}]}' > "$BODY_FILE"
+fi
+raw=$(curl -sS -m "$REQ_TMO" --noproxy '*' -D "$HDR" -w '\n%{http_code}' \
+  -H 'Content-Type: application/json' --data-binary @"$BODY_FILE" \
   "http://127.0.0.1:${ZG_PORT}/v1/chat/completions" 2>/dev/null || true)
 code=${raw##*$'\n'}
 js=${raw%$'\n'*}
@@ -77,6 +111,8 @@ if [ -n "$META" ]; then
     printf 'retry_after=%s\n' "${ra:-}"
     printf 'nonce=%s\n' "$NONCE"
     printf 'code=%s\n' "$code"
+    printf 'big=%s\n' "${EGRESS_PROBE_BIG:-0}"
+    printf 'body_bytes=%s\n' "$(wc -c < "$BODY_FILE" 2>/dev/null || echo 0)"
     # R2582: the probe is NOT free. zengate injects the OpenCode system prompt,
     # so even max_tokens=32 consumed ~4k prompt tokens in a live measurement.
     # Record it so selection logs show how much of the daily bucket the probe
