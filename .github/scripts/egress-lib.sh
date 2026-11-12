@@ -25,14 +25,6 @@ EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
 # 00:44:19 UTC reset), so a 13h window can still land in the same bucket.
 # Successful relays are avoided for 24h; every run starts on a fresh IP.
 EGRESS_REUSE_WINDOW="${EGRESS_REUSE_WINDOW:-86400}"
-# R2595 (D8, operator: "200 then 429 keeps getting worse"): the anonymous free
-# bucket resets daily at a fixed UTC boundary (observed 00:44:19; 48/48 quota
-# 429 retry-after values converge there). A rolling 24h reuse window is wrong
-# for relays: a relay used at 23:00 yesterday is fresh again at 00:45 today,
-# but the rolling window would keep excluding it until 23:00 tonight. At ~288
-# selections/day that shrinks the fresh pool all day and forces the selector
-# onto dirtier exits. Align the cutoff with the most recent reset boundary.
-EGRESS_QUOTA_RESET_UTC="${EGRESS_QUOTA_RESET_UTC:-00:44:19}"
 EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
 # R2567 (operator: is provider traffic really leaving through the selected
 # proxy?): the old probe used www.cloudflare.com, which the local CONNECT proxy
@@ -173,35 +165,6 @@ egress_usage_init() {
   chmod 600 "$EGRESS_USAGE" 2>/dev/null || true
 }
 
-# egress_quota_reset_epoch: epoch of the most recent daily free-quota reset.
-# Empty EGRESS_QUOTA_RESET_UTC disables reset alignment (rolling window only).
-egress_quota_reset_epoch() {
-  local hhmmss="${EGRESS_QUOTA_RESET_UTC:-}" now today
-  [ -n "$hhmmss" ] || return 1
-  now=$(egress_now)
-  today=$(date -u -d "today $hhmmss" +%s 2>/dev/null) || return 1
-  if [ "$today" -gt "$now" ]; then
-    date -u -d "yesterday $hhmmss" +%s 2>/dev/null || return 1
-  else
-    printf '%s\n' "$today"
-  fi
-}
-
-# egress_usage_cutoff: entries with last_used > cutoff are "recently used".
-# Use the later of (now - reuse_window) and the last quota reset so a new
-# provider day frees every candidate consumed during the previous day.
-egress_usage_cutoff() {
-  local now win cutoff reset
-  now=$(egress_now)
-  win="${EGRESS_REUSE_WINDOW:-86400}"
-  cutoff=$((now - win))
-  reset=$(egress_quota_reset_epoch 2>/dev/null || true)
-  if [ -n "$reset" ] && [ "$reset" -gt "$cutoff" ] 2>/dev/null; then
-    cutoff=$reset
-  fi
-  printf '%s\n' "$cutoff"
-}
-
 egress_usage_prune() {
   local now tmp
   now=$(egress_now)
@@ -219,19 +182,19 @@ egress_usage_prune() {
 
 # egress_usage_has_key <candidate-key>
 egress_usage_has_key() {
-  local key="$1" cutoff
-  cutoff=$(egress_usage_cutoff)
-  jq -e --arg k "$key" --argjson cutoff "$cutoff" \
-    '(.entries[$k].last_used // 0) > $cutoff' "$EGRESS_USAGE" >/dev/null 2>&1
+  local key="$1" now
+  now=$(egress_now)
+  jq -e --arg k "$key" --argjson now "$now" --argjson win "$EGRESS_REUSE_WINDOW" \
+    '(.entries[$k].last_used // 0) > ($now - $win)' "$EGRESS_USAGE" >/dev/null 2>&1
 }
 
 # egress_usage_has_ip <observed-egress-ip>
 egress_usage_has_ip() {
-  local ip="$1" cutoff
+  local ip="$1" now
   [ -n "$ip" ] && [ "$ip" != "unknown" ] || return 1
-  cutoff=$(egress_usage_cutoff)
-  jq -e --arg ip "$ip" --argjson cutoff "$cutoff" \
-    '[.entries[] | select(.egress == $ip and (.last_used // 0) > $cutoff)] | length > 0' \
+  now=$(egress_now)
+  jq -e --arg ip "$ip" --argjson now "$now" --argjson win "$EGRESS_REUSE_WINDOW" \
+    '[.entries[] | select(.egress == $ip and (.last_used // 0) > ($now - $win))] | length > 0' \
     "$EGRESS_USAGE" >/dev/null 2>&1
 }
 
@@ -267,14 +230,6 @@ egress_usage_seed_previous() {
   [ -n "$picked" ] || return 0
   picked_epoch=$(date -u -d "$picked" +%s 2>/dev/null || echo 0)
   [ "$picked_epoch" -gt 0 ] || return 0
-  # R2595: a relay selected before the most recent daily reset already has a
-  # fresh bucket again; seeding it as recently-used would exclude a healthy
-  # candidate for no reason.
-  local reset
-  reset=$(egress_quota_reset_epoch 2>/dev/null || echo 0)
-  if [ "$reset" -gt 0 ] && [ "$picked_epoch" -lt "$reset" ]; then
-    return 0
-  fi
   [ $(( $(egress_now) - picked_epoch )) -le "$EGRESS_REUSE_WINDOW" ] || return 0
   egress=$(jq -r '.egress_ip // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
   egress_usage_add "$up" "$egress" "previous-run" || true
