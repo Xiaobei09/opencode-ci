@@ -267,6 +267,14 @@ egress_usage_seed_previous() {
   [ -n "$picked" ] || return 0
   picked_epoch=$(date -u -d "$picked" +%s 2>/dev/null || echo 0)
   [ "$picked_epoch" -gt 0 ] || return 0
+  # R2595: a relay selected before the most recent daily reset already has a
+  # fresh bucket again; seeding it as recently-used would exclude a healthy
+  # candidate for no reason.
+  local reset
+  reset=$(egress_quota_reset_epoch 2>/dev/null || echo 0)
+  if [ "$reset" -gt 0 ] && [ "$picked_epoch" -lt "$reset" ]; then
+    return 0
+  fi
   [ $(( $(egress_now) - picked_epoch )) -le "$EGRESS_REUSE_WINDOW" ] || return 0
   egress=$(jq -r '.egress_ip // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
   egress_usage_add "$up" "$egress" "previous-run" || true
