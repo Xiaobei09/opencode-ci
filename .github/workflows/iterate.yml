@@ -280,6 +280,13 @@ jobs:
           EGRESS_SELECT_MAX: "0"
           EGRESS_SELECT_BUDGET: "0"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
+          # R2597: direct stays candidate #1. Only after direct fails, verify at
+          # most two relays, each with a real-turn-sized probe (400KB ≈ 86k
+          # tokens) instead of trusting the 4k probe. Set fallback max to 0 to
+          # restore the old stop-on-direct-quota behavior.
+          EGRESS_RELAY_FALLBACK_MAX: "2"
+          EGRESS_BIG_PROBE_BYTES: "400000"
+          EGRESS_BIG_PROBE_TIMEOUT: "60"
         run: |
           set +e
           bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
