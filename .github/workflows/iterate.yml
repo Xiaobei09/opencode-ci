@@ -171,6 +171,7 @@ jobs:
           # 也要清掉上一轮的失败计数；否则"重启以应用更新"后仍沿用旧 streak，
           # 下一轮再失败一次就触发 3 连败暂停，违背"启动后保持接力运行"。
           gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+          gh variable set CI_EGRESS_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "")
           if [ "$paused" = "true" ]; then
             gh variable set CI_LOOP_PAUSED --body false --repo "$repo" >/dev/null 2>&1 || true
@@ -508,6 +509,14 @@ jobs:
             STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "watcher_reason=${STOP_REASON:-unknown}" >> "$GITHUB_OUTPUT"
+            # R2596: an egress quota stop is external (per-IP anonymous bucket),
+            # not a content/code failure. It must not count toward the 3-round
+            # pause: on 2026-11-11 three dirty runner IPs paused the loop for
+            # 11 hours until a manual dispatch. The fix is another fresh runner
+            # IP, so failure_guard relays immediately.
+            if printf '%s' "$STOP_REASON" | grep -qiE 'quota exhausted|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
+              echo "egress_quota_stop=true" >> "$GITHUB_OUTPUT"
+            fi
             # R2535：watcher 是进程外停止，不能一律按失败计。auto-continue 在首个
             # 正常 assistant 回合写该标记；有 200 的轮次必须清零 streak（运营者规则：
             # 只有连续 3 轮没有任何 200 才停循环）。
@@ -528,6 +537,9 @@ jobs:
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "watcher_reason=auto-continue: ${STOP_REASON}" >> "$GITHUB_OUTPUT"
             echo "round_success=${ROUND_SUCCESS}" >> "$GITHUB_OUTPUT"
+            if printf '%s' "$STOP_REASON" | grep -qiE 'quota exhausted|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
+              echo "egress_quota_stop=true" >> "$GITHUB_OUTPUT"
+            fi
             echo "::warning::auto-continue ended this round: ${STOP_REASON} (round_success=${ROUND_SUCCESS}); relay policy decides whether to pause"
             RC=0
           fi
@@ -609,7 +621,53 @@ jobs:
           select_outcome="${{ steps.select_egress.outcome }}"
           select_reason="${{ steps.select_egress.outputs.reason }}"
           restore_outcome="${{ steps.restore_ws.outcome }}"
+          quota_stop="${{ steps.run_opencode.outputs.egress_quota_stop }}"
           allow=false
+          # R2596 (D8, operator: "find an exit that actually works"): a dirty
+          # runner IP is external. The old 3-round pause stopped the loop for
+          # 11 hours on 2026-11-11 after three quota 429s, so no fresh IP was
+          # ever tried. Egress-only failures now relay immediately (with a
+          # growing backoff after several tries) and never set CI_LOOP_PAUSED.
+          egress_only=false
+          if [ "$quota_stop" = "true" ] && [ "$round_success" != "true" ]; then
+            egress_only=true
+          fi
+          if [ "$select_outcome" = "failure" ] \
+             && printf '%s' "$select_reason" | grep -qiE 'free-quota|quota exhausted|FreeUsageLimit'; then
+            egress_only=true
+          fi
+          # Safety net: OpenCode can exit 0 after a quota 429 without the watcher
+          # writing a stop marker. Treat the run as an egress-only retry too, so
+          # a restored/stale 429 cannot push the loop into the 3-round pause.
+          if [ "$egress_only" != "true" ] && [ "$round_success" != "true" ] \
+             && [ -s "$RUNNER_TEMP/opencode-errors.txt" ] \
+             && grep -qiE 'FreeUsageLimit|free usage limit|provider\.free-limit' "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null; then
+            egress_only=true
+          fi
+          # A healthy turn proves the egress works; clear the egress retry streak.
+          if [ -f "$RUNNER_TEMP/round-had-success" ]; then
+            gh variable set CI_EGRESS_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+          fi
+          egress_retry_policy() {
+            local cur next delay
+            cur=$(gh variable get CI_EGRESS_STREAK --repo "$repo" 2>/dev/null || echo 0)
+            case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+            next=$((cur + 1))
+            gh variable set CI_EGRESS_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1 || true
+            # Egress quota says nothing about the content loop. Keep the content
+            # failure counter clear so a later real failure still pauses after 3.
+            gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+            delay=0
+            if [ "$next" -ge 4 ]; then
+              delay=$(( 15 << (next - 4) ))
+              [ "$delay" -gt 300 ] && delay=300
+            fi
+            echo "::notice::egress-only failure #$next (anonymous quota is per exit IP); not counting toward pause; next fresh runner IP in ${delay}s"
+            echo "egress_retry=true" >> "$GITHUB_OUTPUT"
+            echo "egress_retry_count=$next" >> "$GITHUB_OUTPUT"
+            echo "relay_delay=$delay" >> "$GITHUB_OUTPUT"
+            allow=true
+          }
           if [ "$restore_outcome" != "success" ]; then
             # R2580（D2）：restore 失败时 OpenCode/Select 都被跳过；这里只记录真实
             # 原因，后续 skipped 分支按一次失败轮计数并接力。绝不能启动 OpenCode
@@ -621,6 +679,11 @@ jobs:
             # R2521：本轮如果出现过正常回合（200/正常产出），失败计数清零；
             # 只有真正"连续 3 轮没有任何成功"才暂停。END-ROUND-CI 的 marker
             # 会带 success=true/false；egress watcher 停止按无成功处理。
+            if [ "$egress_only" = "true" ]; then
+              egress_retry_policy
+              echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             if [ "$round_success" = "true" ]; then
               gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               allow=true
@@ -684,6 +747,11 @@ jobs:
               echo "select_failed=true" >> "$GITHUB_OUTPUT"
               echo "::warning::egress selection failed; ${select_reason:-no candidate answered 200}"
             fi
+            if [ "$egress_only" = "true" ]; then
+              egress_retry_policy
+              echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             if [ -f "$RUNNER_TEMP/round-had-success" ]; then
               gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               allow=true
@@ -732,6 +800,11 @@ jobs:
             exit 0
           fi
           echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
+          relay_delay="${{ steps.failure_guard.outputs.relay_delay }}"
+          if [ -n "$relay_delay" ] && [ "$relay_delay" -gt 0 ] 2>/dev/null; then
+            echo "egress retry backoff: sleeping ${relay_delay}s before dispatching a fresh runner"
+            sleep "$relay_delay"
+          fi
           relayed=0
           for attempt in 1 2 3; do
             # R2579: never inherit the repository default branch. It was once
@@ -778,7 +851,22 @@ jobs:
           select_failed="${{ steps.failure_guard.outputs.select_failed }}"
           select_reason="${{ steps.select_egress.outputs.reason }}"
           restore_failed="${{ steps.failure_guard.outputs.restore_failed }}"
-          if [ "$restore_failed" = "true" ]; then
+          egress_retry="${{ steps.failure_guard.outputs.egress_retry }}"
+          egress_n="${{ steps.failure_guard.outputs.egress_retry_count }}"
+          if [ "$egress_retry" = "true" ]; then
+            # R2596: during a dirty-IP period the loop now retries every 1-5 min.
+            # Do not spam Telegram: notify at 1/3/6/12/24/48 and then every 24.
+            case "$egress_n" in
+              1|3|6|12|24|48) ;;
+              *) if [ $((egress_n % 24)) -ne 0 ] 2>/dev/null; then
+                   echo "egress retry #$egress_n: suppressing duplicate TG notice"
+                   exit 0
+                 fi ;;
+            esac
+          fi
+          if [ "$egress_retry" = "true" ]; then
+            reason="出口配额耗尽（外部按 IP 的匿名桶）；循环未暂停，已换新 runner IP 重试（第 ${egress_n} 次）"
+          elif [ "$restore_failed" = "true" ]; then
             reason="环境/工作区还原失败；已跳过 OpenCode 并按失败计数接力新 run（快照未被覆盖）"
           elif [ "$select_failed" = "true" ]; then
             reason="出口选择失败：${select_reason:-no candidate answered 200}；已按失败计数接力新 run"
@@ -797,6 +885,7 @@ jobs:
             reason="opencode 结束（outcome=${outcome:-unknown}），已接力新 run"
           fi
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
+          [ "$egress_retry" = "true" ] && streak=$(gh variable get CI_EGRESS_STREAK --repo "$repo" 2>/dev/null || echo "?")
           # R2587（D7）：结束通知必须带真实错误证据，而不只是 outcome。退出码
           # 与本次 Run OpenCode 抓到的最后一条错误（已去 ANSI/CR）一并附上。
           rc="${{ steps.run_opencode.outputs.exit_code }}"
