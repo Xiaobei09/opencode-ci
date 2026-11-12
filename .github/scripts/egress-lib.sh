@@ -17,6 +17,11 @@ EGRESS_UPSTREAM_FILE="$EGRESS_STATE_DIR/upstream"
 EGRESS_EPOCH_FILE="$EGRESS_STATE_DIR/epoch"
 EGRESS_CANDIDATES_FILE="$EGRESS_STATE_DIR/candidates.tsv"
 EGRESS_STATE_FILE="${EGRESS_STATE_FILE:-$HOME/.config/opencode/exit-proxy.json}"
+# Diagnostic/test isolation: EGRESS_STATE_FILE is NOT derived from
+# EGRESS_STATE_DIR. A local selector test that overrides only the state dir
+# still writes the real $HOME selection report (observed R2598: a test relay
+# overwrote exit-proxy.json while the live upstream file stayed `direct`).
+# Always set EGRESS_STATE_FILE together with EGRESS_STATE_DIR in tests.
 EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
 # R2565: anonymous free quota is per egress IP. Reusing the same relay across
 # runs means paying with a partially consumed bucket; the provider's 429
