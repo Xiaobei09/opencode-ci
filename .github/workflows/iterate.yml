@@ -514,7 +514,7 @@ jobs:
             # pause: on 2026-11-11 three dirty runner IPs paused the loop for
             # 11 hours until a manual dispatch. The fix is another fresh runner
             # IP, so failure_guard relays immediately.
-            if printf '%s' "$STOP_REASON" | grep -qiE 'quota exhausted|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
+            if printf '%s' "$STOP_REASON" | grep -qiE 'quota|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
               echo "egress_quota_stop=true" >> "$GITHUB_OUTPUT"
             fi
             # R2535：watcher 是进程外停止，不能一律按失败计。auto-continue 在首个
@@ -537,7 +537,7 @@ jobs:
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "watcher_reason=auto-continue: ${STOP_REASON}" >> "$GITHUB_OUTPUT"
             echo "round_success=${ROUND_SUCCESS}" >> "$GITHUB_OUTPUT"
-            if printf '%s' "$STOP_REASON" | grep -qiE 'quota exhausted|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
+            if printf '%s' "$STOP_REASON" | grep -qiE 'quota|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
               echo "egress_quota_stop=true" >> "$GITHUB_OUTPUT"
             fi
             echo "::warning::auto-continue ended this round: ${STOP_REASON} (round_success=${ROUND_SUCCESS}); relay policy decides whether to pause"
