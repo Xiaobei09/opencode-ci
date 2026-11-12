@@ -263,10 +263,20 @@ handle_quota() {
   log "quota error detected (upstream=$CUR_UP, retry_after=${retry_after:-?}s)"
   # A quota error after the 120s preflight window still means this egress IP is
   # exhausted (possibly after a long healthy run). Keep it out of future
-  # selection for the provider's reset window too; the current run keeps its
-  # tunnel and follows the normal 3-consecutive-error policy.
+  # selection for the provider's reset window too.
   if [ "$selected_at" -gt 0 ] && [ $((now - selected_at)) -gt "$PROBE_FALSE_WINDOW" ]; then
     blacklist_selected "quota-after-healthy-window" "$ttl" || true
+    # R2594 (D8): a verified Free usage limit with a long Retry-After is bucket
+    # exhaustion, not a transient burst. Waiting for the 3-consecutive policy
+    # spent two more auto-continue turns (~2 min) on an egress that cannot
+    # recover within the run; the bucket is per egress IP and refills only when
+    # the provider's Retry-After elapses. End the round now so the relay starts
+    # the next run with a fresh runner IP. Short/unparseable Retry-After keeps
+    # the streak policy (possible burst window).
+    if [ -z "$retry_after" ] \
+       || [ "$retry_after" -ge "${EGRESS_QUOTA_HARD_STOP_SECONDS:-600}" ] 2>/dev/null; then
+      stop_run "quota exhausted on egress $CUR_UP after $((now - selected_at))s (retry_after=${retry_after:-?}s); blacklisted for ${ttl}s; ending this round so the next run selects a fresh egress"
+    fi
   fi
   record_failure quota "$line"
 }
@@ -326,6 +336,12 @@ while IFS= read -r line; do
       # succeed (quota is evaluated at the provider), so do not reset the
       # failure streak here; only a healthy turn does that.
       log "provider connection established (diagnostic, upstream=$CUR_UP)"
+      ;;
+    *"close "*"target="*opencode.ai*"upstream="*)
+      # R2594 (D8): byte accounting proves whether the tunnel carried a real
+      # turn (100k+ prompt tokens, hundreds of KB) or only a small probe. This
+      # is the direct answer to "did the endpoint really use the proxy exit?".
+      log "provider tunnel closed (${line:0:220})"
       ;;
   esac
 done < <(tail -q -n +1 -F -- "$PROXY_LOG" "$PLUGIN_LOG" 2>/dev/null)

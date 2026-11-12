@@ -103,7 +103,12 @@ def watch_epoch():
         time.sleep(0.4)
 
 
-def pipe(a, b, label):
+def pipe(a, b, label, stats=None, key=None):
+    # R2594 (D8): count bytes per direction so the close line can prove that a
+    # real inference turn (100k+ prompt tokens, hundreds of KB) traversed this
+    # tunnel, not just a small preflight probe. Previously the proxy only
+    # logged CONNECT, which could not distinguish probe traffic from turns.
+    total = 0
     try:
         while True:
             try:
@@ -113,10 +118,16 @@ def pipe(a, b, label):
                 break
             if not data:
                 break
+            total += len(data)
             b.sendall(data)
     except OSError:
         pass
     finally:
+        if stats is not None and key is not None:
+            try:
+                stats[key] += total
+            except (KeyError, TypeError):
+                pass
         for s in (a, b):
             try:
                 s.shutdown(socket.SHUT_RDWR)
@@ -222,8 +233,18 @@ def handle(client):
         upstream.settimeout(IDLE_TIMEOUT)
         with lock:
             active.append((client, upstream))
-        threading.Thread(target=pipe, args=(client, upstream, target), daemon=True).start()
-        pipe(upstream, client, target)
+        # Byte counters: sent = client request -> upstream, recv = provider
+        # response -> client. The close line is the proof of real traffic.
+        stats = {"c2u": len(rest or b""), "u2c": len(extra or b"")}
+        threading.Thread(
+            target=pipe, args=(client, upstream, target, stats, "c2u"), daemon=True
+        ).start()
+        pipe(upstream, client, target, stats, "u2c")
+        print(
+            f"close {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+            f"target={target} upstream={label} sent={stats['c2u']} recv={stats['u2c']}",
+            flush=True,
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"error target={target} upstream={up!r} {exc}", flush=True)
         try:
