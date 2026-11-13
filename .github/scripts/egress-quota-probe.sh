@@ -43,6 +43,10 @@ STATE_DIR="${EGRESS_STATE_DIR:-${RUNNER_TEMP:-/tmp}/egress}"
 UP_FILE="$STATE_DIR/upstream"
 META="${EGRESS_QUOTA_PROBE_META:-$STATE_DIR/quota-probe.meta}"
 TMO="${EGRESS_QUOTA_PROBE_TIMEOUT:-15}"
+case "$TMO" in ''|*[!0-9]*) TMO=15 ;; esac
+# zengate rejects REQUEST_TIMEOUT_MS below 10000; clamp the per-probe timeout
+# so a small diagnostic value cannot prevent the probe server from starting.
+[ "$TMO" -lt 10 ] && TMO=10
 MAX_ALT="${EGRESS_QUOTA_PROBE_MAX_ALTERNATES:-2}"
 START_TMO="${EGRESS_QUOTA_PROBE_START_TIMEOUT:-30}"
 
@@ -118,7 +122,7 @@ fi
 
 if ! EGRESS_PROBE_REQUEST_TIMEOUT_MS=$((TMO * 1000)) \
      timeout "$START_TMO" bash "$SCRIPT_DIR/egress-probe-server.sh" start \
-       >> "$STATE_DIR/quota-probe.log" 2>&1; then
+       >> "$STATE_DIR/quota-probe-server.log" 2>&1; then
   bash "$SCRIPT_DIR/egress-probe-server.sh" stop >/dev/null 2>&1 || true
   meta "scope=inconclusive"
   meta "note=probe server unavailable"

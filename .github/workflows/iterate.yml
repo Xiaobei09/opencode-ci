@@ -1158,7 +1158,8 @@ jobs:
               $1=="alt_code"{code=$2}
               $1=="alt_reason"{reason=$2}
               $1=="scope"{scope=$2}
-              END{if(scope!="") printf "429 结束探针：%s → %s（code=%s，reason=%s，scope=%s）", up, alt, code, reason, scope}
+              $1=="note"{note=$2}
+              END{if(scope=="") exit; printf "429 结束探针：%s → %s（code=%s，reason=%s，scope=%s%s）", (up==""?"?":up), (alt==""?"?":alt), (code==""?"?":code), (reason==""?"?":reason), scope, (note==""?"":"，note=" note)}
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
           if [ -n "$probe_line" ]; then
@@ -1258,7 +1259,8 @@ jobs:
               $1=="alt_code"{code=$2}
               $1=="alt_reason"{reason=$2}
               $1=="scope"{scope=$2}
-              END{if(scope!="") printf "429 结束探针：%s → %s（code=%s，reason=%s，scope=%s）", up, alt, code, reason, scope}
+              $1=="note"{note=$2}
+              END{if(scope=="") exit; printf "429 结束探针：%s → %s（code=%s，reason=%s，scope=%s%s）", (up==""?"?":up), (alt==""?"?":alt), (code==""?"?":code), (reason==""?"?":reason), scope, (note==""?"":"，note=" note)}
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
           if [ -n "$probe_line" ]; then
