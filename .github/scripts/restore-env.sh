@@ -389,6 +389,15 @@ for d in "$HOME/.config/opencode/v2lib" "$HOME/.opencode/v2lib"; do
     fi
     echo "v2lib code sync ok: $d/halt-release.ts matches repo (sha=$(sha256sum "$d/halt-release.ts" | cut -c1-12))"
   fi
+  # Option C (resume-once) is a separate plugin; a stale/missing copy must not
+  # silently disable post-restart resume while the loop's own files look green.
+  if [ -f "$ENV_SRC/config/v2lib/resume-once.ts" ]; then
+    if ! cmp -s "$ENV_SRC/config/v2lib/resume-once.ts" "$d/resume-once.ts"; then
+      echo "::error::v2lib code sync mismatch at $d/resume-once.ts (repo != runtime)"
+      exit 1
+    fi
+    echo "v2lib code sync ok: $d/resume-once.ts matches repo (sha=$(sha256sum "$d/resume-once.ts" | cut -c1-12))"
+  fi
   sync_checked=$((sync_checked + 1))
   echo "v2lib code sync ok: $d/auto-continue.ts matches repo (sha=$(sha256sum "$d/auto-continue.ts" | cut -c1-12))"
 done
@@ -407,6 +416,18 @@ if [ -f "$ENV_SRC/config/plugins/tg-bridge-v2.ts" ] && [ -f "$HOME/.config/openc
   fi
 else
   echo "::warning::plugin code sync not verified (source or runtime entry missing)"
+fi
+
+# Option C entry: verify the copy independently of the bridge entry, otherwise a
+# single-file copy failure disables one-shot resume with no visible symptom.
+if [ -f "$ENV_SRC/config/plugins/resume-once-v2.ts" ]; then
+  if [ -f "$HOME/.config/opencode/plugins/resume-once-v2.ts" ] \
+     && cmp -s "$ENV_SRC/config/plugins/resume-once-v2.ts" "$HOME/.config/opencode/plugins/resume-once-v2.ts"; then
+    echo "plugin code sync ok: resume-once-v2.ts matches repo (sha=$(sha256sum "$HOME/.config/opencode/plugins/resume-once-v2.ts" | cut -c1-12))"
+  else
+    echo "::error::plugin code sync mismatch at $HOME/.config/opencode/plugins/resume-once-v2.ts (repo != runtime)"
+    exit 1
+  fi
 fi
 
 if [ ! -d "$HOME/.config/opencode/plugins" ]; then

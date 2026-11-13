@@ -369,6 +369,12 @@ jobs:
           BUDGET_SECONDS: ${{ inputs.budget_seconds }}
           EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
+          # Option C: one-shot resume after a CI restart, independent of the
+          # auto-continue loop. Default on; set repository variable
+          # CI_RESUME_ONCE=0 to disable. RESUME_ONCE_FORCE=1 lets it run even
+          # while the auto loop gate is open (it never overrides halted/loop-off).
+          CI_RESUME_ONCE: ${{ vars.CI_RESUME_ONCE || '1' }}
+          RESUME_ONCE_FORCE: ${{ vars.RESUME_ONCE_FORCE || '' }}
         run: |
           set +e
           # R2576 (D9): stamp the OpenCode phase so the snapshot step can report
@@ -457,10 +463,14 @@ jobs:
           fi
           # R2618: no default per-round timeout. The old 600s budget killed a
           # healthy, still-working turn every 10 minutes and relayed a new run.
-          # 0 = run until OpenCode exits or the egress watcher sees 3 consecutive
-          # 429s; the job-level timeout-minutes: 360 remains the hard safety cap.
+          # 0 = run until OpenCode exits or the egress watcher sees a verified
+          # quota 429 (R2620: the first one ends the round); the job-level
+          # timeout-minutes: 360 remains the hard safety cap.
           BUDGET="${BUDGET_SECONDS:-0}"
           SID=""
+          # Option C receives the exact session this run opens, so it never
+          # guesses a different front/pinned target from restored state.
+          RESUME_SID=""
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
           fi
@@ -499,19 +509,41 @@ jobs:
           echo "recovery probe: recover=$([ -n "$RECOVER" ] && echo yes || echo no) msgs=$RECOVER_MSGS"
           if [ -n "$SID" ] && [ "$SID_PRESENT" = "yes" ]; then
             ARGS=(--standalone --session "$SID")
+            RESUME_SID="$SID"
             echo "resuming bound session present_in_db=$SID_PRESENT"
           elif [ -n "$SID" ] && [ "$SID_PRESENT" != "no" ] && [ "$SID_PRESENT" != "no-table" ]; then
             ARGS=(--standalone --session "$SID")
+            RESUME_SID="$SID"
             echo "resuming pinned session (db unreadable, present_in_db=$SID_PRESENT)"
           elif [ -n "$RECOVER" ]; then
             ARGS=(--standalone --session "$RECOVER")
+            RESUME_SID="$RECOVER"
             echo "recovery: bound absent (present_in_db=$SID_PRESENT); pinned the richest restored session (msgs=$RECOVER_MSGS)"
           else
             ARGS=(--standalone --continue)
+            RESUME_SID=""
             if [ -n "$SID" ]; then
               echo "bound session absent (present_in_db=$SID_PRESENT); no richer session to recover; falling back to --continue"
             else
               echo "no bound session found; continuing the last session"
+            fi
+          fi
+          # Option C (resume-once-v2 plugin): arm the exact session for one
+          # post-restart continuation. It is independent of auto-continue and
+          # no-ops when the loop is already active. Default on.
+          RESUME_ONCE_ENABLED=1
+          if printf '%s' "${CI_RESUME_ONCE:-1}" | grep -qiE '^(0|false|no|off)$'; then
+            RESUME_ONCE_ENABLED=0
+          fi
+          if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_SID" ]; then
+            export RESUME_ONCE_SIDS="$RESUME_SID"
+            echo "option C resume-once armed: $RESUME_SID"
+          else
+            export RESUME_ONCE_SIDS=""
+            if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
+              echo "option C resume-once skipped: no explicit session (--continue path)"
+            else
+              echo "option C resume-once disabled by CI_RESUME_ONCE=${CI_RESUME_ONCE:-}"
             fi
           fi
           if [ -f "$EGRESS_DIR/stop" ]; then
