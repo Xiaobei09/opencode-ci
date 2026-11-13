@@ -434,9 +434,9 @@ jobs:
           # egress-selection step after comparing this run's exit with the
           # previous run's. Do not set it here (a step-level env would shadow
           # the computed value).
-          # R2625: after a verified quota 429 ends the round, spend one real
-          # zengate request on an alternate egress to test whether the quota is
-          # path-specific. Diagnostic only; set the repo variable to 0 to skip.
+          # R2628: after a verified quota 429 ends the round, re-probe the
+          # CURRENT egress (a fresh alternate always has quota and says
+          # nothing). Diagnostic only; set the repo variable to 0 to skip.
           EGRESS_QUOTA_PROBE: ${{ vars.EGRESS_QUOTA_PROBE || '1' }}
         run: |
           set +e
@@ -781,15 +781,15 @@ jobs:
             echo "::warning::auto-continue ended this round: ${STOP_REASON} (round_success=${ROUND_SUCCESS}); relay policy decides whether to pause"
             RC=0
           fi
-          # R2625 (operator: "429 结束时再次使用 zengate 测试"): the 0-message
-          # gateway probe always gets 400 even while quota is exhausted, so it
-          # cannot tell us whether the quota is path-specific. After a verified
-          # quota stop, spend one REAL zengate request on an alternate egress
-          # (direct -> relay, relay -> direct). Diagnostic only: it never
-          # changes selection, the stop reason, or the relay policy.
+          # R2628 (operator: "改为探测当前出口，因为探测新出口没有意义"): a
+          # fresh alternate always has quota, so R2625's direct->relay probe
+          # returned 200 on every round and carried no signal. After a verified
+          # quota stop, re-probe the SAME egress the round used (direct -> the
+          # same runner IP, relay -> the same relay entry). Diagnostic only: it
+          # never changes selection, the stop reason, or the relay policy.
           if [ "${EGRESS_QUOTA_PROBE:-1}" != "0" ] \
              && printf '%s' "${STOP_REASON:-}" | grep -qiE 'quota 429|FreeUsageLimit|provider\.free-limit'; then
-            echo "quota-end zengate diagnostic: probing an alternate egress (real request)"
+            echo "quota-end zengate diagnostic: re-probing the current egress (real request)"
             EGRESS_QUOTA_PROBE=1 bash "$GITHUB_WORKSPACE/.github/scripts/egress-quota-probe.sh" \
               2>&1 | tee "$EGRESS_DIR/quota-probe.log" || true
           fi
@@ -1207,18 +1207,25 @@ jobs:
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
-          # R2625: surface the round-end zengate scope probe, so the operator
-          # sees whether an alternate path still had quota or every path 429'd.
+          # R2628: surface the round-end zengate probe, so the operator sees
+          # whether the CURRENT egress is still exhausted.
           probe_line=""
           if [ -s "$RUNNER_TEMP/egress/quota-probe.meta" ]; then
             probe_line=$(awk -F= '
               $1=="round_up"{up=$2}
-              $1=="alt_up"{alt=$2}
-              $1=="alt_code"{code=$2}
-              $1=="alt_reason"{reason=$2}
-              $1=="scope"{scope=$2}
+              $1=="current_up"{cur=$2}
+              $1=="code"{code=$2}
+              $1=="reason"{reason=$2}
+              $1=="result"{result=$2}
               $1=="note"{note=$2}
-              END{if(scope=="") exit; printf "429 结束探针：%s → %s（code=%s，reason=%s，scope=%s%s）", (up==""?"?":up), (alt==""?"?":alt), (code==""?"?":code), (reason==""?"?":reason), scope, (note==""?"":"，note=" note)}
+              END{
+                if(result=="") exit
+                if(cur=="") cur=up
+                label=result
+                if(result=="current-exhausted") label="仍无额度"
+                else if(result=="current-ok") label="仍有额度"
+                printf "429 结束探针：当前出口 %s（code=%s，reason=%s，结果=%s%s）", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":"，note=" note)
+              }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
           if [ -n "$probe_line" ]; then
@@ -1307,19 +1314,26 @@ jobs:
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
-          # R2625: the stop card must also show the round-end zengate scope
-          # probe, because the 3/3 quota pause is exactly when "is it only
-          # direct?" matters most.
+          # R2628: the stop card must also show the round-end zengate probe,
+          # because the 3/3 quota pause is exactly when the current egress
+          # state matters most.
           probe_line=""
           if [ -s "$RUNNER_TEMP/egress/quota-probe.meta" ]; then
             probe_line=$(awk -F= '
               $1=="round_up"{up=$2}
-              $1=="alt_up"{alt=$2}
-              $1=="alt_code"{code=$2}
-              $1=="alt_reason"{reason=$2}
-              $1=="scope"{scope=$2}
+              $1=="current_up"{cur=$2}
+              $1=="code"{code=$2}
+              $1=="reason"{reason=$2}
+              $1=="result"{result=$2}
               $1=="note"{note=$2}
-              END{if(scope=="") exit; printf "429 结束探针：%s → %s（code=%s，reason=%s，scope=%s%s）", (up==""?"?":up), (alt==""?"?":alt), (code==""?"?":code), (reason==""?"?":reason), scope, (note==""?"":"，note=" note)}
+              END{
+                if(result=="") exit
+                if(cur=="") cur=up
+                label=result
+                if(result=="current-exhausted") label="仍无额度"
+                else if(result=="current-ok") label="仍有额度"
+                printf "429 结束探针：当前出口 %s（code=%s，reason=%s，结果=%s%s）", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":"，note=" note)
+              }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
           if [ -n "$probe_line" ]; then
