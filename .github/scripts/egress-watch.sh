@@ -44,6 +44,7 @@ fail_streak=0
 last_fail_at=0
 quota_streak=0
 quota_last_at=0
+quota_last_msg=""
 selected_at=0
 selected_kind=""
 selected_egress=""
@@ -118,19 +119,24 @@ record_failure() {
   fi
 }
 
-# record_quota <line> [retry_after]
+# record_quota <line> [retry_after] [msg_at]
 # R2618 (operator: "连续3个429再结束"): a single quota 429 no longer ends the
 # round. Count verified 429s; the third consecutive one stops the round and the
 # workflow pauses the loop (no successor). A healthy turn resets the streak.
+# Dedupe by the error message timestamp, not wall-clock: retries of the same
+# failed message share msg_at, while genuinely distinct 429s have distinct
+# msg_at values. A 20s wall-clock window would swallow rapid retries and make
+# the 3-429 rule unreachable.
 # Auto-continue has its own 3-consecutive-error limit, so the round still ends
 # even if the watcher misses the third line in the shutdown race.
 record_quota() {
-  local line="$1" retry_after="${2:-?}" now
+  local line="$1" retry_after="${2:-?}" msg_at="${3:-}" now
   now=$(egress_now)
-  if [ "$quota_last_at" -gt 0 ] && [ $((now - quota_last_at)) -lt "$FAIL_DEDUPE_SECONDS" ]; then
-    log "duplicate quota 429 within ${FAIL_DEDUPE_SECONDS}s ignored (streak=$quota_streak/$FAIL_LIMIT, upstream=$CUR_UP): ${line:0:200}"
+  if [ -n "$msg_at" ] && [ "$msg_at" = "$quota_last_msg" ]; then
+    log "duplicate quota 429 for the same message msg_at=$msg_at ignored (streak=$quota_streak/$FAIL_LIMIT, upstream=$CUR_UP): ${line:0:200}"
     return 0
   fi
+  quota_last_msg="$msg_at"
   quota_last_at=$now
   quota_streak=$((quota_streak + 1))
   log "quota 429 detected (streak=$quota_streak/$FAIL_LIMIT, upstream=$CUR_UP, retry_after=${retry_after}s)"
@@ -292,7 +298,7 @@ handle_quota() {
       blacklist_selected "quota-after-healthy-window" "$ttl" || true
     fi
   fi
-  record_quota "$line" "${retry_after:-?}"
+  record_quota "$line" "${retry_after:-?}" "$msg_at"
 }
 
 # R2578 (operator: "200 后仍 429"): the startup check only proves the first
@@ -338,6 +344,7 @@ while IFS= read -r line; do
         last_fail_at=0
         quota_streak=0
         quota_last_at=0
+        quota_last_msg=""
       fi
       ;;
     *idle_timeout*)
