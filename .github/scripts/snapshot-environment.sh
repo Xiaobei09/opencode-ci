@@ -357,6 +357,14 @@ else
   echo "::warning::environment package is empty"
 fi
 echo "snapshot timing: publish $(( $(date +%s) - UP_T0 ))s, total $(( $(date +%s) - SNAP_T0 ))s"
+SNAP_TOTAL=$(( $(date +%s) - SNAP_T0 ))
+# R2638 (D9): the restart checklist has a 30s advisory for this step. A slow
+# run-end env-sync push (network) can push it over and silently eat the
+# non-opencode budget (measured 17-34s; 34s came from a 29s push). Warn
+# explicitly so the regression is visible in the run log.
+if [ "$SNAP_TOTAL" -gt 30 ]; then
+  echo "::warning::snapshot total ${SNAP_TOTAL}s exceeds the 30s advisory (env-sync push latency is the usual cause; non-opencode total target is 60s)"
+fi
 # R2576 (D9): report the complete non-opencode wall time for this run:
 # setup (job start → OpenCode start) + post-run (failure policy +
 # relay + notify + snapshot). Target <60s.
