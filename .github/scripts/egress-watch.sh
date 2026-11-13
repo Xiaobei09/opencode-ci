@@ -136,19 +136,64 @@ record_failure() {
   fi
 }
 
+# R2634 (operator: "在429后重新检测为200后使用fork修改当前机器人会话ID"):
+# the watcher cannot fork by itself (the host API belongs to the plugin process).
+# It writes one request file per kept-round probe; the bridge instance that owns
+# the session claims it with an atomic rename and performs the fork. Default on;
+# FORK_ON_QUOTA_200=0 disables both writing and handling.
+write_quota_fork_request() {
+  local sid="$1" msg_at="$2" dir ts file tmp
+  if [ "${FORK_ON_QUOTA_200:-1}" = "0" ]; then
+    log "quota fork disabled (FORK_ON_QUOTA_200=0)"
+    return 0
+  fi
+  if ! printf '%s' "$sid" | grep -Eq '^ses_[A-Za-z0-9_-]+$'; then
+    log "quota fork skipped: quota line has no valid session= (cannot identify the bot session)"
+    return 0
+  fi
+  dir="${QUOTA_FORK_DIR:-/tmp/opencode/quota-fork-requests}"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    log "quota fork request dir unavailable: $dir"
+    return 0
+  fi
+  ts=$(date +%s%3N)
+  file="$dir/${ts}-${sid}-$$.json"
+  tmp="$file.tmp"
+  if jq -n \
+      --argjson ts "$ts" \
+      --arg sid "$sid" \
+      --arg msg_at "${msg_at:-?}" \
+      --arg upstream "$CUR_UP" \
+      --arg egress "${selected_egress:-}" \
+      --arg run "${GITHUB_RUN_ID:-}" \
+      --arg reason "quota-probe-200" \
+      '{ts:$ts,sid:$sid,msg_at:$msg_at,upstream:$upstream,egress:$egress,run:$run,reason:$reason}' > "$tmp" 2>/dev/null; then
+    if mv -f "$tmp" "$file" 2>/dev/null; then
+      log "quota fork request written (sid=$sid, file=$(basename "$file"), dir=$dir)"
+      return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    log "quota fork request rename FAILED (sid=$sid, dir=$dir)"
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  log "quota fork request write FAILED (sid=$sid, dir=$dir)"
+  return 0
+}
+
 # R2629 (operator: "如果探测为200就不停止本轮"): before ending the round on the
 # first verified quota 429, re-probe the CURRENT egress with one real zengate
 # request. Only a 200 keeps the round alive; quota/transport/disabled/timeout
 # keep the old stop behavior. A 200 spends one free message, and the next real
 # turn may still 429 (R2619); that is the operator's accepted trade-off.
 quota_probe_keeps_round() {
-  local msg_at="$1" meta rc
+  local msg_at="$1" sid="${2:-}" meta rc
   if [ "${EGRESS_QUOTA_PROBE:-1}" = "0" ]; then
     log "quota probe disabled (EGRESS_QUOTA_PROBE=0); stopping this round"
     return 1
   fi
   meta="$EGRESS_STATE_DIR/quota-probe.meta"
-  log "quota 429: re-probing current egress before stop (upstream=$CUR_UP, msg_at=${msg_at:-?})"
+  log "quota 429: re-probing current egress before stop (upstream=$CUR_UP, msg_at=${msg_at:-?}, session=${sid:-?})"
   EGRESS_STATE_DIR="$EGRESS_STATE_DIR" \
     EGRESS_QUOTA_PROBE_META="$meta" \
     timeout 90 bash "$SCRIPT_DIR/egress-quota-probe.sh" >> "$WATCH_LOG" 2>&1
@@ -156,7 +201,8 @@ quota_probe_keeps_round() {
   case "$rc" in
     0)
       printf 'action=kept-round\n' >> "$meta" 2>/dev/null || true
-      log "quota probe: current egress returned 200; keeping this round alive (upstream=$CUR_UP, msg_at=${msg_at:-?})"
+      log "quota probe: current egress returned 200; keeping this round alive (upstream=$CUR_UP, msg_at=${msg_at:-?}, session=${sid:-?})"
+      write_quota_fork_request "$sid" "$msg_at"
       return 0
       ;;
     1)
@@ -179,8 +225,11 @@ quota_probe_keeps_round() {
 # even if the retry keeps failing or the watcher misses the quota line in the
 # shutdown race.
 record_quota() {
-  local line="$1" retry_after="${2:-?}" msg_at="${3:-}" now reset_at=""
+  local line="$1" retry_after="${2:-?}" msg_at="${3:-}" now reset_at="" sid=""
   now=$(egress_now)
+  # R2634: the structured auto-continue line carries `session=ses_...`; keep it so
+  # the 200 branch can ask the owning bot to fork exactly that conversation.
+  sid=$(printf '%s' "$line" | sed -nE 's/.*session=(ses_[A-Za-z0-9_-]+).*/\1/p' | head -1)
   if [ -n "$msg_at" ] && [ "$msg_at" = "$quota_last_msg" ]; then
     log "duplicate quota 429 for the same message msg_at=$msg_at ignored (streak=$quota_streak/$QUOTA_LIMIT, upstream=$CUR_UP): ${line:0:200}"
     return 0
@@ -200,7 +249,8 @@ record_quota() {
     # R2629: only a real 200 from the live current-egress probe keeps this
     # round alive. A healthy turn later resets the counters; if the retry keeps
     # failing, auto-continue's 3-consecutive-error limit still ends the round.
-    if quota_probe_keeps_round "$msg_at"; then
+    # R2634: the 200 branch also writes the fork request for this session.
+    if quota_probe_keeps_round "$msg_at" "$sid"; then
       return 0
     fi
     # Keep `quota` in the reason: iterate.yml uses it to mark an egress-only

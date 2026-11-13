@@ -272,6 +272,12 @@ jobs:
           # CURRENT egress (a fresh alternate always has quota and says
           # nothing). Diagnostic only; set the repo variable to 0 to skip.
           EGRESS_QUOTA_PROBE: ${{ vars.EGRESS_QUOTA_PROBE || '1' }}
+          # R2634: when the 429 re-probe returns 200, the watcher writes a fork
+          # request. The bot bridge owning that session forks it, remaps the
+          # bot's ID to the new session, and sends one notice. Full history is
+          # copied; no chat is replayed. Default on; set the repo variable to 0
+          # to disable.
+          FORK_ON_QUOTA_200: ${{ vars.FORK_ON_QUOTA_200 || '1' }}
         run: bash -e "$GITHUB_WORKSPACE/.github/scripts/run-opencode.sh"
       - name: Update failure streak and stop policy
         id: failure_guard
