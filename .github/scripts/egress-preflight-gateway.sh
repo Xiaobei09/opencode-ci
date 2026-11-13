@@ -5,10 +5,14 @@
 # malformed JSON body is rejected by the inference gateway with HTTP 400 before
 # any model call, so this probe spends NO free message. It proves the exact
 # completion endpoint is reachable through the selected path (the local proxy
-# has already been pointed at the chosen upstream). If the provider checks
-# quota before body validation, a FreeUsageLimitError 429 here is a free early
-# quota signal; otherwise the first real turn remains the authoritative quota
-# test.
+# has already been pointed at the chosen upstream).
+#
+# R2625 live finding (operator: "确认 429 比 400 优先吗?"): NO. The gateway
+# validates the body BEFORE quota. At 05:54:44 this probe returned 400 while
+# the real turn hit FreeUsageLimitError at 05:55:08 (24s later). The 429 branch
+# below is only a safety net for a future gateway change; it cannot be used as
+# an early quota signal. The first real turn is authoritative, and the R2625
+# round-end zengate probe answers whether the quota is path-specific.
 #
 # Usage: egress-preflight-gateway.sh [timeout-seconds]
 # Env:
