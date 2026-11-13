@@ -121,5 +121,12 @@ case "$reason" in
   *)     result=inconclusive ;;
 esac
 meta "result=$result"
+# R2628: keep the R2625 meta keys as aliases so a run that loaded the old
+# workflow YAML before this change still prints the probe line. New readers use
+# result/current_up; these aliases are harmless and can be removed later.
+meta "alt_up=$up"
+meta "alt_code=$code"
+meta "alt_reason=$reason"
+meta "scope=$result"
 log "result=$result (current=$up code=$code reason=$reason)"
 exit 0
