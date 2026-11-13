@@ -26,6 +26,13 @@
 # Diagnostic only: it never changes selection, the stop reason, or the relay
 # policy. A quota 429 spends no message; a 200 spends one.
 #
+# Exit codes (R2629: the watcher gates the quota stop on this):
+#   0 = current egress returned 200 (current-ok) -> keep the round alive
+#   1 = current egress still returns quota 429 (current-exhausted)
+#   2 = inconclusive (transport/HTTP/startup failure)
+#   3 = disabled by EGRESS_QUOTA_PROBE=0
+# Non-zero means "not proven usable"; callers keep the old stop behavior.
+#
 # Usage: egress-quota-probe.sh
 # Env:
 #   EGRESS_STATE_DIR                  round egress state (upstream)
@@ -55,13 +62,13 @@ meta() { printf '%s\n' "$1" >> "$META" 2>/dev/null || true; }
 
 if [ "${EGRESS_QUOTA_PROBE:-1}" = "0" ]; then
   log "disabled by EGRESS_QUOTA_PROBE=0"
-  exit 0
+  exit 3
 fi
 if ! command -v zengate >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
   log "zengate/python3 unavailable; skipped"
   meta "result=inconclusive"
   meta "note=zengate or python3 unavailable"
-  exit 0
+  exit 2
 fi
 
 UP=$(cat "$UP_FILE" 2>/dev/null || echo direct)
@@ -77,7 +84,7 @@ if [ "$CUR_KIND" != "direct" ] && [ -z "$CUR_TARGET" ]; then
   meta "result=inconclusive"
   meta "note=current egress has no target"
   log "current egress has no target; skipped (up=$UP)"
-  exit 0
+  exit 2
 fi
 
 PROBE_STARTED=0
@@ -95,7 +102,7 @@ if ! EGRESS_PROBE_REQUEST_TIMEOUT_MS=$((TMO * 1000)) \
   meta "result=inconclusive"
   meta "note=probe server unavailable"
   log "probe server unavailable; skipped"
-  exit 0
+  exit 2
 fi
 PROBE_STARTED=1
 
@@ -129,4 +136,8 @@ meta "alt_code=$code"
 meta "alt_reason=$reason"
 meta "scope=$result"
 log "result=$result (current=$up code=$code reason=$reason)"
-exit 0
+case "$result" in
+  current-ok)        exit 0 ;;
+  current-exhausted) exit 1 ;;
+  *)                 exit 2 ;;
+esac

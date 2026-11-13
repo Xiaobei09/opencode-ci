@@ -8,7 +8,9 @@
 # only:
 #   - stops the round on the FIRST verified quota 429 (R2620; operator:
 #     "改为出现一个429就重启吧") so the relay immediately starts a fresh run
-#     and a fresh egress selection. Transport failures still stop after 3;
+#     and a fresh egress selection. R2629 (operator: "如果探测为200就不停止
+#     本轮"): before that stop, re-probe the CURRENT egress; only a real 200
+#     keeps the round alive. Transport failures still stop after 3;
 #   - a quota 429 before any healthy turn is classified by the preflight mode
 #     (path-only vs zengate 200), not by a fixed 120s wall-clock window; after
 #     a healthy turn it is a long-window quota and the exit is still
@@ -44,6 +46,8 @@ FAIL_LIMIT=3
 # R2620 (operator: "改为出现一个429就重启吧"): a single verified quota 429 ends
 # the round. The relay then dispatches a fresh run instead of waiting for three
 # consecutive 429s. Transport failures keep the 3-strike threshold.
+# R2629: the stop is gated by a live re-probe of the current egress; a 200
+# keeps the round alive (see quota_probe_keeps_round).
 QUOTA_LIMIT=1
 FAIL_DEDUPE_SECONDS=20
 
@@ -132,13 +136,48 @@ record_failure() {
   fi
 }
 
+# R2629 (operator: "如果探测为200就不停止本轮"): before ending the round on the
+# first verified quota 429, re-probe the CURRENT egress with one real zengate
+# request. Only a 200 keeps the round alive; quota/transport/disabled/timeout
+# keep the old stop behavior. A 200 spends one free message, and the next real
+# turn may still 429 (R2619); that is the operator's accepted trade-off.
+quota_probe_keeps_round() {
+  local msg_at="$1" meta rc
+  if [ "${EGRESS_QUOTA_PROBE:-1}" = "0" ]; then
+    log "quota probe disabled (EGRESS_QUOTA_PROBE=0); stopping this round"
+    return 1
+  fi
+  meta="$EGRESS_STATE_DIR/quota-probe.meta"
+  log "quota 429: re-probing current egress before stop (upstream=$CUR_UP, msg_at=${msg_at:-?})"
+  EGRESS_STATE_DIR="$EGRESS_STATE_DIR" \
+    EGRESS_QUOTA_PROBE_META="$meta" \
+    timeout 90 bash "$SCRIPT_DIR/egress-quota-probe.sh" >> "$WATCH_LOG" 2>&1
+  rc=$?
+  case "$rc" in
+    0)
+      printf 'action=kept-round\n' >> "$meta" 2>/dev/null || true
+      log "quota probe: current egress returned 200; keeping this round alive (upstream=$CUR_UP, msg_at=${msg_at:-?})"
+      return 0
+      ;;
+    1)
+      log "quota probe: current egress still returns quota 429; stopping this round"
+      ;;
+    *)
+      log "quota probe: inconclusive or disabled (rc=$rc); stopping this round"
+      ;;
+  esac
+  return 1
+}
+
 # record_quota <line> [retry_after] [msg_at]
 # R2620 (operator: "改为出现一个429就重启吧"): the first verified quota 429 ends
 # the round. Dedupe by the error message timestamp, not wall-clock: retries of
 # the same failed message share msg_at, so one provider failure cannot produce
 # several stops. A healthy turn resets the streak.
+# R2629: before the stop, re-probe the current egress; a 200 keeps the round.
 # Auto-continue has its own 3-consecutive-error limit, so the round still ends
-# even if the watcher misses the quota line in the shutdown race.
+# even if the retry keeps failing or the watcher misses the quota line in the
+# shutdown race.
 record_quota() {
   local line="$1" retry_after="${2:-?}" msg_at="${3:-}" now reset_at=""
   now=$(egress_now)
@@ -158,6 +197,12 @@ record_quota() {
   fi
   log "quota 429 detected (streak=$quota_streak/$QUOTA_LIMIT, upstream=$CUR_UP, retry_after=${retry_after}s${reset_at:+, reset_at=$reset_at})"
   if [ "$quota_streak" -ge "$QUOTA_LIMIT" ]; then
+    # R2629: only a real 200 from the live current-egress probe keeps this
+    # round alive. A healthy turn later resets the counters; if the retry keeps
+    # failing, auto-continue's 3-consecutive-error limit still ends the round.
+    if quota_probe_keeps_round "$msg_at"; then
+      return 0
+    fi
     # Keep `quota` in the reason: iterate.yml uses it to mark an egress-only
     # retry and relay a fresh run. Do NOT word it as three consecutive 429s;
     # that is the old pause-the-loop trigger.
@@ -303,7 +348,7 @@ handle_quota() {
   if [ -n "$retry_after" ] && [ "$retry_after" -gt "$ttl" ] 2>/dev/null; then ttl="$retry_after"; fi
   if [ "$selected_at" -gt 0 ]; then
     if [ "$healthy_turn_seen" = "1" ]; then
-      log "quota 429 after a healthy turn (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and ending the round"
+      log "quota 429 after a healthy turn (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s; probing current egress before stop"
       blacklist_selected "quota-after-healthy-window" "$ttl" || true
     else
       cur_egress=$(current_egress_ip || true)
@@ -314,9 +359,9 @@ handle_quota() {
         # 429 is the expected result on an already-exhausted exit. Judge by
         # "no healthy turn yet", not by a 120s wall-clock window: a slow first
         # turn is still the pre-healthy-turn case.
-        log "path-only preflight made no quota claim; quota 429 arrived before any healthy turn after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and ending the round"
+        log "path-only preflight made no quota claim; quota 429 arrived before any healthy turn after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s; probing current egress before stop"
       else
-        log "selected egress answered 200 in preflight but quota 429 arrived before any healthy turn after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and ending the round"
+        log "selected egress answered 200 in preflight but quota 429 arrived before any healthy turn after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s; probing current egress before stop"
       fi
       if [ "$cur_egress" != "?" ] && [ "$cur_egress" != "skipped" ] \
          && [ -n "$selected_egress" ] && [ "$cur_egress" != "$selected_egress" ]; then

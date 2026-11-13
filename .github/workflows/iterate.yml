@@ -783,13 +783,17 @@ jobs:
           fi
           # R2628 (operator: "改为探测当前出口，因为探测新出口没有意义"): a
           # fresh alternate always has quota, so R2625's direct->relay probe
-          # returned 200 on every round and carried no signal. After a verified
-          # quota stop, re-probe the SAME egress the round used (direct -> the
-          # same runner IP, relay -> the same relay entry). Diagnostic only: it
-          # never changes selection, the stop reason, or the relay policy.
+          # returned 200 on every round and carried no signal. Re-probe the
+          # SAME egress the round used (direct -> the same runner IP, relay ->
+          # the same relay entry). Diagnostic only: it never changes selection,
+          # the stop reason, or the relay policy.
+          # R2629 (operator: "如果探测为200就不停止本轮"): egress-watch.sh runs
+          # this probe BEFORE stopping and keeps the round on 200. Skip this
+          # post-stop fallback when the live probe already wrote its meta.
           if [ "${EGRESS_QUOTA_PROBE:-1}" != "0" ] \
+             && ! grep -qx 'probe_target=current' "$EGRESS_DIR/quota-probe.meta" 2>/dev/null \
              && printf '%s' "${STOP_REASON:-}" | grep -qiE 'quota 429|FreeUsageLimit|provider\.free-limit'; then
-            echo "quota-end zengate diagnostic: re-probing the current egress (real request)"
+            echo "quota-end zengate diagnostic: post-stop fallback probe (live probe did not run)"
             EGRESS_QUOTA_PROBE=1 bash "$GITHUB_WORKSPACE/.github/scripts/egress-quota-probe.sh" \
               2>&1 | tee "$EGRESS_DIR/quota-probe.log" || true
           fi
@@ -1217,6 +1221,7 @@ jobs:
               $1=="code"{code=$2}
               $1=="reason"{reason=$2}
               $1=="result"{result=$2}
+              $1=="action"{action=$2}
               $1=="note"{note=$2}
               END{
                 if(result=="") exit
@@ -1224,6 +1229,7 @@ jobs:
                 label=result
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
+                if(action=="kept-round") label=label "（本轮未停）"
                 printf "429 结束探针：当前出口 %s（code=%s，reason=%s，结果=%s%s）", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":"，note=" note)
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
@@ -1325,6 +1331,7 @@ jobs:
               $1=="code"{code=$2}
               $1=="reason"{reason=$2}
               $1=="result"{result=$2}
+              $1=="action"{action=$2}
               $1=="note"{note=$2}
               END{
                 if(result=="") exit
@@ -1332,6 +1339,7 @@ jobs:
                 label=result
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
+                if(action=="kept-round") label=label "（本轮未停）"
                 printf "429 结束探针：当前出口 %s（code=%s，reason=%s，结果=%s%s）", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":"，note=" note)
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
