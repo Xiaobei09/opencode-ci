@@ -9,10 +9,12 @@
 #   - counts consecutive quota 429s and transport failures separately, and
 #     stops the round after 3 of either kind (the relay then starts a fresh run
 #     that selects a new egress);
-#   - if the selected egress answered 200 in preflight but hits quota, blacklists
-#     it for the provider's Retry-After window but does NOT stop on the first
-#     429: R2618 (operator: "连续3个429再结束") requires three consecutive 429s.
-#     The workflow pauses the loop when the watcher reports that 3-429 stop;
+#   - if the selected egress hits quota shortly after selection, blacklists it
+#     for the provider's Retry-After window but does NOT stop on the first 429:
+#     R2618 (operator: "连续3个429再结束") requires three consecutive 429s.
+#     The workflow pauses the loop when the watcher reports that 3-429 stop.
+#     With the default path-only preflight there was no quota 200 at all; the
+#     log says so instead of reusing the old "200 then 429" wording;
 #   - resets both consecutive counters on a real healthy turn.
 #
 # Usage: egress-watch.sh <run-log> [proxy-log] [plugin-log]
@@ -49,6 +51,7 @@ selected_at=0
 selected_kind=""
 selected_egress=""
 selected_direct_ip=""
+selected_preflight="unknown"
 
 log() { echo "$(egress_iso) $*" >> "$WATCH_LOG"; }
 
@@ -66,6 +69,7 @@ if [ -f "$EGRESS_STATE_FILE" ]; then
   selected_kind=$(jq -r '.kind // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
   selected_egress=$(jq -r '.egress_ip // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
   selected_direct_ip=$(jq -r '.direct_ip // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
+  selected_preflight=$(jq -r '.preflight_mode // "unknown"' "$EGRESS_STATE_FILE" 2>/dev/null || echo unknown)
   _picked=$(jq -r '.picked_at // ""' "$EGRESS_STATE_FILE" 2>/dev/null || true)
   if [ -n "$_picked" ]; then
     selected_at=$(date -u -d "$_picked" +%s 2>/dev/null || echo 0)
@@ -82,7 +86,7 @@ if [ "$CUR_UP" = "?" ] && [ -n "$selected_kind" ]; then
       ;;
   esac
 fi
-log "watch start run_log=$LOG proxy_log=$PROXY_LOG plugin_log=$PLUGIN_LOG upstream=$CUR_UP selected_at=$selected_at mode=select-once"
+log "watch start run_log=$LOG proxy_log=$PROXY_LOG plugin_log=$PLUGIN_LOG upstream=$CUR_UP selected_at=$selected_at preflight=$selected_preflight mode=select-once"
 
 while [ ! -f "$LOG" ]; do sleep 1; done
 # The proxy is started immediately before this watcher, but make tail tolerant
@@ -284,11 +288,23 @@ handle_quota() {
   if [ "$selected_at" -gt 0 ] && [ $((now - selected_at)) -le "$PROBE_FALSE_WINDOW" ]; then
     cur_egress=$(current_egress_ip || true)
     [ -n "$cur_egress" ] || cur_egress="?"
-    log "selected egress answered 200 in preflight but hit quota 429 after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and counting the 429"
-    if [ "$cur_egress" != "?" ] && [ -n "$selected_egress" ] && [ "$cur_egress" != "$selected_egress" ]; then
+    if [ "$selected_preflight" = "path" ]; then
+      # R2619: path mode sends no inference message, so there was no quota 200
+      # to contradict. The first real turn is the quota test; this 429 is the
+      # expected result on an already-exhausted exit.
+      log "path-only preflight made no quota claim; the first real turn hit quota 429 after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and counting the 429"
+    else
+      log "selected egress answered 200 in preflight but hit quota 429 after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and counting the 429"
+    fi
+    if [ "$cur_egress" != "?" ] && [ "$cur_egress" != "skipped" ] \
+       && [ -n "$selected_egress" ] && [ "$cur_egress" != "$selected_egress" ]; then
       log "warning: relay egress rotated after selection (selected=$selected_egress current=$cur_egress); quota was hit on the current exit but the candidate entry stayed the same"
     fi
-    blacklist_selected "quota-after-preflight-200" "$ttl" || true
+    if [ "$selected_preflight" = "path" ]; then
+      blacklist_selected "quota-after-path-check" "$ttl" || true
+    else
+      blacklist_selected "quota-after-preflight-200" "$ttl" || true
+    fi
   else
     log "quota 429 detected (upstream=$CUR_UP, retry_after=${retry_after:-?}s)"
     # A quota 429 after the 120s preflight window still means this egress IP is

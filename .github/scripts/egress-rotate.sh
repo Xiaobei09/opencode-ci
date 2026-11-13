@@ -160,7 +160,7 @@ while IFS=$'\t' read -r kind target source; do
       relay|http) egress="$stable_egress" ;;
     esac
     [ -n "$egress" ] || egress="unknown"
-    egress_write_state "$kind" "$up" "$egress" "$source" "$DIRECT_IP"
+    egress_write_state "$kind" "$up" "$egress" "$source" "$DIRECT_IP" "zengate"
     egress_bl_del "$key"
     echo "rotate: switched to $kind $target egress=$egress (source=$source$( [ -n "$stable_egress" ] && echo ', egress sticky over 8 parallel traces' ))"
     exit 0

@@ -281,10 +281,16 @@ jobs:
           EGRESS_SELECT_MAX: "0"
           EGRESS_SELECT_BUDGET: "0"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
-          # R2617 (operator rollback): do not cap fallback exits. 0 = unlimited;
-          # -1 would disable relay fallback entirely. The real-turn-sized probe
-          # is OFF by default because it consumes a free message that the real
-          # turn needs; the first real turn is the quota test.
+          # R2619 (operator: "预检 200 后真实回合 429"; "4k token 边界不可能"):
+          # default is a zero-message path preflight. The free tier meters
+          # MESSAGES, not tokens; a zengate probe is itself a real request and
+          # spends the last message on an IP that has exactly one left, which
+          # is the mechanical cause of "probe 200, real turn 429". Set the repo
+          # variable EGRESS_PREFLIGHT_MODE=zengate to restore the real-OpenCode
+          # probe (one free message per candidate); curl is diagnostic only.
+          EGRESS_PREFLIGHT_MODE: ${{ vars.EGRESS_PREFLIGHT_MODE || 'path' }}
+          # R2617: do not cap fallback exits. 0 = unlimited; -1 disables relay
+          # fallback. R2619: EGRESS_BIG_PROBE is ignored outside zengate mode.
           EGRESS_RELAY_FALLBACK_MAX: "0"
           EGRESS_BIG_PROBE: "0"
           EGRESS_BIG_PROBE_BYTES: "400000"
@@ -305,6 +311,9 @@ jobs:
             sel_err=$(grep -aE '^\[egress-select\] ERROR: ' "$RUNNER_TEMP/select-proxy.log" 2>/dev/null | tail -1 | sed -E 's/^\[egress-select\] ERROR: //' | cut -c1-240)
             if printf '%s' "$sel_err" | grep -q 'direct free-quota exhausted'; then
               reason="${sel_err:-direct free-quota exhausted}"
+              echo "::error::egress selection failed: $reason; ending this run so the next fresh runner IP gets a new daily bucket"
+            elif printf '%s' "$sel_err" | grep -q 'path probe'; then
+              reason="${sel_err:-no candidate passed the path probe}"
               echo "::error::egress selection failed: $reason; ending this run so the next fresh runner IP gets a new daily bucket"
             else
               reason="no egress candidate answered 200 (select-proxy rc=$rc)"

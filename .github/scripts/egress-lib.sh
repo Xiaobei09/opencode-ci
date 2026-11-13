@@ -27,7 +27,7 @@ EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
 # runs means paying with a partially consumed bucket; the provider's 429
 # retry-after was observed at ~12.9h, longer than the 6h failure blacklist.
 # R2582: the bucket is a DAILY quota (48/48 recent 429s converge to the same
-# 00:44:19 UTC reset), so a 13h window can still land in the same bucket.
+# 00:44:19 UTC reset), so the reuse window is 24h to avoid the same bucket.
 # Successful relays are avoided for 24h; every run starts on a fresh IP.
 EGRESS_REUSE_WINDOW="${EGRESS_REUSE_WINDOW:-86400}"
 EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
@@ -60,13 +60,11 @@ egress_probe_model() {
   printf '%s\n' "$m"
 }
 
-# R2584 (operator: "these exits all happen to have exactly one response left?"):
-# A zengate probe is one small request (~4k prompt tokens). A real resumed turn
-# carries the whole session context: live measurement over 24h gave p50≈107k,
-# p90≈162k, max≈170k tokens. So a relay bucket with only ~70k left can answer
-# the probe with 200, answer exactly one real turn, then 429 the next concurrent
-# turn. Log the observed real prompt size next to the probe so the mismatch is
-# visible in every selection (no need to re-derive it from the DB by hand).
+# Diagnostic helper: observed real prompt token sizes. Token size is NOT the
+# free-tier meter — a 169k-token real request succeeded on a healthy IP while
+# curl was already 429 from the same IP. The meter is message count, so a
+# zengate probe (one message) can spend the last message on a nearly-empty IP.
+# Kept for capacity diagnostics only; the selector no longer uses it.
 egress_real_prompt_stats() {
   local db="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}" row avg="" max="" n="0"
   if [ -s "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
@@ -257,9 +255,11 @@ egress_write_upstream() {
   egress_epoch_bump
 }
 
-# egress_write_state <kind> <upstream> <egress_ip> <source> <direct_ip>
+# egress_write_state <kind> <upstream> <egress_ip> <source> <direct_ip> [preflight_mode]
+# preflight_mode is diagnostic: "path" means the selection made no quota claim
+# (zero inference messages), "zengate" means a real probe 200 was observed.
 egress_write_state() {
-  local kind="$1" upstream="$2" egress="$3" source="$4" direct="$5"
+  local kind="$1" upstream="$2" egress="$3" source="$4" direct="$5" mode="${6:-unknown}"
   local dir tmp
   dir="$(dirname "$EGRESS_STATE_FILE")"
   # R2575 (D8): a failed write used to leave an empty/partial exit-proxy.json
@@ -275,10 +275,11 @@ egress_write_state() {
     --arg egress "$egress" \
     --arg direct "$direct" \
     --arg source "$source" \
+    --arg mode "$mode" \
     --arg at "$(egress_iso)" \
     '{proxy:$proxy, scheme:$scheme, upstream:$upstream, kind:$kind,
       egress_ip:$egress, direct_ip:$direct, latency_s:"",
-      source:$source, picked_at:$at}' > "$tmp" || { rm -f "$tmp"; return 1; }
+      source:$source, preflight_mode:$mode, picked_at:$at}' > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$EGRESS_STATE_FILE" || { rm -f "$tmp"; return 1; }
   chmod 600 "$EGRESS_STATE_FILE" 2>/dev/null || true
   return 0

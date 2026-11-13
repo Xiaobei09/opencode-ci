@@ -18,7 +18,7 @@ TMO="${3:-20}"
 # free quota is per model; a mismatched probe can return 200 while the real
 # session immediately fails with provider.free-limit.
 MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
-echo "zengate preflight model=$MODEL" >&2
+echo "zengate preflight model=$MODEL messages=1 (this consumes one free message; a 200 only proves >=1 remained before the probe)" >&2
 META="${EGRESS_PREFLIGHT_META:-}"
 # R2565: a cache/proxy that replays a canned "OK" must not pass as a real
 # provider completion. Ask for a fresh nonce and verify it appears in the
@@ -53,8 +53,8 @@ if [ "${EGRESS_PROBE_BIG:-0}" = "1" ]; then
   #
   # This costs one real provider request (~86k tokens in live measurement), so
   # it is opt-in (EGRESS_BIG_PROBE=1) and runs only after direct failed. By
-  # default the selector relies on the small path probe; the first real turn
-  # is the quota test.
+  # default the selector uses the zero-message path preflight; the first real
+  # turn is the quota test.
   FILLER="$PROBE_DIR/filler.txt"
   WANT_BYTES="${EGRESS_BIG_PROBE_BYTES:-400000}"
   if [ ! -s "$FILLER" ] || [ "$(wc -c < "$FILLER" 2>/dev/null || echo 0)" -lt "$WANT_BYTES" ]; then
@@ -109,15 +109,19 @@ if [ -s "$HDR" ]; then
 fi
 if [ -n "$META" ]; then
   {
+    printf 'mode=zengate\n'
+    printf 'messages=1\n'
     printf 'retry_after=%s\n' "${ra:-}"
     printf 'nonce=%s\n' "$NONCE"
     printf 'code=%s\n' "$code"
     printf 'big=%s\n' "${EGRESS_PROBE_BIG:-0}"
     printf 'body_bytes=%s\n' "$(wc -c < "$BODY_FILE" 2>/dev/null || echo 0)"
-    # R2582: the probe is NOT free. zengate injects the OpenCode system prompt,
-    # so even max_tokens=32 consumed ~4k prompt tokens in a live measurement.
-    # Record it so selection logs show how much of the daily bucket the probe
-    # itself spent ("200" only proves this much headroom existed).
+    # R2619: the probe is NOT free, and the free tier meters messages, not
+    # prompt tokens. zengate injects the OpenCode system prompt, so even
+    # max_tokens=32 consumes one message (~4k prompt tokens in a live
+    # measurement). A 200 only proves ">=1 message remained before the probe";
+    # the probe then spends it, so an IP with exactly one message left can
+    # still 429 the next real turn. Record the token usage for diagnostics.
     printf 'tokens=%s\n' "$(printf '%s' "$js" | jq -r '.usage.total_tokens // empty' 2>/dev/null)"
   } > "$META" 2>/dev/null || true
 fi

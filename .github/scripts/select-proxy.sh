@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Select the initial egress for this CI run and write a local-proxy handoff.
 #
-# Every candidate is tested by zengate: the real OpenCode CLI runs one fresh
-# session per candidate through a candidate-specific local CONNECT proxy. This
-# avoids treating a synthetic curl 429 as proof that the IP is exhausted.
+# By default every candidate is tested with a ZERO-MESSAGE path preflight: a
+# Cloudflare trace through the candidate, plus an 8-sample sticky-egress check
+# for relays. It sends no inference request, so it cannot spend the last free
+# message. Set EGRESS_PREFLIGHT_MODE=zengate to restore the real OpenCode probe
+# (which consumes one free message per candidate).
 #
 # R2562 (operator): the egress is selected ONCE here for the whole run. The
-# watcher no longer rotates. Probe the candidate pool until one answers 200;
-# there is no quota-based early stop.
+# watcher no longer rotates. Probe the candidate pool until one passes the path
+# probe; there is no quota-based early stop.
 #
 # R2582 (operator rollback + root cause): direct is candidate #1 and must stay
 # enabled. The free provider returns FreeUsageLimitError (HTTP 429,
@@ -21,14 +23,15 @@
 # selection budget (EGRESS_SELECT_BUDGET) is still honored to prevent a
 # pathological loop, and the candidate list itself is finite.
 #
-# R2617 (operator: "200 暂不处理" + rollback of the R2598 design): the
-# real-turn-sized inference probe is OFF by default (EGRESS_BIG_PROBE=1 opts
-# in). The free tier meters MESSAGES, so every inference probe consumes one of
-# the messages the real turn needs — a 200 probe can itself cause the next real
-# turn to 429. The small nonce probe verifies that the request really traverses
-# the candidate exit (PATH); the first real turn verifies the QUOTA. A
-# preflight 200 is therefore logged as "path verified", never as "quota
-# proven". If the real turn 429s, the watcher blacklists that exit.
+# R2619 (operator: "预检 200 后真实回合 429"; "都是刚刚好 4k token 不太可能"):
+# the free tier meters MESSAGES, not prompt tokens. A zengate probe is itself a
+# real inference request, so its 200 only proves "at least one free message
+# remained before the probe"; the probe then spends that message. On an IP with
+# exactly one message left, the probe 200 is followed by a real-turn 429. This
+# is not a 4k-token boundary (a 169k-token real request succeeded on a healthy
+# IP). Default is therefore path mode: zero inference messages, and the first
+# real turn is the quota test. EGRESS_PREFLIGHT_MODE=zengate is opt-in for
+# diagnostics; EGRESS_BIG_PROBE=1 is ignored outside zengate mode.
 #
 # Outputs:
 #   $RUNNER_TEMP/egress/upstream        direct | relay:ip:port | http:host:port
@@ -47,9 +50,6 @@ EGRESS_STATE_DIR="${EGRESS_STATE_DIR:-$RUNNER_TEMP/egress}"
 export EGRESS_STATE_DIR
 # shellcheck source=egress-lib.sh
 . "$SCRIPT_DIR/egress-lib.sh"
-
-# R2511: probe the same model the agent really uses (see egress_probe_model).
-export EGRESS_PROBE_MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
 
 mkdir -p "$EGRESS_STATE_DIR"
 : > "$EGRESS_CANDIDATES_FILE"
@@ -83,19 +83,31 @@ START=$(egress_now)
 
 log() { echo "[egress-select] $*"; }
 
-PROBE_ENGINE=curl
-# R2598: a fallback verification sends a real-turn-sized context (~100k
-# tokens). The gateway needs more than the 20s small-probe budget for a slow
-# relay; the selector's per-request curl timeout still caps a hung small probe
-# at PREFLIGHT_TMO. 45s is enough for the measured ~7s big request.
-if EGRESS_PROBE_REQUEST_TIMEOUT_MS="${EGRESS_PROBE_REQUEST_TIMEOUT_MS:-45000}" \
-   bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
-  PROBE_ENGINE=zengate
-  PARALLEL=1
-  log "preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate)"
-  trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
+PREFLIGHT_MODE="${EGRESS_PREFLIGHT_MODE:-path}"
+case "$PREFLIGHT_MODE" in
+  path|zengate|curl) ;;
+  *) log "warning: unknown EGRESS_PREFLIGHT_MODE=$PREFLIGHT_MODE; using path"; PREFLIGHT_MODE=path ;;
+esac
+PROBE_ENGINE="$PREFLIGHT_MODE"
+if [ "$PREFLIGHT_MODE" = "path" ]; then
+  log "preflight engine=path (zero inference messages; the first real turn is the quota test)"
+elif [ "$PREFLIGHT_MODE" = "zengate" ]; then
+  # R2511: probe the same model the agent really uses (see egress_probe_model).
+  export EGRESS_PROBE_MODEL="${EGRESS_PROBE_MODEL:-$(egress_probe_model)}"
+  # R2598: the zengate probe needs enough time for the gateway; the selector's
+  # per-request timeout still caps a hung probe at PREFLIGHT_TMO.
+  if EGRESS_PROBE_REQUEST_TIMEOUT_MS="${EGRESS_PROBE_REQUEST_TIMEOUT_MS:-45000}" \
+     bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
+    PROBE_ENGINE=zengate
+    PARALLEL=1
+    log "preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate; each probe consumes one free message)"
+    trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
+  else
+    log "warning: zengate probe unavailable; falling back to curl preflight (diagnostic only)"
+    PROBE_ENGINE=curl
+  fi
 else
-  log "warning: zengate probe unavailable; falling back to curl preflight"
+  log "preflight engine=curl (diagnostic only; curl 429 is not a free-quota signal)"
 fi
 
 DIRECT_IP=$(egress_trace_direct)
@@ -204,26 +216,30 @@ if [ ${#KIND[@]} -gt 0 ]; then
 fi
 fresh_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^0$' || true)
 used_count=$(printf '%s\n' "${PREUSED[@]}" | grep -c '^1$' || true)
-log "selection plan: ${#KIND[@]} candidate(s), fresh=$fresh_count recently-used=$used_count reuse-window=${EGRESS_REUSE_WINDOW}s, parallel=$PARALLEL, timeout=${PREFLIGHT_TMO}s"
-# R2584: make the probe-vs-real-token mismatch explicit. The operator saw
-# "preflight 200 then the real request 429" and asked whether every relay exit
-# happens to have exactly one response left. It does not: one real turn is
-# ~27x larger than the probe, so a nearly-empty shared bucket can pass the
-# probe and serve one (or zero) real turns.
-log "real turn prompt (24h non-error): $(egress_real_prompt_stats) tokens; zengate probe is one small request (~4k tokens), so a probe 200 only proves probe-sized headroom"
+log "selection plan: ${#KIND[@]} candidate(s), fresh=$fresh_count recently-used=$used_count reuse-window=${EGRESS_REUSE_WINDOW}s, parallel=$PARALLEL, timeout=${PREFLIGHT_TMO}s, preflight=$PREFLIGHT_MODE"
+# R2619: state the real unit explicitly. The free tier counts messages, so a
+# probe 200 proves only that one message remained *before* the probe. Token
+# size is irrelevant: a 169k-token real request succeeded on a healthy IP while
+# curl was already 429 from the same IP. Path mode sends zero messages.
+case "$PREFLIGHT_MODE" in
+  path)    log "free tier meters messages, not tokens: path preflight sends 0 inference messages; the first real turn tests quota" ;;
+  zengate) log "free tier meters messages, not tokens: each zengate probe consumes 1 message; a probe 200 only proves >=1 message remained before the probe" ;;
+  *)       log "free tier meters messages, not tokens: curl cannot observe the real free-quota bucket (non-OpenCode clients are gated)" ;;
+esac
 
 i=0
 # R2582 (operator: "直连 429 时代理也会 429"): direct stays candidate #1. The
 # old policy then stopped on a direct quota 429 because shared relay buckets
 # were believed to be exhausted. R2598 revisited that with live evidence:
 # 11/14 shared relays served a real zengate probe, and two of them served two
-# consecutive ~100k-token (real-turn-sized) requests. The false "200 then 429"
-# was the 4k probe failing to prove real headroom, not the relay path itself.
+# consecutive ~100k-token (real-turn-sized) requests.
 #
-# R2617: direct stays candidate #1. If it fails, fallback exits are unlimited
-# by default (EGRESS_RELAY_FALLBACK_MAX=0). Each relay must pass the small
-# nonce probe and a sticky-egress check; the real-size inference probe is
-# opt-in only (EGRESS_BIG_PROBE=1) because it consumes a free message.
+# R2619: the false "200 then 429" was NOT a token-size mismatch. The free tier
+# meters messages, not tokens; the zengate probe is one real message. On an IP
+# with exactly one message left, the probe spends it, and the next real turn
+# 429s. Default is therefore path-only (0 messages). In zengate mode each relay
+# must still pass the nonce probe and a sticky-egress check; the real-size
+# inference probe is opt-in only (EGRESS_BIG_PROBE=1) and consumes a message.
 DIRECT_QUOTA_EXHAUSTED=0
 DIRECT_FAILED=0
 # R2617 (operator: "回退的出口数量不要限制"): 0 = unlimited fallback exits;
@@ -256,19 +272,29 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     pf="$EGRESS_STATE_DIR/preflight.$$.$idx"
     meta="$pf.meta"
     rm -f "$pf" "$meta"
-    if [ "$PROBE_ENGINE" = "zengate" ]; then
-      EGRESS_PREFLIGHT_META="$meta" \
-      timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
-        bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$([ "$kind" = direct ] && echo "" || echo "$target")" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
-    elif [ "$kind" = "direct" ]; then
-      EGRESS_PREFLIGHT_META="$meta" \
-      timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
-        bash "$SCRIPT_DIR/egress-preflight.sh" direct "" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
-    else
-      EGRESS_PREFLIGHT_META="$meta" \
-      timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
-        bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$target" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
-    fi
+    case "$PROBE_ENGINE" in
+      path)
+        EGRESS_PREFLIGHT_META="$meta" EGRESS_EXPECTED_IP="${DIRECT_IP:-}" \
+        timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
+          bash "$SCRIPT_DIR/egress-preflight-path.sh" "$kind" "$([ "$kind" = direct ] && echo "" || echo "$target")" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
+        ;;
+      zengate)
+        EGRESS_PREFLIGHT_META="$meta" \
+        timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
+          bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$([ "$kind" = direct ] && echo "" || echo "$target")" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
+        ;;
+      *)
+        if [ "$kind" = "direct" ]; then
+          EGRESS_PREFLIGHT_META="$meta" \
+          timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
+            bash "$SCRIPT_DIR/egress-preflight.sh" direct "" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
+        else
+          EGRESS_PREFLIGHT_META="$meta" \
+          timeout --signal=TERM --kill-after=2s "$PROBE_TIMEOUT" \
+            bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$target" "$PREFLIGHT_TMO" > "$pf" 2>/dev/null &
+        fi
+        ;;
+    esac
     B_REC+=("$idx|$kind|$target|$source|$key|$up|$pf|$!|${PREUSED[$idx]}")
     B_KEYS+=("$key")
   done
@@ -294,22 +320,33 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     out=$(cat "$pf" 2>/dev/null || true); rm -f "$pf"
     ra=""
     tokens=""
+    messages=""
+    pf_mode=""
+    pf_egress=""
     if [ -f "$pf.meta" ]; then
       ra=$(sed -n 's/^retry_after=//p' "$pf.meta" 2>/dev/null | head -1)
       tokens=$(sed -n 's/^tokens=//p' "$pf.meta" 2>/dev/null | head -1)
+      messages=$(sed -n 's/^messages=//p' "$pf.meta" 2>/dev/null | head -1)
+      pf_mode=$(sed -n 's/^mode=//p' "$pf.meta" 2>/dev/null | head -1)
+      pf_egress=$(sed -n 's/^egress=//p' "$pf.meta" 2>/dev/null | head -1)
       rm -f "$pf.meta"
     fi
     code=${out%%$'\t'*}
     why=${out##*$'\t'}
     [ -n "$code" ] || code=000
     [ -n "$why" ] || why=transport
-    if [ "$code" = "200" ] && [ "$why" = "ok" ]; then
+    if [ "$code" = "200" ] && { [ "$why" = "ok" ] || [ "$why" = "path_ok" ]; }; then
       if [ -z "$SELECTED_KIND" ]; then
         # R2551: preflight 200 只证明“那一次连接”的出口 IP 有额度。relay 若
         # 每次 CONNECT 轮换出口 IP，真实会话可能落到另一个已 quota 的 IP
         # （实测 58.27.117.24: 210.19.219.99 ↔ 入口 IP），于是 200 后仍 429。
         stable_egress=""
-        if [ "$kind" = "relay" ] || [ "$kind" = "http" ]; then
+        if [ "$pf_mode" = "path" ] && [ -n "$pf_egress" ] \
+           && { [ "$kind" = "relay" ] || [ "$kind" = "http" ]; }; then
+          # The path preflight already sampled 8 parallel CONNECTs and returned
+          # the single stable exit; do not pay for a second identical check.
+          stable_egress="$pf_egress"
+        elif [ "$kind" = "relay" ] || [ "$kind" = "http" ]; then
           if ! egress_trace_stable "$kind" "$target" 8 > "$EGRESS_STATE_DIR/stable-select.$$"; then
             log "candidate $kind $target passed preflight but egress rotates (saw ${EGRESS_TRACE_SEEN:-?}); skipping: preflight cannot validate the IP the real session will use"
             egress_bl_add "$key" "" "unstable-egress" 21600 || true
@@ -328,12 +365,16 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
         # R2598/R2617: the real-turn-sized probe is now OPT-IN
         # (EGRESS_BIG_PROBE=1) and OFF by default. The free tier counts
         # MESSAGES, so every inference probe steals a message from the real
-        # turn; a 4k probe returning 200 can itself consume the last message
-        # and make the next real turn 429. Default path: the small nonce probe
-        # proves the PATH really traverses this exit; the first real turn is the
-        # quota test. Fallback exits are unlimited (RELAY_FALLBACK_MAX=0).
+        # turn; a probe returning 200 can itself consume the last message and
+        # make the next real turn 429. In path mode the preflight sends zero
+        # messages; in zengate mode the small nonce probe is the path check,
+        # and the first real turn is still the quota test. Fallback exits are
+        # unlimited (RELAY_FALLBACK_MAX=0).
         if [ "$DIRECT_FAILED" = "1" ] && [ "$kind" != "direct" ] && [ "$RELAY_FALLBACK_MAX" -ge 0 ]; then
-          if [ "${EGRESS_BIG_PROBE:-0}" != "1" ]; then
+          if [ "${EGRESS_BIG_PROBE:-0}" != "1" ] || [ "$PREFLIGHT_MODE" != "zengate" ]; then
+            if [ "${EGRESS_BIG_PROBE:-0}" = "1" ] && [ "$PREFLIGHT_MODE" != "zengate" ]; then
+              log "ignoring EGRESS_BIG_PROBE=1 in preflight mode=$PREFLIGHT_MODE (it would consume a free message)"
+            fi
             log "relay fallback: $kind $target passed the path probe; selecting it (quota is tested by the first real turn)"
           else
           fallback_label="$RELAY_FALLBACK_MAX"; [ "$fallback_label" -eq 0 ] && fallback_label="unlimited"
@@ -346,7 +387,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
           bigpf="$EGRESS_STATE_DIR/bigprobe.$$.$RELAY_FALLBACK_TRIES"
           bigmeta="$bigpf.meta"
           rm -f "$bigpf" "$bigmeta"
-          log "relay fallback #${RELAY_FALLBACK_TRIES}/${fallback_label}: $kind $target passed the 4k probe; verifying with a real-size context probe"
+          log "relay fallback #${RELAY_FALLBACK_TRIES}/${fallback_label}: $kind $target passed the small path probe; verifying with a real-size context probe"
           EGRESS_PROBE_BIG=1 EGRESS_PREFLIGHT_META="$bigmeta" \
             timeout --signal=TERM --kill-after=5s "$BIG_PROBE_TIMEOUT" \
             bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$target" "$BIG_PROBE_TIMEOUT" > "$bigpf" 2>/dev/null || true
@@ -401,7 +442,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
         SELECTED_KIND="$kind"; SELECTED_TARGET="$target"; SELECTED_SOURCE="$source"; SELECTED_UP="$up"
         [ "$used" = "1" ] && SELECTED_SOURCE="${source}-reused"
         case "$kind" in
-          direct) SELECTED_EGRESS="${DIRECT_IP:-unknown}" ;;
+          direct) SELECTED_EGRESS="${DIRECT_IP:-${pf_egress:-unknown}}" ;;
           relay|http) SELECTED_EGRESS="$stable_egress" ;;
         esac
         [ -n "$SELECTED_EGRESS" ] || SELECTED_EGRESS="unknown"
@@ -411,9 +452,10 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
         why_note=""
         [ "$kind" = "direct" ] && why_note=" (direct-first: candidate #1 passed)"
         [ -n "$stable_egress" ] && why_note="$why_note (egress sticky over 8 parallel traces)"
-        [ "$PROBE_ENGINE" = "zengate" ] && why_note="$why_note (nonce-verified)"
+        [ "$PROBE_ENGINE" = "path" ] && why_note="$why_note (path-only, 0 messages)"
+        [ "$PROBE_ENGINE" = "zengate" ] && why_note="$why_note (nonce-verified, 1 message)"
         [ "$used" = "1" ] && why_note="$why_note (reused after all fresh candidates failed)"
-        log "selected $kind $target egress=$SELECTED_EGRESS source=$SELECTED_SOURCE code=200${why_note} (batch=$batch_start${tokens:+, probe_tokens=$tokens})"
+        log "selected $kind $target egress=$SELECTED_EGRESS source=$SELECTED_SOURCE code=200${why_note} (batch=$batch_start mode=$PREFLIGHT_MODE${messages:+, messages=$messages}${tokens:+, probe_tokens=$tokens})"
       fi
       # Stop paying for lower-priority probes as soon as the winner is known.
       killed=0
@@ -484,7 +526,10 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
 done
 
 if [ -z "$SELECTED_KIND" ]; then
-  if [ "$DIRECT_QUOTA_EXHAUSTED" = "1" ]; then
+  if [ "$PREFLIGHT_MODE" = "path" ]; then
+    log "ERROR: no candidate passed the zero-message path probe (direct + relays); refusing to run without a verified egress"
+    echo "::error::egress selection failed: no candidate passed the path probe (direct + relays); no unverified egress will be used"
+  elif [ "$DIRECT_QUOTA_EXHAUSTED" = "1" ]; then
     if [ "$RELAY_FALLBACK_MAX" -ge 0 ]; then
       log "ERROR: direct free-quota exhausted and no relay passed the path probe; ending this run so the next fresh runner IP gets a new direct bucket (no pause; relay will retry)"
       echo "::error::egress selection failed: direct quota exhausted; no relay passed the path probe"
@@ -508,7 +553,7 @@ egress_write_upstream "$SELECTED_UP" || {
   echo "::error::failed to write egress upstream ($EGRESS_UPSTREAM_FILE); refusing to run without a verified egress"
   exit 1
 }
-egress_write_state "$SELECTED_KIND" "$SELECTED_UP" "$SELECTED_EGRESS" "$SELECTED_SOURCE" "${DIRECT_IP:-unknown}" || {
+egress_write_state "$SELECTED_KIND" "$SELECTED_UP" "$SELECTED_EGRESS" "$SELECTED_SOURCE" "${DIRECT_IP:-unknown}" "$PREFLIGHT_MODE" || {
   echo "::error::failed to write egress state ($EGRESS_STATE_FILE); refusing to run without a verified egress"
   exit 1
 }
@@ -539,5 +584,5 @@ if ! grep -q '^HTTPS_PROXY=http://127\.0\.0\.1:' "$RUNNER_TEMP/exit-proxy.env"; 
   exit 1
 fi
 
-echo "[egress-select] upstream=$SELECTED_UP kind=$SELECTED_KIND egress=$SELECTED_EGRESS source=$SELECTED_SOURCE direct=${DIRECT_IP:-unknown}"
+echo "[egress-select] upstream=$SELECTED_UP kind=$SELECTED_KIND egress=$SELECTED_EGRESS source=$SELECTED_SOURCE direct=${DIRECT_IP:-unknown} preflight=$PREFLIGHT_MODE"
 exit 0
