@@ -528,16 +528,67 @@ jobs:
               echo "no bound session found; continuing the last session"
             fi
           fi
-          # Option C (resume-once-v2 plugin): arm the exact session for one
-          # post-restart continuation. It is independent of auto-continue and
-          # no-ops when the loop is already active. Default on.
+          # Option C (resume-once-v2 plugin): arm one post-restart continuation
+          # per interrupted session. R2624 (operator: "ses_e2d48872怎么没有跨ci接力"):
+          # the old block armed only RESUME_SID (the single session this run
+          # opens), so another bot's interrupted turn was never even evaluated.
+          # Arm every registered bot's persisted front/pinned target; the plugin
+          # still applies its per-session gates (halted / loop-off / active loop /
+          # quota tail) independently, so this widens coverage without forcing a
+          # resume. Default on.
           RESUME_ONCE_ENABLED=1
           if printf '%s' "${CI_RESUME_ONCE:-1}" | grep -qiE '^(0|false|no|off)$'; then
             RESUME_ONCE_ENABLED=0
           fi
-          if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_SID" ]; then
-            export RESUME_ONCE_SIDS="$RESUME_SID"
-            echo "option C resume-once armed: $RESUME_SID"
+          resume_front_of() {
+            local st="$1" sid=""
+            sid=$(jq -r '.front // empty' "$st" 2>/dev/null || true)
+            case "$sid" in ses_*) printf '%s' "$sid"; return 0 ;; esac
+            sid=$(jq -r '.pinned // empty' "$st" 2>/dev/null || true)
+            case "$sid" in ses_*) printf '%s' "$sid" ;; esac
+          }
+          RESUME_ONCE_LIST="$RESUME_SID"
+          RESUME_ONCE_SIDS=""
+          if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
+            # Keep the bot registry's order (first entry = tg-chats.json, the
+            # rest = tg-chats-<id>.json), matching auto-continue's discovery.
+            _bots_json="$HOME/.config/opencode/tg-bots.json"
+            if [ -f "$_bots_json" ] && command -v jq >/dev/null 2>&1; then
+              _first_bot=1
+              while IFS= read -r _botid; do
+                [ -n "$_botid" ] || continue
+                # Same convention as auto-continue.resolveExtraTargetPaths:
+                # the first registry entry owns tg-chats.json, the rest own
+                # tg-chats-<id>.json.
+                if [ "$_first_bot" = "1" ]; then
+                  _state="$HOME/.config/opencode/tg-chats.json"
+                  _first_bot=0
+                else
+                  _state="$HOME/.config/opencode/tg-chats-${_botid}.json"
+                fi
+                [ -f "$_state" ] || continue
+                _sid=$(resume_front_of "$_state")
+                if [ -n "$_sid" ]; then
+                  RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
+                fi
+              done < <(jq -r '.bots[]?.id // empty' "$_bots_json" 2>/dev/null || true)
+            else
+              # Registry missing/unreadable: fall back to every persisted bot
+              # state file. Globbing tg-chats*.json also covers the primary.
+              for _state in "$HOME"/.config/opencode/tg-chats.json "$HOME"/.config/opencode/tg-chats-*.json; do
+                [ -f "$_state" ] || continue
+                _sid=$(resume_front_of "$_state")
+                if [ -n "$_sid" ]; then
+                  RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
+                fi
+              done
+            fi
+            # Deduplicate (bots may share a front), preserving first-seen order.
+            RESUME_ONCE_SIDS=$(printf '%s\n' "$RESUME_ONCE_LIST" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
+          fi
+          if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_ONCE_SIDS" ]; then
+            export RESUME_ONCE_SIDS
+            echo "option C resume-once armed: $RESUME_ONCE_SIDS"
           else
             export RESUME_ONCE_SIDS=""
             if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
