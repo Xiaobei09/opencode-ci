@@ -52,8 +52,9 @@ if [ "${EGRESS_PROBE_BIG:-0}" = "1" ]; then
   # same context size as a real turn so "200" means "can serve a turn".
   #
   # This costs one real provider request (~86k tokens in live measurement), so
-  # the selector only runs it after direct failed, at most
-  # EGRESS_RELAY_FALLBACK_MAX times.
+  # it is opt-in (EGRESS_BIG_PROBE=1) and runs only after direct failed. By
+  # default the selector relies on the small path probe; the first real turn
+  # is the quota test.
   FILLER="$PROBE_DIR/filler.txt"
   WANT_BYTES="${EGRESS_BIG_PROBE_BYTES:-400000}"
   if [ ! -s "$FILLER" ] || [ "$(wc -c < "$FILLER" 2>/dev/null || echo 0)" -lt "$WANT_BYTES" ]; then

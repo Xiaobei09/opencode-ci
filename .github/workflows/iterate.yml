@@ -14,10 +14,10 @@ on:
         required: false
         default: false
       budget_seconds:
-        description: OpenCode run budget in seconds (default ~5h30m; max job is 6h)
+        description: OpenCode run budget in seconds (R2617 default 600s = 10min; a timeout counts as a no-200 round)
         type: string
         required: false
-        default: "19800"
+        default: "600"
       reset_baseline:
         description: Rewrite the repository back to its clean initial baseline (runtime state stays in the release)
         type: boolean
@@ -280,11 +280,12 @@ jobs:
           EGRESS_SELECT_MAX: "0"
           EGRESS_SELECT_BUDGET: "0"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
-          # R2597: direct stays candidate #1. Only after direct fails, verify at
-          # most two relays, each with a real-turn-sized probe (400KB ≈ 86k
-          # tokens) instead of trusting the 4k probe. Set fallback max to 0 to
-          # restore the old stop-on-direct-quota behavior.
-          EGRESS_RELAY_FALLBACK_MAX: "2"
+          # R2617 (operator rollback): do not cap fallback exits. 0 = unlimited;
+          # -1 would disable relay fallback entirely. The real-turn-sized probe
+          # is OFF by default because it consumes a free message that the real
+          # turn needs; the first real turn is the quota test.
+          EGRESS_RELAY_FALLBACK_MAX: "0"
+          EGRESS_BIG_PROBE: "0"
           EGRESS_BIG_PROBE_BYTES: "400000"
           EGRESS_BIG_PROBE_TIMEOUT: "60"
         run: |
@@ -297,12 +298,12 @@ jobs:
             # afresh, and the failure notification must not claim an egress.
             rm -f "$HOME/.config/opencode/exit-proxy.json" "$RUNNER_TEMP/exit-proxy.env" \
                   "$RUNNER_TEMP/egress/upstream" "$RUNNER_TEMP/egress/candidates.tsv"
-            # R2588（D8）：失败原因必须区分。direct quota 耗尽时探测拿到的是
-            # 429（不是“没有 200”），而且是**有意**不切共享 relay（同桶已耗尽）。
-            # 旧文案把两种失败都写成“没有 200”，正好掩盖运营者关心的根因。
+            # R2588/R2617：失败原因必须区分。direct quota 耗尽时探测拿到的是
+            # 429；是否试过 relay 由 select-proxy 的 ERROR 行说明（当前默认
+            # 不限量，所以通常是“no relay passed the path probe”）。
             sel_err=$(grep -aE '^\[egress-select\] ERROR: ' "$RUNNER_TEMP/select-proxy.log" 2>/dev/null | tail -1 | sed -E 's/^\[egress-select\] ERROR: //' | cut -c1-240)
             if printf '%s' "$sel_err" | grep -q 'direct free-quota exhausted'; then
-              reason="direct free-quota exhausted; shared relays deliberately not tried (their buckets are already consumed)"
+              reason="${sel_err:-direct free-quota exhausted}"
               echo "::error::egress selection failed: $reason; ending this run so the next fresh runner IP gets a new daily bucket"
             else
               reason="no egress candidate answered 200 (select-proxy rc=$rc)"
@@ -445,7 +446,9 @@ jobs:
             tail -20 "$EGRESS_DIR/proxy.log" 2>/dev/null || true
             exit 1
           fi
-          BUDGET="${BUDGET_SECONDS:-19800}"
+          # R2617: cap a single round at 10 minutes so one stuck turn cannot
+          # block the loop/context for hours (operator: "哪一个工作流超过10分钟").
+          BUDGET="${BUDGET_SECONDS:-600}"
           SID=""
           if [ -f "$HOME/.config/opencode/tg-chats.json" ]; then
             SID=$(jq -r '.front // empty' "$HOME/.config/opencode/tg-chats.json" 2>/dev/null || true)
@@ -630,11 +633,10 @@ jobs:
           restore_outcome="${{ steps.restore_ws.outcome }}"
           quota_stop="${{ steps.run_opencode.outputs.egress_quota_stop }}"
           allow=false
-          # R2596 (D8, operator: "find an exit that actually works"): a dirty
-          # runner IP is external. The old 3-round pause stopped the loop for
-          # 11 hours on 2026-11-11 after three quota 429s, so no fresh IP was
-          # ever tried. Egress-only failures now relay immediately (with a
-          # growing backoff after several tries) and never set CI_LOOP_PAUSED.
+          # R2596/R2617: a dirty runner IP is external, so a single egress-only
+          # failure relays immediately with a growing backoff. But the operator's
+          # restored rule still applies: 3 consecutive rounds without ANY real
+          # 200 set CI_LOOP_PAUSED=true and suppress the successor.
           egress_only=false
           if [ "$quota_stop" = "true" ] && [ "$round_success" != "true" ]; then
             egress_only=true
@@ -644,23 +646,45 @@ jobs:
             egress_only=true
           fi
           # Safety net: OpenCode can exit 0 after a quota 429 without the watcher
-          # writing a stop marker. Treat the run as an egress-only retry too, so
-          # a restored/stale 429 cannot push the loop into the 3-round pause.
+          # writing a stop marker. Treat the run as an egress-only retry too;
+          # the no-200 streak still counts it and pauses after 3.
           if [ "$egress_only" != "true" ] && [ "$round_success" != "true" ] \
              && [ -s "$RUNNER_TEMP/opencode-errors.txt" ] \
              && grep -qiE 'FreeUsageLimit|free usage limit|provider\.free-limit' "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null; then
             egress_only=true
           fi
           # A healthy turn proves the egress works; clear the egress retry streak.
-          if [ -f "$RUNNER_TEMP/round-had-success" ]; then
+          if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; then
             gh variable set CI_EGRESS_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+            gh variable set CI_NO_200_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
           fi
           egress_retry_policy() {
-            local cur next delay
+            local cur next delay no200
             cur=$(gh variable get CI_EGRESS_STREAK --repo "$repo" 2>/dev/null || echo 0)
             case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
             next=$((cur + 1))
             gh variable set CI_EGRESS_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1 || true
+            # R2617 (operator: "连续3轮没有200后不再继续"): an egress-only round
+            # is still a round without a real 200 unless a healthy turn already
+            # ran. Restore the 3-round stop that R2596 had bypassed; a quota
+            # after a real 200 does not count (CI_NO_200_STREAK was reset above).
+            if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; then
+              gh variable set CI_NO_200_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+            else
+              no200=$(gh variable get CI_NO_200_STREAK --repo "$repo" 2>/dev/null || echo 0)
+              case "$no200" in ''|*[!0-9]*) no200=0 ;; esac
+              no200=$((no200 + 1))
+              gh variable set CI_NO_200_STREAK --body "$no200" --repo "$repo" >/dev/null 2>&1 || true
+              if [ "$no200" -ge 3 ]; then
+                gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+                echo "::error::$no200 consecutive rounds without any real 200; CI_LOOP_PAUSED=true, no successor"
+                echo "egress_retry=true" >> "$GITHUB_OUTPUT"
+                echo "egress_retry_count=$next" >> "$GITHUB_OUTPUT"
+                allow=false
+                return 0
+              fi
+              echo "::notice::round had no real 200 (CI_NO_200_STREAK=$no200/3); will relay a fresh round"
+            fi
             # Egress quota says nothing about the content loop. Keep the content
             # failure counter clear so a later real failure still pauses after 3.
             gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
@@ -669,7 +693,7 @@ jobs:
               delay=$(( 15 << (next - 4) ))
               [ "$delay" -gt 300 ] && delay=300
             fi
-            echo "::notice::egress-only failure #$next (anonymous quota is per exit IP); not counting toward pause; next fresh runner IP in ${delay}s"
+            echo "::notice::egress-only failure #$next (anonymous quota is per exit IP); relay in ${delay}s; no-200 streak is tracked separately"
             echo "egress_retry=true" >> "$GITHUB_OUTPUT"
             echo "egress_retry_count=$next" >> "$GITHUB_OUTPUT"
             echo "relay_delay=$delay" >> "$GITHUB_OUTPUT"
@@ -721,12 +745,15 @@ jobs:
             # R2550（D5）：exit 0 不等于本轮有正常回合。旧实现无条件清零 streak，
             # 于是插件未注入/进程静默退出时会无限接力且永远不触发 3 连败暂停。
             # 判据与 watcher 分支一致：本进程写过 round-had-success，或确属时间预算耗尽。
-            if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$soft_success" = "true" ]; then
+            if [ -f "$RUNNER_TEMP/round-had-success" ]; then
               gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               allow=true
               echo "run succeeded; reset CI_FAIL_STREAK"
             else
-              echo "::warning::opencode exited 0 but produced no healthy turn this run; counting it as a failed round"
+              # R2617: a soft timeout (exit 124) is NOT a healthy turn. Counting
+              # it as success let a stuck loop relay forever; the operator's rule
+              # is 3 consecutive rounds without any real 200 → stop.
+              echo "::warning::opencode exited 0 but produced no healthy turn this run${soft_success:+ (soft_success=$soft_success)}; counting it as a failed round"
               echo "silent_exit=true" >> "$GITHUB_OUTPUT"
               cur=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo 0)
               case "$cur" in ''|*[!0-9]*) cur=0 ;; esac

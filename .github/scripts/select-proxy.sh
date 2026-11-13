@@ -16,15 +16,19 @@
 # already exhausted. Forcing relay therefore reproduces "preflight 200, then
 # the real request immediately 429". Never disable direct or put relays first.
 #
-# R2598 (operator: "find a really usable exit"): the blanket "shared relay is
-# exhausted" conclusion was too broad. Live evidence: 11/14 relays passed a
-# real zengate probe, and two served two consecutive ~100k-token requests. The
-# "200 then 429" was mostly the 4k probe failing to prove real-turn headroom.
-# Direct is still #1; if direct fails, up to two relays must now pass a
-# real-turn-sized (~400KB / ~86k token) context probe before one is selected
-# (EGRESS_RELAY_FALLBACK_MAX, default 2). A relay is never selected on the 4k
-# probe alone while direct is healthy; forcing relay without the big probe is
-# still forbidden.
+# R2617 (operator: "回退的出口数量不要限制"): fallback exits are unlimited by
+# default (EGRESS_RELAY_FALLBACK_MAX=0); -1 disables relay fallback. The
+# selection budget (EGRESS_SELECT_BUDGET) is still honored to prevent a
+# pathological loop, and the candidate list itself is finite.
+#
+# R2617 (operator: "200 暂不处理" + rollback of the R2598 design): the
+# real-turn-sized inference probe is OFF by default (EGRESS_BIG_PROBE=1 opts
+# in). The free tier meters MESSAGES, so every inference probe consumes one of
+# the messages the real turn needs — a 200 probe can itself cause the next real
+# turn to 429. The small nonce probe verifies that the request really traverses
+# the candidate exit (PATH); the first real turn verifies the QUOTA. A
+# preflight 200 is therefore logged as "path verified", never as "quota
+# proven". If the real turn 429s, the watcher blacklists that exit.
 #
 # Outputs:
 #   $RUNNER_TEMP/egress/upstream        direct | relay:ip:port | http:host:port
@@ -216,18 +220,17 @@ i=0
 # consecutive ~100k-token (real-turn-sized) requests. The false "200 then 429"
 # was the 4k probe failing to prove real headroom, not the relay path itself.
 #
-# New policy: direct is still #1 and a failed direct is blacklisted. If direct
-# fails, up to EGRESS_RELAY_FALLBACK_MAX (default 2, hard cap 2) relays that
-# pass the small probe must ALSO pass a real-turn-sized (EGRESS_BIG_PROBE_BYTES
-# ~400KB / ~86k tokens) probe before one is selected. This keeps the per-run
-# exit count at direct + 2 relays = 3, and never selects a relay on the 4k
-# probe alone. If none pass, the run ends and relays to a fresh runner; the
-# R2596 no-pause policy still applies.
+# R2617: direct stays candidate #1. If it fails, fallback exits are unlimited
+# by default (EGRESS_RELAY_FALLBACK_MAX=0). Each relay must pass the small
+# nonce probe and a sticky-egress check; the real-size inference probe is
+# opt-in only (EGRESS_BIG_PROBE=1) because it consumes a free message.
 DIRECT_QUOTA_EXHAUSTED=0
 DIRECT_FAILED=0
-RELAY_FALLBACK_MAX="${EGRESS_RELAY_FALLBACK_MAX:-2}"
-case "$RELAY_FALLBACK_MAX" in ''|*[!0-9]*) RELAY_FALLBACK_MAX=0 ;; esac
-[ "$RELAY_FALLBACK_MAX" -gt 2 ] && RELAY_FALLBACK_MAX=2
+# R2617 (operator: "回退的出口数量不要限制"): 0 = unlimited fallback exits;
+# a positive value keeps an explicit budget; -1 disables relay fallback.
+RELAY_FALLBACK_MAX="${EGRESS_RELAY_FALLBACK_MAX:-0}"
+case "$RELAY_FALLBACK_MAX" in ''|*[!0-9-]*) RELAY_FALLBACK_MAX=0 ;; esac
+[ "$RELAY_FALLBACK_MAX" -lt -1 ] && RELAY_FALLBACK_MAX=-1
 RELAY_FALLBACK_TRIES=0
 BIG_PROBE_TIMEOUT="${EGRESS_BIG_PROBE_TIMEOUT:-60}"
 while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
@@ -280,7 +283,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
   for rec in "${B_REC[@]+"${B_REC[@]}"}"; do
     IFS='|' read -r idx kind target source key up pf pid used <<< "$rec"
     pos=$((pos + 1))
-    if [ "$DIRECT_QUOTA_EXHAUSTED" = "1" ] && [ "$RELAY_FALLBACK_MAX" -eq 0 ]; then
+    if [ "$DIRECT_QUOTA_EXHAUSTED" = "1" ] && [ "$RELAY_FALLBACK_MAX" -lt 0 ]; then
       # Direct's bucket is gone and relay fallback is disabled; do not let a
       # same-batch relay win the selection.
       if [ -n "${pid:-}" ]; then kill "$pid" 2>/dev/null || true; fi
@@ -322,11 +325,19 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
           log "candidate $kind $target preflight 200 but egress=$stable_egress was used recently (reuse-window=${EGRESS_REUSE_WINDOW}s); skipping to keep a fresh quota bucket"
           continue
         fi
-        # R2598: after direct failed, a relay's 4k-probe 200 is not proof that
-        # one real resumed turn fits. Require a real-turn-sized probe before
-        # selecting it; at most RELAY_FALLBACK_MAX relays are paid for.
-        if [ "$DIRECT_FAILED" = "1" ] && [ "$kind" != "direct" ] && [ "$RELAY_FALLBACK_MAX" -gt 0 ]; then
-          if [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
+        # R2598/R2617: the real-turn-sized probe is now OPT-IN
+        # (EGRESS_BIG_PROBE=1) and OFF by default. The free tier counts
+        # MESSAGES, so every inference probe steals a message from the real
+        # turn; a 4k probe returning 200 can itself consume the last message
+        # and make the next real turn 429. Default path: the small nonce probe
+        # proves the PATH really traverses this exit; the first real turn is the
+        # quota test. Fallback exits are unlimited (RELAY_FALLBACK_MAX=0).
+        if [ "$DIRECT_FAILED" = "1" ] && [ "$kind" != "direct" ] && [ "$RELAY_FALLBACK_MAX" -ge 0 ]; then
+          if [ "${EGRESS_BIG_PROBE:-0}" != "1" ]; then
+            log "relay fallback: $kind $target passed the path probe; selecting it (quota is tested by the first real turn)"
+          else
+          fallback_label="$RELAY_FALLBACK_MAX"; [ "$fallback_label" -eq 0 ] && fallback_label="unlimited"
+          if [ "$RELAY_FALLBACK_MAX" -gt 0 ] && [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
             log "relay fallback budget exhausted (${RELAY_FALLBACK_MAX}); no relay verified with a real-size probe"
             i=${#KIND[@]}
             break
@@ -335,7 +346,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
           bigpf="$EGRESS_STATE_DIR/bigprobe.$$.$RELAY_FALLBACK_TRIES"
           bigmeta="$bigpf.meta"
           rm -f "$bigpf" "$bigmeta"
-          log "relay fallback #${RELAY_FALLBACK_TRIES}/${RELAY_FALLBACK_MAX}: $kind $target passed the 4k probe; verifying with a real-size context probe"
+          log "relay fallback #${RELAY_FALLBACK_TRIES}/${fallback_label}: $kind $target passed the 4k probe; verifying with a real-size context probe"
           EGRESS_PROBE_BIG=1 EGRESS_PREFLIGHT_META="$bigmeta" \
             timeout --signal=TERM --kill-after=5s "$BIG_PROBE_TIMEOUT" \
             bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$target" "$BIG_PROBE_TIMEOUT" > "$bigpf" 2>/dev/null || true
@@ -352,7 +363,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
           if [ "$bigcode" != "200" ] || [ "$bigwhy" != "ok" ]; then
             log "relay fallback #${RELAY_FALLBACK_TRIES} failed the real-size probe code=$bigcode reason=$bigwhy${bigtokens:+ tokens=$bigtokens}; continuing"
             [ "$bigwhy" = "probe_setup" ] || egress_bl_add "$key" "$stable_egress" "big-probe-${bigwhy}" 21600 || true
-            if [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
+            if [ "$RELAY_FALLBACK_MAX" -gt 0 ] && [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
               log "relay fallback budget exhausted after #${RELAY_FALLBACK_TRIES} failed real-size probe(s)"
               i=${#KIND[@]}
               break
@@ -368,7 +379,7 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
             log "relay fallback #${RELAY_FALLBACK_TRIES} passed the real-size probe but egress rotates after it (saw ${EGRESS_TRACE_SEEN:-?}); skipping to avoid validating one IP and running on another"
             rm -f "$postpf"
             egress_bl_add "$key" "" "big-probe-unstable" 21600 || true
-            if [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
+            if [ "$RELAY_FALLBACK_MAX" -gt 0 ] && [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
               i=${#KIND[@]}
               break
             fi
@@ -378,13 +389,14 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
           if [ -n "$stable_egress" ] && [ -n "$post_egress" ] && [ "$post_egress" != "$stable_egress" ]; then
             log "relay fallback #${RELAY_FALLBACK_TRIES} big-probe egress changed ($stable_egress -> $post_egress); skipping because the real turn could land on an unverified bucket"
             egress_bl_add "$key" "$post_egress" "big-probe-rotated" 21600 || true
-            if [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
+            if [ "$RELAY_FALLBACK_MAX" -gt 0 ] && [ "$RELAY_FALLBACK_TRIES" -ge "$RELAY_FALLBACK_MAX" ]; then
               i=${#KIND[@]}
               break
             fi
             continue
           fi
           tokens="$bigtokens"
+          fi
         fi
         SELECTED_KIND="$kind"; SELECTED_TARGET="$target"; SELECTED_SOURCE="$source"; SELECTED_UP="$up"
         [ "$used" = "1" ] && SELECTED_SOURCE="${source}-reused"
@@ -442,10 +454,10 @@ while [ "$i" -lt "${#KIND[@]}" ] && [ -z "$SELECTED_KIND" ]; do
     fi
     if [ "$kind" = "direct" ] && [ "$why" = "quota" ]; then
       DIRECT_QUOTA_EXHAUSTED=1
-      if [ "$RELAY_FALLBACK_MAX" -gt 0 ]; then
-        log "direct free-quota exhausted (code=$code retry_after=${ra:-?}s); direct stays failed, verifying up to ${RELAY_FALLBACK_MAX} relay(s) with a real-size (~100k token) context probe"
+      if [ "$RELAY_FALLBACK_MAX" -ge 0 ]; then
+        log "direct free-quota exhausted (code=$code retry_after=${ra:-?}s); direct stays failed, trying relay fallback exits (max=${RELAY_FALLBACK_MAX:-0}; 0=unlimited)"
       else
-        log "direct free-quota exhausted (code=$code retry_after=${ra:-?}s); relay fallback disabled — stopping candidate probing (operator: relay also 429s)"
+        log "direct free-quota exhausted (code=$code retry_after=${ra:-?}s); relay fallback disabled — stopping candidate probing"
         i=${#KIND[@]}
       fi
     fi
@@ -473,9 +485,9 @@ done
 
 if [ -z "$SELECTED_KIND" ]; then
   if [ "$DIRECT_QUOTA_EXHAUSTED" = "1" ]; then
-    if [ "$RELAY_FALLBACK_MAX" -gt 0 ]; then
-      log "ERROR: direct free-quota exhausted and no relay passed the real-size context probe; ending this run so the next fresh runner IP gets a new direct bucket (no pause; relay will retry)"
-      echo "::error::egress selection failed: direct quota exhausted; no relay passed a real-size context probe"
+    if [ "$RELAY_FALLBACK_MAX" -ge 0 ]; then
+      log "ERROR: direct free-quota exhausted and no relay passed the path probe; ending this run so the next fresh runner IP gets a new direct bucket (no pause; relay will retry)"
+      echo "::error::egress selection failed: direct quota exhausted; no relay passed the path probe"
     else
       log "ERROR: direct free-quota exhausted; relay fallback disabled — refusing to switch to shared relay egress. Ending this run so the next fresh runner IP gets a new direct bucket."
       echo "::error::egress selection failed: direct quota exhausted; relay fallback disabled"
