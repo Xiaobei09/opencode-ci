@@ -294,8 +294,22 @@ jobs:
           EGRESS_BIG_PROBE: "0"
           EGRESS_BIG_PROBE_BYTES: "400000"
           EGRESS_BIG_PROBE_TIMEOUT: "60"
+          # R2626: repo-level kill switch for the egress-change-gated quota-tail
+          # recovery. Default on; the TG menu（额度尾恢复）is the per-install
+          # auto/off preference.
+          CI_QUOTA_TAIL_RECOVER: ${{ vars.CI_QUOTA_TAIL_RECOVER || '1' }}
         run: |
           set +e
+          # R2626 (operator: "改，给我一个菜单的选择按钮/界面"): capture the
+          # PREVIOUS run's selected egress before selection overwrites it. A
+          # pre-boot quota/429 tail is only recoverable in Option C when this
+          # run picked a genuinely different exit; same exit keeps
+          # skip=quota-error so we do not immediately burn another 429.
+          PREV_EXIT="$RUNNER_TEMP/exit-proxy.prev.json"
+          rm -f "$PREV_EXIT"
+          if [ -s "$HOME/.config/opencode/exit-proxy.json" ]; then
+            cp "$HOME/.config/opencode/exit-proxy.json" "$PREV_EXIT" 2>/dev/null || true
+          fi
           bash "$GITHUB_WORKSPACE/.github/scripts/select-proxy.sh" 2>&1 | tee "$RUNNER_TEMP/select-proxy.log"
           rc=${PIPESTATUS[0]}
           echo "select-proxy rc=$rc"
@@ -337,6 +351,44 @@ jobs:
             echo "::error::egress selection reported success but $RUNNER_TEMP/exit-proxy.env is missing/incomplete; ending this run (no direct fallback)"
             exit 1
           fi
+          # R2626: compare the previous run's egress with this run's selection.
+          # "Different" means a different upstream (direct|relay:ip:port|
+          # http:host:port) OR a different observed egress IP. A missing
+          # previous file is NOT evidence of a change (fresh snapshot/manual
+          # first run) → keep the conservative skip=quota-error.
+          PREV_UP=""; PREV_EG=""
+          if [ -s "$PREV_EXIT" ]; then
+            PREV_UP=$(jq -r '.upstream // empty' "$PREV_EXIT" 2>/dev/null || true)
+            PREV_EG=$(jq -r '.egress_ip // empty' "$PREV_EXIT" 2>/dev/null || true)
+          fi
+          NEW_UP=$(jq -r '.upstream // empty' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null || true)
+          NEW_EG=$(jq -r '.egress_ip // empty' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null || true)
+          EGRESS_CHANGED=0
+          if [ -n "$PREV_UP" ]; then
+            if [ "$PREV_UP" != "$NEW_UP" ]; then
+              EGRESS_CHANGED=1
+            elif [ -n "$PREV_EG" ] && [ -n "$NEW_EG" ] && [ "$PREV_EG" != "$NEW_EG" ]; then
+              EGRESS_CHANGED=1
+            fi
+          fi
+          # R2626 menu preference (TG 循环/代理页 →「额度尾恢复」):
+          # auto = only after an egress change; off = always skip quota tails.
+          QR_MODE="auto"
+          QR_FILE="$HOME/.config/opencode/quota-recover.json"
+          if [ -f "$QR_FILE" ]; then
+            QR_MODE=$(jq -r '.mode // "auto"' "$QR_FILE" 2>/dev/null || echo auto)
+          fi
+          [ "$QR_MODE" = "off" ] || QR_MODE="auto"
+          QR_ENABLED=0
+          if [ "$EGRESS_CHANGED" = "1" ] && [ "$QR_MODE" = "auto" ]; then
+            case "${CI_QUOTA_TAIL_RECOVER:-1}" in
+              0|false|no|off|OFF|False|No) QR_ENABLED=0 ;;
+              *) QR_ENABLED=1 ;;
+            esac
+          fi
+          # Consumed by the Run OpenCode step (and then by the Option C plugin).
+          echo "RESUME_ONCE_QUOTA_RECOVER=$QR_ENABLED" >> "$GITHUB_ENV"
+          echo "R2626 quota-tail recover: prev=${PREV_UP:-none}/${PREV_EG:-?} new=${NEW_UP:-?}/${NEW_EG:-?} changed=$EGRESS_CHANGED mode=$QR_MODE enabled=$QR_ENABLED"
           if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
             # R2520：与 TG 错误卡 exitProxySummary() 使用完全相同的键名/顺序：
             # kind → upstream → local → egress → direct。旧格式 `CI egress: direct direct`
@@ -347,6 +399,9 @@ jobs:
             PROXY=$(jq -r '.proxy // "127.0.0.1:8089"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
             EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
             MSG="exit proxy: kind=${KIND} upstream=${UP} local=${SCHEME}://${PROXY} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+            # R2626: visible proof that this run may recover a pre-boot quota
+            # tail once (only when the egress actually changed).
+            [ "$QR_ENABLED" = "1" ] && MSG="$MSG quota-tail-recover=on"
             curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \
               >/dev/null 2>&1 || echo "::warning::could not send the exit-proxy notice to telegram"
@@ -375,6 +430,10 @@ jobs:
           # while the auto loop gate is open (it never overrides halted/loop-off).
           CI_RESUME_ONCE: ${{ vars.CI_RESUME_ONCE || '1' }}
           RESUME_ONCE_FORCE: ${{ vars.RESUME_ONCE_FORCE || '' }}
+          # R2626: RESUME_ONCE_QUOTA_RECOVER is written to $GITHUB_ENV by the
+          # egress-selection step after comparing this run's exit with the
+          # previous run's. Do not set it here (a step-level env would shadow
+          # the computed value).
           # R2625: after a verified quota 429 ends the round, spend one real
           # zengate request on an alternate egress to test whether the quota is
           # path-specific. Diagnostic only; set the repo variable to 0 to skip.
