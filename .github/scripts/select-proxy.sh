@@ -115,7 +115,8 @@ DIRECT_COLO=$(curl -sS -m 10 --noproxy '*' "$EGRESS_TRACE_URL" 2>/dev/null | awk
 log "direct egress=${DIRECT_IP:-unknown} colo=${DIRECT_COLO:-?}"
 
 # ---- candidate list -------------------------------------------------------
-# 1) direct (a fresh runner IP is often the best bucket)
+# 1) direct (first candidate; R2620: a fresh runner IP is NOT reliably a fresh
+#    free-quota bucket, so selection never assumes that)
 printf 'direct\t-\tdirect\n' >> "$EGRESS_CANDIDATES_FILE"
 
 # 2) proxyip relay entries (non-CF ASN + CF edge ports; --connect-to relays TCP)
@@ -531,10 +532,10 @@ if [ -z "$SELECTED_KIND" ]; then
     echo "::error::egress selection failed: no candidate passed the path probe (direct + relays); no unverified egress will be used"
   elif [ "$DIRECT_QUOTA_EXHAUSTED" = "1" ]; then
     if [ "$RELAY_FALLBACK_MAX" -ge 0 ]; then
-      log "ERROR: direct free-quota exhausted and no relay passed the path probe; ending this run so the next fresh runner IP gets a new direct bucket (no pause; relay will retry)"
+      log "ERROR: direct free-quota exhausted and no relay passed the path probe; ending this run so the next run can select again (no pause; relay will retry)"
       echo "::error::egress selection failed: direct quota exhausted; no relay passed the path probe"
     else
-      log "ERROR: direct free-quota exhausted; relay fallback disabled — refusing to switch to shared relay egress. Ending this run so the next fresh runner IP gets a new direct bucket."
+      log "ERROR: direct free-quota exhausted; relay fallback disabled — refusing to switch to shared relay egress. Ending this run so the next run can select again."
       echo "::error::egress selection failed: direct quota exhausted; relay fallback disabled"
     fi
   else

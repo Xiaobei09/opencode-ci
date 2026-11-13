@@ -6,16 +6,16 @@
 # R2562 (operator): the egress is selected exactly once in the "Select egress
 # proxy" step. This watcher no longer rotates or re-selects inside a run. It
 # only:
-#   - counts consecutive quota 429s and transport failures separately, and
-#     stops the round after 3 of either kind (the relay then starts a fresh run
-#     that selects a new egress);
+#   - stops the round on the FIRST verified quota 429 (R2620; operator:
+#     "改为出现一个429就重启吧") so the relay immediately starts a fresh run
+#     and a fresh egress selection. Transport failures still stop after 3;
 #   - if the selected egress hits quota shortly after selection, blacklists it
-#     for the provider's Retry-After window but does NOT stop on the first 429:
-#     R2618 (operator: "连续3个429再结束") requires three consecutive 429s.
-#     The workflow pauses the loop when the watcher reports that 3-429 stop.
-#     With the default path-only preflight there was no quota 200 at all; the
-#     log says so instead of reusing the old "200 then 429" wording;
+#     for the provider's Retry-After window before stopping. With the default
+#     path-only preflight there was no quota 200 at all; the log says so
+#     instead of reusing the old "200 then 429" wording;
 #   - resets both consecutive counters on a real healthy turn.
+# The workflow counts consecutive 429-only rounds in CI_429_STREAK and keeps
+# the general "3 rounds without any healthy turn" safety valve.
 #
 # Usage: egress-watch.sh <run-log> [proxy-log] [plugin-log]
 set -uo pipefail
@@ -39,6 +39,10 @@ egress_bl_init
 egress_bl_prune
 
 FAIL_LIMIT=3
+# R2620 (operator: "改为出现一个429就重启吧"): a single verified quota 429 ends
+# the round. The relay then dispatches a fresh run instead of waiting for three
+# consecutive 429s. Transport failures keep the 3-strike threshold.
+QUOTA_LIMIT=1
 PROBE_FALSE_WINDOW=120
 FAIL_DEDUPE_SECONDS=20
 
@@ -124,28 +128,28 @@ record_failure() {
 }
 
 # record_quota <line> [retry_after] [msg_at]
-# R2618 (operator: "连续3个429再结束"): a single quota 429 no longer ends the
-# round. Count verified 429s; the third consecutive one stops the round and the
-# workflow pauses the loop (no successor). A healthy turn resets the streak.
-# Dedupe by the error message timestamp, not wall-clock: retries of the same
-# failed message share msg_at, while genuinely distinct 429s have distinct
-# msg_at values. A 20s wall-clock window would swallow rapid retries and make
-# the 3-429 rule unreachable.
+# R2620 (operator: "改为出现一个429就重启吧"): the first verified quota 429 ends
+# the round. Dedupe by the error message timestamp, not wall-clock: retries of
+# the same failed message share msg_at, so one provider failure cannot produce
+# several stops. A healthy turn resets the streak.
 # Auto-continue has its own 3-consecutive-error limit, so the round still ends
-# even if the watcher misses the third line in the shutdown race.
+# even if the watcher misses the quota line in the shutdown race.
 record_quota() {
   local line="$1" retry_after="${2:-?}" msg_at="${3:-}" now
   now=$(egress_now)
   if [ -n "$msg_at" ] && [ "$msg_at" = "$quota_last_msg" ]; then
-    log "duplicate quota 429 for the same message msg_at=$msg_at ignored (streak=$quota_streak/$FAIL_LIMIT, upstream=$CUR_UP): ${line:0:200}"
+    log "duplicate quota 429 for the same message msg_at=$msg_at ignored (streak=$quota_streak/$QUOTA_LIMIT, upstream=$CUR_UP): ${line:0:200}"
     return 0
   fi
   quota_last_msg="$msg_at"
   quota_last_at=$now
   quota_streak=$((quota_streak + 1))
-  log "quota 429 detected (streak=$quota_streak/$FAIL_LIMIT, upstream=$CUR_UP, retry_after=${retry_after}s)"
-  if [ "$quota_streak" -ge "$FAIL_LIMIT" ]; then
-    stop_run "three consecutive quota 429s (upstream=$CUR_UP, retry_after=${retry_after}s); ending this round so the loop stops"
+  log "quota 429 detected (streak=$quota_streak/$QUOTA_LIMIT, upstream=$CUR_UP, retry_after=${retry_after}s)"
+  if [ "$quota_streak" -ge "$QUOTA_LIMIT" ]; then
+    # Keep `quota` in the reason: iterate.yml uses it to mark an egress-only
+    # retry and relay a fresh run. Do NOT word it as three consecutive 429s;
+    # that is the old pause-the-loop trigger.
+    stop_run "quota 429 on the selected egress (upstream=$CUR_UP, retry_after=${retry_after}s); ending this round on the first quota 429 so the next run restarts with a fresh egress"
   fi
 }
 
@@ -189,8 +193,9 @@ current_egress_ip() {
 }
 
 # R2582 (operator rollback): direct is a supported production egress again.
-# Do NOT stop the run just because upstream=direct; the free quota is per
-# egress IP and a fresh runner IP is usually the freshest bucket.
+# Do NOT stop the run just because upstream=direct. R2620: fresh runner IPs
+# still hit the same free-quota wall, so do not assume a new IP means a new
+# bucket; a quota 429 is handled uniformly for direct and relay.
 
 # R2567 (operator priority): verify before the first turn that provider traffic
 # really leaves through the selected upstream. A relay selection that reports
@@ -275,13 +280,12 @@ handle_quota() {
     fi
   fi
 
-  # R2618 (operator: "连续3个429再结束"): a candidate that passed the real 200
-  # preflight but hits anonymous free quota is exhausted, but that single 429 is
-  # no longer an immediate stop. Do not rotate inside the run; blacklist it for
-  # at least 6h (or the provider's Retry-After, whichever is longer) and count
-  # the 429. Only the third consecutive 429 ends the round. R2565: the observed
-  # Retry-After was ~12.9-23h; honoring it avoids retrying the same IP before
-  # its bucket resets.
+  # R2620 (operator: "改为出现一个429就重启吧"): a candidate that passed the
+  # preflight but hits free quota is exhausted. Blacklist it for at least 6h (or
+  # the provider's Retry-After, whichever is longer), then record the 429; the
+  # first verified 429 ends the round and the relay starts a fresh run. R2565:
+  # the observed Retry-After was ~12.9-23h; honoring it avoids retrying the same
+  # exit before its bucket resets.
   retry_after=$(printf '%s' "$line" | sed -nE 's/.*retry_after_s=([0-9]+).*/\1/p' | head -1)
   ttl=21600
   if [ -n "$retry_after" ] && [ "$retry_after" -gt "$ttl" ] 2>/dev/null; then ttl="$retry_after"; fi
@@ -292,9 +296,9 @@ handle_quota() {
       # R2619: path mode sends no inference message, so there was no quota 200
       # to contradict. The first real turn is the quota test; this 429 is the
       # expected result on an already-exhausted exit.
-      log "path-only preflight made no quota claim; the first real turn hit quota 429 after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and counting the 429"
+      log "path-only preflight made no quota claim; the first real turn hit quota 429 after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and ending the round"
     else
-      log "selected egress answered 200 in preflight but hit quota 429 after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and counting the 429"
+      log "selected egress answered 200 in preflight but hit quota 429 after $((now - selected_at))s (upstream=$CUR_UP, selected_egress=${selected_egress:-?}, current_egress=$cur_egress, retry_after=${retry_after:-?}s, msg_at=$msg_at); blacklisting for ${ttl}s and ending the round"
     fi
     if [ "$cur_egress" != "?" ] && [ "$cur_egress" != "skipped" ] \
        && [ -n "$selected_egress" ] && [ "$cur_egress" != "$selected_egress" ]; then
@@ -307,9 +311,9 @@ handle_quota() {
     fi
   else
     log "quota 429 detected (upstream=$CUR_UP, retry_after=${retry_after:-?}s)"
-    # A quota 429 after the 120s preflight window still means this egress IP is
+    # A quota 429 after the 120s preflight window still means this exit is
     # exhausted (possibly after a long healthy run). Keep it out of future
-    # selection for the provider's reset window too; the streak decides the stop.
+    # selection for the provider's reset window too; the first 429 ends the run.
     if [ "$selected_at" -gt 0 ]; then
       blacklist_selected "quota-after-healthy-window" "$ttl" || true
     fi
@@ -355,7 +359,7 @@ while IFS= read -r line; do
       # turns accumulate to 3 and stop a healthy round (same class as R2559).
       if [ "$fail_streak" -ne 0 ] || [ "$last_fail_at" -ne 0 ] \
          || [ "$quota_streak" -ne 0 ] || [ "$quota_last_at" -ne 0 ]; then
-        log "healthy turn; reset consecutive counters (was transport=$fail_streak/$FAIL_LIMIT quota=$quota_streak/$FAIL_LIMIT)"
+        log "healthy turn; reset consecutive counters (was transport=$fail_streak/$FAIL_LIMIT quota=$quota_streak/$QUOTA_LIMIT)"
         fail_streak=0
         last_fail_at=0
         quota_streak=0

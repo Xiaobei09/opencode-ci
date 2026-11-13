@@ -23,12 +23,13 @@ EGRESS_STATE_FILE="${EGRESS_STATE_FILE:-$HOME/.config/opencode/exit-proxy.json}"
 # overwrote exit-proxy.json while the live upstream file stayed `direct`).
 # Always set EGRESS_STATE_FILE together with EGRESS_STATE_DIR in tests.
 EGRESS_USAGE="${EGRESS_USAGE:-$HOME/.config/opencode/egress-usage.json}"
-# R2565: anonymous free quota is per egress IP. Reusing the same relay across
-# runs means paying with a partially consumed bucket; the provider's 429
-# retry-after was observed at ~12.9h, longer than the 6h failure blacklist.
-# R2582: the bucket is a DAILY quota (48/48 recent 429s converge to the same
-# 00:44:19 UTC reset), so the reuse window is 24h to avoid the same bucket.
-# Successful relays are avoided for 24h; every run starts on a fresh IP.
+# R2565: free quota was believed to be per egress IP; R2620 disproved the
+# simple version (8 consecutive direct runs used 8 different IPs and still hit
+# the same wall). The provider's 429 retry-after was still observed at ~12.9h
+# and 48/48 recent 429s converged on the same 00:44:19 UTC reset, so avoiding a
+# recently used relay for 24h remains a useful precaution even though it does
+# not guarantee a fresh bucket. Successful relays are avoided for 24h without
+# assuming that a fresh runner IP is a fresh bucket.
 EGRESS_REUSE_WINDOW="${EGRESS_REUSE_WINDOW:-86400}"
 EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
 # R2567 (operator: is provider traffic really leaving through the selected

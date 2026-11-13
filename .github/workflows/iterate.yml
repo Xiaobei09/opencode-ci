@@ -14,7 +14,7 @@ on:
         required: false
         default: false
       budget_seconds:
-        description: OpenCode per-run time budget in seconds (0 = no timeout, run until it exits or hits 3 consecutive 429s; job hard cap is 360m)
+        description: OpenCode per-run time budget in seconds (0 = no timeout, run until it exits or hits a quota 429; job hard cap is 360m)
         type: string
         required: false
         default: "0"
@@ -265,11 +265,10 @@ jobs:
         id: select_egress
         # R2562：整个 run 只在这里选一次出口。
         # R2582（运营者回滚 + 根因）：**direct 必须是候选 #1，绝不能再强制 relay**。
-        # 免费模型的 429 是 FreeUsageLimitError（retryAfter≈16h），按出口 IP 计桶；
-        # 每次 runner 的 direct IP 是新鲜桶，而 proxyip 的 relay 出口是多人共享、
-        # 跨 run 复用的旧桶——强制 relay 会直接选中已耗尽桶，表现为“预检 200，
-        # 真正请求立刻 429”。失败候选仍按黑名单 6h 跳过；所有候选（含 direct）
-        # 都没有 200 时才 fail closed。
+        # 免费模型的 429 是 FreeUsageLimitError（retryAfter≈16h）。R2620 实测
+        # 连续 8 轮直连 IP 各不相同却仍在预检后 429，说明额度并不只按出口 IP
+        # 计桶（restore 的 $HOME/session 身份也可能参与）。因此 direct 仍优先，
+        # 但失败候选按黑名单 6h 跳过；所有候选（含 direct）都不可用时 fail closed。
         # R2580（D2）：restore 失败时不选出口/不跑 OpenCode，避免残缺环境
         # 被桥的 interval env-sync 写回，覆盖上一份好快照。
         if: steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
@@ -311,10 +310,10 @@ jobs:
             sel_err=$(grep -aE '^\[egress-select\] ERROR: ' "$RUNNER_TEMP/select-proxy.log" 2>/dev/null | tail -1 | sed -E 's/^\[egress-select\] ERROR: //' | cut -c1-240)
             if printf '%s' "$sel_err" | grep -q 'direct free-quota exhausted'; then
               reason="${sel_err:-direct free-quota exhausted}"
-              echo "::error::egress selection failed: $reason; ending this run so the next fresh runner IP gets a new daily bucket"
+              echo "::error::egress selection failed: $reason; ending this run so the next run can select a fresh egress"
             elif printf '%s' "$sel_err" | grep -q 'path probe'; then
               reason="${sel_err:-no candidate passed the path probe}"
-              echo "::error::egress selection failed: $reason; ending this run so the next fresh runner IP gets a new daily bucket"
+              echo "::error::egress selection failed: $reason; ending this run so the next run can select a fresh egress"
             else
               reason="no egress candidate answered 200 (select-proxy rc=$rc)"
               echo "::error::egress selection failed: neither direct nor any relay answered 200; ending this run (no unverified egress)"
@@ -536,21 +535,18 @@ jobs:
             STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
             echo "watcher_stop=true" >> "$GITHUB_OUTPUT"
             echo "watcher_reason=${STOP_REASON:-unknown}" >> "$GITHUB_OUTPUT"
-            # R2596: an egress quota stop is external (per-IP anonymous bucket),
-            # not a content/code failure. It must not count toward the 3-round
-            # pause: on 2026-11-11 three dirty runner IPs paused the loop for
-            # 11 hours until a manual dispatch. The fix is another fresh runner
-            # IP, so failure_guard relays immediately.
+            # R2596/R2620: an egress quota stop is external (free-tier usage
+            # limit), not a content/code failure. It must not count toward the
+            # content-failure pause: failure_guard treats it as an egress-only
+            # round and relays immediately. The general no-healthy-turn guard
+            # still pauses after 3 such rounds.
             if printf '%s' "$STOP_REASON" | grep -qiE 'quota|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
               echo "egress_quota_stop=true" >> "$GITHUB_OUTPUT"
             fi
-            # R2618: the watcher's own 3-429 stop, or auto-continue's
-            # 3-consecutive-errors ending on a free-limit/429, means the loop
-            # must stop instead of relaying another fresh IP.
-            if printf '%s' "$STOP_REASON" | grep -qiE 'three consecutive quota 429s|3 consecutive 429s|3 consecutive errors.*(free[- ]limit|429|quota)'; then
-              echo "quota_429_limit=true" >> "$GITHUB_OUTPUT"
-              echo "::error::3 consecutive 429s (${STOP_REASON:0:200}); the loop will stop (no successor)"
-            fi
+            # R2620 (operator: "改为出现一个429就重启吧"): a single verified
+            # quota 429 is an egress-only round and must relay immediately. Do
+            # not pause the loop here; the general 3-rounds-without-a-healthy-turn
+            # guard still applies. Do not match the watcher's old 3-429 wording.
             # R2535：watcher 是进程外停止，不能一律按失败计。auto-continue 在首个
             # 正常 assistant 回合写该标记；有 200 的轮次必须清零 streak（运营者规则：
             # 只有连续 3 轮没有任何 200 才停循环）。
@@ -574,13 +570,10 @@ jobs:
             if printf '%s' "$STOP_REASON" | grep -qiE 'quota|free[- ]limit|FreeUsageLimitError|provider\.free-limit'; then
               echo "egress_quota_stop=true" >> "$GITHUB_OUTPUT"
             fi
-            # R2618: the watcher's own 3-429 stop, or auto-continue's
-            # 3-consecutive-errors ending on a free-limit/429, means the loop
-            # must stop instead of relaying another fresh IP.
-            if printf '%s' "$STOP_REASON" | grep -qiE 'three consecutive quota 429s|3 consecutive 429s|3 consecutive errors.*(free[- ]limit|429|quota)'; then
-              echo "quota_429_limit=true" >> "$GITHUB_OUTPUT"
-              echo "::error::3 consecutive 429s (${STOP_REASON:0:200}); the loop will stop (no successor)"
-            fi
+            # R2620 (operator: "改为出现一个429就重启吧"): a single verified
+            # quota 429 is an egress-only round and must relay immediately. Do
+            # not pause the loop here; the general 3-rounds-without-a-healthy-turn
+            # guard still applies. Do not match the watcher's old 3-429 wording.
             echo "::warning::auto-continue ended this round: ${STOP_REASON} (round_success=${ROUND_SUCCESS}); relay policy decides whether to pause"
             RC=0
           fi
@@ -664,24 +657,14 @@ jobs:
           select_reason="${{ steps.select_egress.outputs.reason }}"
           restore_outcome="${{ steps.restore_ws.outcome }}"
           quota_stop="${{ steps.run_opencode.outputs.egress_quota_stop }}"
-          quota_429_limit="${{ steps.run_opencode.outputs.quota_429_limit }}"
           budget_timeout="${{ steps.run_opencode.outputs.budget_timeout }}"
           allow=false
-          # R2618 (operator: "连续3个429再结束"): this round already saw three
-          # consecutive quota 429s. Stop the whole loop now; do not dispatch a
-          # successor and do not burn more runner IPs.
-          if [ "$quota_429_limit" = "true" ]; then
-            gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-            gh variable set CI_429_STREAK --body 3 --repo "$repo" >/dev/null 2>&1 || true
-            echo "quota_429_limit=true" >> "$GITHUB_OUTPUT"
-            echo "::error::3 consecutive quota 429s in this round; CI_LOOP_PAUSED=true, no successor"
-            echo "allow_relay=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # R2596/R2617: a dirty runner IP is external, so a single egress-only
-          # failure relays immediately with a growing backoff. But the operator's
-          # restored rule still applies: 3 consecutive rounds without ANY real
-          # 200 set CI_LOOP_PAUSED=true and suppress the successor.
+          # R2620 (operator: "改为出现一个429就重启吧"): a quota 429 is an
+          # egress-only round; relay immediately instead of pausing on the old
+          # within-round 3-429 rule. The general safety valve below still pauses
+          # after 3 consecutive rounds without ANY real healthy turn.
+          # R2596/R2617: an exhausted free-tier egress is external, so a single
+          # egress-only failure relays immediately with a growing backoff.
           egress_only=false
           if [ "$quota_stop" = "true" ] && [ "$round_success" != "true" ]; then
             egress_only=true
@@ -710,11 +693,12 @@ jobs:
             case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
             next=$((cur + 1))
             gh variable set CI_EGRESS_STREAK --body "$next" --repo "$repo" >/dev/null 2>&1 || true
-            # R2618 (operator: "连续3个429再结束"): an egress-only round here is
-            # a quota 429 round. Count consecutive 429 rounds across fresh runner
-            # IPs; only the third one pauses the loop. A healthy turn resets the
-            # streak above (and is checked again so a quota after a real 200
-            # never counts).
+            # R2620 (operator: "改为出现一个429就重启吧"): every quota 429 now
+            # ends its round, so this counts consecutive 429-only rounds. Keep
+            # the general safety valve: after 3 rounds without ANY real healthy
+            # turn, pause for an operator instead of restarting forever. A
+            # healthy turn resets the streak above (and is checked again so a
+            # quota after a real 200 never counts).
             if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; then
               gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               q429=0
@@ -725,14 +709,14 @@ jobs:
               gh variable set CI_429_STREAK --body "$q429" --repo "$repo" >/dev/null 2>&1 || true
               if [ "$q429" -ge 3 ]; then
                 gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-                echo "::error::$q429 consecutive quota 429 rounds (CI_429_STREAK=$q429/3); CI_LOOP_PAUSED=true, no successor"
-                echo "quota_429_limit=true" >> "$GITHUB_OUTPUT"
+                echo "::error::$q429 consecutive quota 429 rounds without a healthy turn (CI_429_STREAK=$q429/3); CI_LOOP_PAUSED=true, no successor"
+                echo "quota_round_limit=true" >> "$GITHUB_OUTPUT"
                 echo "egress_retry=true" >> "$GITHUB_OUTPUT"
                 echo "egress_retry_count=$next" >> "$GITHUB_OUTPUT"
                 allow=false
                 return 0
               fi
-              echo "::notice::quota 429 round $q429/3 (CI_429_STREAK); will relay a fresh runner IP"
+              echo "::notice::quota 429 round $q429/3 (CI_429_STREAK); will relay a fresh run"
             fi
             # Egress quota says nothing about the content loop. Keep the content
             # failure counter clear so a later real failure still pauses after 3.
@@ -742,7 +726,7 @@ jobs:
               delay=$(( 15 << (next - 4) ))
               [ "$delay" -gt 300 ] && delay=300
             fi
-            echo "::notice::egress-only failure #$next (anonymous quota is per exit IP); relay in ${delay}s; 429 streak is tracked separately"
+            echo "::notice::egress-only failure #$next (free-tier quota is not keyed by exit IP alone); relay in ${delay}s; 429 streak is tracked separately"
             echo "egress_retry=true" >> "$GITHUB_OUTPUT"
             echo "egress_retry_count=$next" >> "$GITHUB_OUTPUT"
             echo "relay_delay=$delay" >> "$GITHUB_OUTPUT"
@@ -954,7 +938,9 @@ jobs:
             esac
           fi
           if [ "$egress_retry" = "true" ]; then
-            reason="出口配额 429（外部按 IP 的匿名桶）；未到连续 3 次，已换新 runner IP 重试（第 ${egress_n} 次）"
+            # R2620: every quota 429 ends its round. Do not claim the bucket is
+            # keyed by exit IP: fresh runner IPs still hit the same wall.
+            reason="出口配额 429（免费额度耗尽）；本轮首个 429 已结束并换新 run 重试（第 ${egress_n} 次）"
           elif [ "$restore_failed" = "true" ]; then
             reason="环境/工作区还原失败；已跳过 OpenCode 并按失败计数接力新 run（快照未被覆盖）"
           elif [ "$select_failed" = "true" ]; then
@@ -975,7 +961,7 @@ jobs:
           fi
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           [ "$egress_retry" = "true" ] && streak=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "?")
-          [ "$egress_retry" = "true" ] && streak="${streak}/3 (429)"
+          [ "$egress_retry" = "true" ] && streak="${streak}/3 (429 轮)"
           # R2587（D7）：结束通知必须带真实错误证据，而不只是 outcome。退出码
           # 与本次 Run OpenCode 抓到的最后一条错误（已去 ANSI/CR）一并附上。
           rc="${{ steps.run_opencode.outputs.exit_code }}"
@@ -1016,11 +1002,11 @@ jobs:
           select_failed="${{ steps.failure_guard.outputs.select_failed }}"
           select_reason="${{ steps.select_egress.outputs.reason }}"
           restore_failed="${{ steps.failure_guard.outputs.restore_failed }}"
-          quota_429_limit="${{ steps.failure_guard.outputs.quota_429_limit }}"
+          quota_round_limit="${{ steps.failure_guard.outputs.quota_round_limit }}"
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
-          if [ "$quota_429_limit" = "true" ]; then
+          if [ "$quota_round_limit" = "true" ]; then
             streak=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "3")
-            streak="${streak}/3 (429)"
+            streak="${streak}/3 (429 轮)"
           fi
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
           # R2587（D7）：停止卡同样带退出码与最后一条错误证据。
@@ -1050,8 +1036,8 @@ jobs:
             else
               reason="$reason；未接力"
             fi
-          elif [ "$quota_429_limit" = "true" ]; then
-            reason="连续 3 个 429（出口配额耗尽），循环已暂停，不再接力新 run"
+          elif [ "$quota_round_limit" = "true" ]; then
+            reason="连续 3 轮 429 且无健康回合（免费额度耗尽），循环已暂停，不再接力新 run"
           elif [ "$watcher" = "true" ]; then
             wr=$(tr '\n' ' ' < "$RUNNER_TEMP/egress/stop" 2>/dev/null | cut -c1-300)
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
