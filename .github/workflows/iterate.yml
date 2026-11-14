@@ -349,16 +349,17 @@ jobs:
               q429=$((q429 + 1))
               gh variable set CI_429_STREAK --body "$q429" --repo "$repo" >/dev/null 2>&1 || true
               if [ "$q429" -ge 3 ]; then
-                # R2641 (operator: "没有200的429才计算进连续3轮，并且要求所有bot
-                # 对应的会话都不是活跃（错误/停止）的时候才停"): reaching the
-                # streak is necessary but not sufficient. Only pause when EVERY
-                # registered bot session is stopped/errored; if any bot is still
-                # active, pausing would strand it, so keep the loop alive.
+                # R2641/R2642 (operator: "没有200的429才计算进连续3轮，并且要求所有bot
+                # 对应的会话都不是活跃（错误/停止）的时候才停" / "只有在输出才算
+                # 活跃，自然结束不算"): reaching the streak is necessary but not
+                # sufficient. Only pause when NO registered bot is still
+                # outputting; a naturally finished, stopped or errored bot does
+                # not block the pause, but an in-flight turn does.
                 if bash "$GITHUB_WORKSPACE/.github/scripts/bot-sessions-active.sh"; then
-                  echo "::notice::quota 429 round $q429/3 (CI_429_STREAK) but at least one bot session is still active; relaying instead of pausing"
+                  echo "::notice::quota 429 round $q429/3 (CI_429_STREAK) but at least one bot is still outputting; relaying instead of pausing"
                 else
                   gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-                  echo "::error::$q429 consecutive quota 429 rounds without a healthy turn (CI_429_STREAK=$q429/3) and all bot sessions are inactive; CI_LOOP_PAUSED=true, no successor"
+                  echo "::error::$q429 consecutive quota 429 rounds without a healthy turn (CI_429_STREAK=$q429/3) and no bot is outputting (all ended/stopped/errored); CI_LOOP_PAUSED=true, no successor"
                   echo "quota_round_limit=true" >> "$GITHUB_OUTPUT"
                   echo "egress_retry=true" >> "$GITHUB_OUTPUT"
                   echo "egress_retry_count=$next" >> "$GITHUB_OUTPUT"
