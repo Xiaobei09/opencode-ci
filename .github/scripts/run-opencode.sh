@@ -10,6 +10,15 @@ set +e
 # clip bounds TUI/stack-trace lines that would otherwise wrap.
 section() { printf '\n== %s ==\n' "$*"; }
 clip() { cut -c1-240; }
+# R2661（运营者：「检查 CI 有没有泄露消息内容/敏感信息」）：这个仓库是 **public**，
+# Actions 日志人人可见。插件 error/warn 行可能带 text=/excerpt=/prompt=（消息正文），
+# 这里在打印前统一打码；同时兜住 Telegram token / Bearer 凭据形状的意外拼接。
+redact() {
+  sed -E \
+    -e 's/(^|[[:space:]])(text|excerpt|content|prompt|userText|message)=("[^"]*"|[^[:space:]]+)/\1\2=<redacted>/g' \
+    -e 's/(^|[^0-9A-Za-z_])[0-9]{8,10}:[A-Za-z0-9_-]{30,}/\1<telegram-token>/g' \
+    -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<redacted>/g'
+}
 # R2576 (D9): stamp the OpenCode phase so the snapshot step can report
 # the real non-opencode wall time (setup + post-run) instead of only
 # the setup half. OPENCODE_START_T0 is the boundary between the two.
@@ -410,7 +419,7 @@ if [ -s /tmp/opencode/v2plugin.log ]; then
   PLUGIN_ERR=$(grep -aE '\] (error|warn): ' /tmp/opencode/v2plugin.log 2>/dev/null | tail -10)
   PLUGIN_N=$(printf '%s\n' "$PLUGIN_ERR" | grep -c . 2>/dev/null || true)
   echo "count=${PLUGIN_N:-0} (last 10)"
-  [ -n "$PLUGIN_ERR" ] && printf '%s\n' "$PLUGIN_ERR" | clip | sed 's/^/  /'
+  [ -n "$PLUGIN_ERR" ] && printf '%s\n' "$PLUGIN_ERR" | redact | clip | sed 's/^/  /'
 else
   echo "no plugin log"
 fi
@@ -436,9 +445,9 @@ if [ -s "$RUN_LOG" ]; then
   echo "total=$(wc -l < "$ERR_TXT" 2>/dev/null || echo 0)"
   if [ -s "$ERR_TXT" ]; then
     echo "top repeated:"
-    sed -E 's/\\n.*$//' "$ERR_TXT" | sort | uniq -c | sort -rn | head -10 | clip | sed 's/^/  /'
+    sed -E 's/\\n.*$//' "$ERR_TXT" | sort | uniq -c | sort -rn | head -10 | redact | clip | sed 's/^/  /'
     echo "last 5:"
-    tail -5 "$ERR_TXT" | sed -E 's/\\n.*$//; s/^.*cause="//' | clip | sed 's/^/  /'
+    tail -5 "$ERR_TXT" | sed -E 's/\\n.*$//; s/^.*cause="//' | redact | clip | sed 's/^/  /'
   fi
 else
   echo "no run log"

@@ -7,6 +7,17 @@
 set +e
 ENV_SRC="$SESSIONS_DIR/opencode"
 mkdir -p "$ENV_SRC"
+# R2661（运营者：「检查 CI 有没有泄露消息内容/敏感信息」）：env/targets/records 包里有
+# 整个 $HOME（tg.env 里的 bot token、tg-chats 队列正文）和 opencode.db（全部消息），
+# 只能发到 **私有** sessions 仓库。仓库可见性被误改时 fail closed：本轮不保存，
+# 也绝不把包传到公开 release。ENV_SNAPSHOT_ALLOW_PUBLIC=1 仅用于本地排障。
+if [ "${ENV_SNAPSHOT_ALLOW_PUBLIC:-0}" != "1" ] && [ -n "${SESSIONS_REPO:-}" ] && command -v gh >/dev/null 2>&1; then
+  _private=$(gh repo view "$SESSIONS_REPO" --json isPrivate --jq '.isPrivate' 2>/dev/null || echo "")
+  if [ "$_private" != "true" ]; then
+    echo "::error::SESSIONS_REPO=$SESSIONS_REPO is not verifiably private (isPrivate='${_private:-unknown}'); refusing to publish chat/env snapshots"
+    exit 1
+  fi
+fi
 ENV_TAG="env"
 SPLIT_SIZE="${SPLIT_SIZE:-256m}"
 if command -v python3 >/dev/null 2>&1 && [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
