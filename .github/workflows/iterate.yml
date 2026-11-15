@@ -278,12 +278,19 @@ jobs:
           # copied; no chat is replayed. Default on; set the repo variable to 0
           # to disable.
           FORK_ON_QUOTA_200: ${{ vars.FORK_ON_QUOTA_200 || '1' }}
+          # R2649: after two consecutive 429-only CI rounds, create a fresh
+          # session per bound bot, switch to it and inject
+          # "阅读（原会话id）对话历史，继续任务". The request is written by
+          # failure_guard below and handled by the bridge at the next boot.
+          # Default on; set the repo variable to 0 to disable.
+          ROLLOVER_ON_429: ${{ vars.ROLLOVER_ON_429 || '1' }}
         run: bash -e "$GITHUB_WORKSPACE/.github/scripts/run-opencode.sh"
       - name: Update failure streak and stop policy
         id: failure_guard
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true'
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
+          ROLLOVER_ON_429: ${{ vars.ROLLOVER_ON_429 || '1' }}
         run: |
           set +e
           # R2576 (D9): start of the post-opencode phase; paired with
@@ -327,6 +334,10 @@ jobs:
           if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; then
             gh variable set CI_EGRESS_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+            # R2649: quota recovered before any rollover was consumed (or the
+            # bridge never got to it). Drop pending requests so a later run
+            # cannot unexpectedly switch sessions days after the 429 streak.
+            rm -f "$HOME/.config/opencode/rollover-requests/"*.json 2>/dev/null || true
           fi
           egress_retry_policy() {
             local cur next delay q429
@@ -348,6 +359,15 @@ jobs:
               case "$q429" in ''|*[!0-9]*) q429=0 ;; esac
               q429=$((q429 + 1))
               gh variable set CI_429_STREAK --body "$q429" --repo "$repo" >/dev/null 2>&1 || true
+              # R2649 (operator): on the SECOND consecutive 429-only round, queue
+              # a durable rollover request for every bound bot session. The request
+              # survives the restart via the env snapshot; the owning bridge then
+              # creates a fresh session, switches to it and injects
+              # "阅读（原会话id）对话历史，继续任务".
+              if [ "$q429" -eq 2 ]; then
+                bash "$GITHUB_WORKSPACE/.github/scripts/write-rollover-requests.sh" "429-streak-2" \
+                  || echo "::warning::rollover request writer failed"
+              fi
               if [ "$q429" -ge 3 ]; then
                 # R2641/R2642 (operator: "没有200的429才计算进连续3轮，并且要求所有bot
                 # 对应的会话都不是活跃（错误/停止）的时候才停" / "只有在输出才算
