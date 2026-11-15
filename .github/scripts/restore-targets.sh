@@ -2,6 +2,10 @@
 # R573: extracted verbatim from iterate.yml "Restore workspace snapshots" so it can
 # run in parallel with the environment restore in a single step.
 set +e
+# R2651: the restore below does `rm -rf "$SESSIONS_DIR/state"` and can clone
+# into "$TARGETS_DIR/<name>". An unset variable would turn those into
+# root-level paths, so refuse to run without both targets.
+: "${SESSIONS_DIR:?SESSIONS_DIR must be set}" "${TARGETS_DIR:?TARGETS_DIR must be set}"
 # R2589 (D9): one wall-clock measurement for the whole targets restore so the
 # run log shows where the non-opencode budget goes.
 RT_T0=$(date +%s)
@@ -269,6 +273,9 @@ for i in $(seq 0 $((COUNT - 1))); do
   commit=$(jq -r ".snapshots[$i].commit // empty" "$INDEX")
   repo=$(jq -r ".snapshots[$i].repo // empty" "$INDEX")
   [ -n "$dir" ] || continue
+  # R2651: the name comes from index.json; a corrupt entry such as `..` would
+  # make the rm -rf below escape TARGETS_DIR.
+  case "$dir" in */*|.|..) echo "::warning::ignoring unsafe snapshot dir '$dir'"; continue ;; esac
   target_dir="$TARGETS_DIR/$dir"
   [ -e "$target_dir" ] && continue
   # R203（D6 还原链缺口）：快照 bundle 克隆失败时**退回远端**再试一次。
