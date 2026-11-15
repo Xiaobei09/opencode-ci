@@ -84,8 +84,21 @@ if [ -f "$QR_FILE" ]; then
   QR_MODE=$(jq -r '.mode // "auto"' "$QR_FILE" 2>/dev/null || echo auto)
 fi
 [ "$QR_MODE" = "off" ] || QR_MODE="auto"
+# R2656 (operator: "与额度尾恢复不同时触发（排斥），优先429换会话"):
+# A pending durable rollover request (either the automatic 429-streak-2 one or
+# the manual TG button) means the old session is about to be replaced. Resuming
+# its quota tail in the same boot would spend a free-quota message/turn right
+# before the switch, so 429 rollover wins: suppress quota-tail recovery for
+# this run and let the bridge consume the rollover request first.
+ROLLOVER_PENDING=0
+ROLLOVER_DIR="$HOME/.config/opencode/rollover-requests"
+if [ -d "$ROLLOVER_DIR" ]; then
+  ROLLOVER_PENDING=$(find "$ROLLOVER_DIR" -maxdepth 1 -name 'ses_*.json' -mmin -1440 2>/dev/null | wc -l | tr -d ' ')
+  case "$ROLLOVER_PENDING" in ''|*[!0-9]*) ROLLOVER_PENDING=0 ;; esac
+  [ "$ROLLOVER_PENDING" -gt 0 ] && ROLLOVER_PENDING=1
+fi
 QR_ENABLED=0
-if [ "$EGRESS_CHANGED" = "1" ] && [ "$QR_MODE" = "auto" ]; then
+if [ "$EGRESS_CHANGED" = "1" ] && [ "$QR_MODE" = "auto" ] && [ "$ROLLOVER_PENDING" = "0" ]; then
   case "${CI_QUOTA_TAIL_RECOVER:-1}" in
     0|false|no|off|OFF|False|No) QR_ENABLED=0 ;;
     *) QR_ENABLED=1 ;;
@@ -93,7 +106,7 @@ if [ "$EGRESS_CHANGED" = "1" ] && [ "$QR_MODE" = "auto" ]; then
 fi
 # Consumed by the Run OpenCode step (and then by the Option C plugin).
 echo "RESUME_ONCE_QUOTA_RECOVER=$QR_ENABLED" >> "$GITHUB_ENV"
-echo "R2626 quota-tail recover: prev=${PREV_UP:-none}/${PREV_EG:-?} new=${NEW_UP:-?}/${NEW_EG:-?} changed=$EGRESS_CHANGED mode=$QR_MODE enabled=$QR_ENABLED"
+echo "R2626 quota-tail recover: prev=${PREV_UP:-none}/${PREV_EG:-?} new=${NEW_UP:-?}/${NEW_EG:-?} changed=$EGRESS_CHANGED mode=$QR_MODE enabled=$QR_ENABLED rollover_pending=$ROLLOVER_PENDING"
 if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
   # R2520：与 TG 错误卡 exitProxySummary() 使用完全相同的键名/顺序：
   # kind → upstream → local → egress → direct。旧格式 `CI egress: direct direct`
@@ -107,6 +120,8 @@ if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
   # R2626: visible proof that this run may recover a pre-boot quota
   # tail once (only when the egress actually changed).
   [ "$QR_ENABLED" = "1" ] && MSG="$MSG quota-tail-recover=on"
+  # R2656: 429 rollover wins over quota-tail recovery.
+  [ "$ROLLOVER_PENDING" = "1" ] && MSG="$MSG quota-tail-recover=skipped(429-rollover)"
   curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \
     >/dev/null 2>&1 || echo "::warning::could not send the exit-proxy notice to telegram"
