@@ -391,6 +391,17 @@ if [ "${EGRESS_QUOTA_PROBE:-1}" != "0" ] \
 fi
 section "opencode result"
 echo "exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null || echo 0)"
+# R2655（运营者："放宽egress_only条件到本轮200数量小于10"）：auto-continue 把
+# 本轮真实健康 assistant 消息数（≈ 成功上游调用/200，上限 10）写到
+# round-200-count。文件不存在时**不要**输出 round_200_count：旧插件/未安装
+# 本版本的轮次必须保持旧的"有成功即清零"行为，不能因为缺省 0 被误判成 <10。
+if [ -f "$RUNNER_TEMP/round-200-count" ]; then
+  ROUND_200_COUNT=$(tr -cd '0-9' < "$RUNNER_TEMP/round-200-count" 2>/dev/null | head -c 9)
+  case "$ROUND_200_COUNT" in
+    ''|*[!0-9]*) ;;
+    *) echo "round_200_count=$ROUND_200_COUNT" >> "$GITHUB_OUTPUT" ;;
+  esac
+fi
 # R2587（D7）：插件错误只写 /tmp/opencode/v2plugin.log，run 结束随
 # runner 一起消失；旧诊断只 grep OpenCode 主日志，插件注入/桥失败在
 # Actions 日志里看不到。这里把插件 error/warn 尾部打印出来。

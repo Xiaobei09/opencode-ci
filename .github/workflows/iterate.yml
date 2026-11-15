@@ -300,6 +300,7 @@ jobs:
           R2651_SELECT_REASON: ${{ steps.select_egress.outputs.reason }}
           R2651_RESTORE_OUTCOME: ${{ steps.restore_ws.outcome }}
           R2651_QUOTA_STOP: ${{ steps.run_opencode.outputs.egress_quota_stop }}
+          R2651_ROUND_200_COUNT: ${{ steps.run_opencode.outputs.round_200_count }}
           R2651_BUDGET_TIMEOUT: ${{ steps.run_opencode.outputs.budget_timeout }}
         run: |
           set +e
@@ -316,6 +317,21 @@ jobs:
           restore_outcome="${R2651_RESTORE_OUTCOME:-}"
           quota_stop="${R2651_QUOTA_STOP:-}"
           budget_timeout="${R2651_BUDGET_TIMEOUT:-}"
+          round_200_count="${R2651_ROUND_200_COUNT:-}"
+          # R2655（运营者："放宽egress_only条件到本轮200数量小于10"）：
+          # 本轮健康 assistant 消息数（≈ 成功 200，插件上限 10）。输出缺失时
+          # 回退读临时文件；两者都没有则 round_200_count 为空 ⇒ low200=false，
+          # 保持旧行为（缺计数不能被当成 0）。
+          if [ -z "$round_200_count" ] && [ -f "$RUNNER_TEMP/round-200-count" ]; then
+            round_200_count=$(tr -cd '0-9' < "$RUNNER_TEMP/round-200-count" 2>/dev/null | head -c 9)
+          fi
+          case "$round_200_count" in
+            ''|*[!0-9]*) round_200_count="" ;;
+          esac
+          low200=false
+          if [ -n "$round_200_count" ] && [ "$round_200_count" -lt 10 ]; then
+            low200=true
+          fi
           allow=false
           # R2620 (operator: "改为出现一个429就重启吧"): a quota 429 is an
           # egress-only round; relay immediately instead of pausing on the old
@@ -324,24 +340,38 @@ jobs:
           # R2596/R2617: an exhausted free-tier egress is external, so a single
           # egress-only failure relays immediately with a growing backoff.
           egress_only=false
-          if [ "$quota_stop" = "true" ] && [ "$round_success" != "true" ]; then
-            egress_only=true
+          # R2655: egress-only is keyed on quota evidence, not on "zero 200s".
+          # A round that produced fewer than 10 healthy turns (low200) is still
+          # quota-limited and must drive the 429 streak/rollover instead of
+          # resetting it. Rounds from an older plugin have no count file, so
+          # low200 stays false and the previous behavior is preserved.
+          quota_evidence=false
+          if [ "$quota_stop" = "true" ]; then
+            quota_evidence=true
           fi
           if [ "$select_outcome" = "failure" ] \
              && printf '%s' "$select_reason" | grep -qiE 'free-quota|quota exhausted|FreeUsageLimit'; then
-            egress_only=true
+            quota_evidence=true
           fi
           # Safety net: OpenCode can exit 0 after a quota 429 without the watcher
           # writing a stop marker. Treat the run as an egress-only retry too;
           # the no-200 streak still counts it and pauses after 3.
-          if [ "$egress_only" != "true" ] && [ "$round_success" != "true" ] \
-             && [ -s "$RUNNER_TEMP/opencode-errors.txt" ] \
+          if [ -s "$RUNNER_TEMP/opencode-errors.txt" ] \
              && grep -qiE 'FreeUsageLimit|free usage limit|provider\.free-limit' "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null; then
+            quota_evidence=true
+          fi
+          if [ "$quota_evidence" = "true" ] \
+             && { [ "$round_success" != "true" ] || [ "$low200" = "true" ]; }; then
             egress_only=true
           fi
+          if [ "$egress_only" = "true" ] && [ "$low200" = "true" ]; then
+            echo "::notice::quota round produced only ${round_200_count} healthy turn(s) (<10); applying egress-only retry/rollover policy"
+          fi
           # A healthy turn proves the egress works; clear the egress retry and
-          # consecutive-429 streaks.
-          if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; then
+          # consecutive-429 streaks. R2655: a low-200 quota round is NOT healthy,
+          # even if it had a few 200s before the quota ran out.
+          if [ "$egress_only" != "true" ] \
+             && { [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; }; then
             gh variable set CI_EGRESS_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             # R2649: quota recovered before any rollover was consumed (or the
@@ -361,7 +391,11 @@ jobs:
             # turn, pause for an operator instead of restarting forever. A
             # healthy turn resets the streak above (and is checked again so a
             # quota after a real 200 never counts).
-            if [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; then
+            # R2655: a low-200 quota round must increment the streak even though
+            # `round-had-success` exists. Only a genuinely healthy round (>=10
+            # 200s, or no count available from an older plugin) resets it.
+            if [ "$low200" != "true" ] \
+               && { [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; }; then
               gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               q429=0
             else
