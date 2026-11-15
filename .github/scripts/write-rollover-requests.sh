@@ -43,6 +43,13 @@ RUN="${GITHUB_RUN_ID:-}"
 SIDS=$(
   for st in "$CFG"/tg-chats.json "$CFG"/tg-chats-*.json; do
     [ -f "$st" ] || continue
+    # R2650: the per-Bot toggle lives in that Bot's state file (missing = on).
+    # A Bot turned off via the TG menu must not get a switch request at all.
+    # NB: do NOT use jq's `//` here — `false // true` is true in jq.
+    if [ "$(jq -r '.rollover429' "$st" 2>/dev/null || true)" = "false" ]; then
+      echo "rollover: skip $(basename "$st") (rollover429=false)" >&2
+      continue
+    fi
     sid=$(jq -r '.front // empty' "$st" 2>/dev/null || true)
     case "$sid" in ses_*) ;; *) sid=$(jq -r '.pinned // empty' "$st" 2>/dev/null || true) ;; esac
     case "$sid" in ses_*) printf '%s\n' "$sid" ;; esac
