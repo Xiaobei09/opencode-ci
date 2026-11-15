@@ -52,7 +52,17 @@ SIDS=$(
     fi
     sid=$(jq -r '.front // empty' "$st" 2>/dev/null || true)
     case "$sid" in ses_*) ;; *) sid=$(jq -r '.pinned // empty' "$st" 2>/dev/null || true) ;; esac
-    case "$sid" in ses_*) printf '%s\n' "$sid" ;; esac
+    # R2651: only the exact session-id shape may become a filename. A corrupt
+    # or forged `front` containing `/` or `..` would otherwise make the write
+    # land outside the request directory.
+    case "$sid" in
+      ses_*) ;;
+      *) continue ;;
+    esac
+    case "$sid" in
+      *[!A-Za-z0-9_-]*) echo "rollover: skip unsafe session id $(printf '%s' "$sid" | cut -c1-40)" >&2 ;;
+      *) printf '%s\n' "$sid" ;;
+    esac
   done | awk 'NF && !seen[$0]++'
 )
 if [ -z "$SIDS" ]; then

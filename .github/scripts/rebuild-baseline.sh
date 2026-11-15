@@ -5,10 +5,28 @@
 # log show only real output. Behavior is unchanged: the step invokes
 # `bash -e <file>`, matching the previous default shell.
 set +e
-cd "$SESSIONS_DIR"
-git checkout --detach HEAD >/dev/null 2>&1 || true
+
+# R2651: this script deletes most of the working tree and force-pushes `main`.
+# It runs under `if: always()`, so it is reached even when the sessions clone
+# failed. Without the guards below, a failed `cd` would make every `rm -rf`
+# and `git push --force` operate on the *CI* checkout instead - destroying or
+# force-pushing the wrong repository. Refuse to touch anything unless the
+# target is provably the sessions repo.
+die() { echo "::error::rebuild-baseline: $*" >&2; exit 1; }
+[ -n "${SESSIONS_DIR:-}" ] || die "SESSIONS_DIR is empty; refusing destructive reset"
+case "$SESSIONS_DIR" in /*) ;; *) die "SESSIONS_DIR is not absolute: $SESSIONS_DIR" ;; esac
+[ -d "$SESSIONS_DIR/.git" ] || die "no git checkout at $SESSIONS_DIR (clone failed?); refusing destructive reset"
+cd "$SESSIONS_DIR" || die "cannot cd to $SESSIONS_DIR"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$SESSIONS_DIR is not a git work tree"
+origin_url=$(git remote get-url origin 2>/dev/null || true)
+case "$origin_url" in
+  *opencode-sessions*) ;;
+  *) die "origin is '$origin_url', not the sessions repo; refusing destructive reset" ;;
+esac
+git checkout --detach HEAD >/dev/null 2>&1 || die "cannot detach HEAD"
 git branch -D baseline-reset >/dev/null 2>&1 || true
-git checkout --orphan baseline-reset >/dev/null 2>&1
+git checkout --orphan baseline-reset >/dev/null 2>&1 || die "cannot create orphan baseline branch"
+[ "$(git symbolic-ref --short HEAD 2>/dev/null || true)" = "baseline-reset" ] || die "orphan checkout did not stick"
 rm -rf opencode/data
 mkdir -p opencode/data
 touch opencode/data/.gitkeep
@@ -54,20 +72,29 @@ git -c user.name="opencode-ci" -c user.email="opencode-ci@users.noreply.github.c
   commit -q -m "baseline: clean initial state ($(date -u +%Y-%m-%dT%H:%M:%SZ))" \
   || echo "::warning::nothing to commit"
 git branch -M baseline-reset main
+pushed=0
 for attempt in 1 2 3 4 5; do
   if git push --force origin main; then
     echo "baseline pushed (single commit)"
+    pushed=1
     break
   fi
   echo "::warning::baseline push attempt $attempt failed; retrying"
   sleep 4
 done
-git tag -f baseline >/dev/null 2>&1
+# R2651: a failed push means the repository still holds the old baseline.
+# Reporting success would leave the operator believing the reset took effect.
+[ "$pushed" = "1" ] || die "git push --force origin main failed after 5 attempts"
+git tag -f baseline >/dev/null 2>&1 || echo "::warning::could not move the local baseline tag"
+tag_pushed=0
 for attempt in 1 2 3 4 5; do
   if git push --force origin refs/tags/baseline; then
     echo "baseline tag pushed"
+    tag_pushed=1
     break
   fi
   echo "::warning::baseline tag push attempt $attempt failed; retrying"
   sleep 4
 done
+[ "$tag_pushed" = "1" ] || die "git push --force origin refs/tags/baseline failed after 5 attempts"
+exit 0

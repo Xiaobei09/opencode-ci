@@ -291,21 +291,31 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
           ROLLOVER_ON_429: ${{ vars.ROLLOVER_ON_429 || '1' }}
+          R2651_REPO: ${{ github.repository }}
+          R2651_RUN_OUTCOME: ${{ steps.run_opencode.outcome }}
+          R2651_WATCHER_STOP: ${{ steps.run_opencode.outputs.watcher_stop }}
+          R2651_ROUND_SUCCESS: ${{ steps.run_opencode.outputs.round_success }}
+          R2651_SOFT_SUCCESS: ${{ steps.run_opencode.outputs.soft_success }}
+          R2651_SELECT_OUTCOME: ${{ steps.select_egress.outcome }}
+          R2651_SELECT_REASON: ${{ steps.select_egress.outputs.reason }}
+          R2651_RESTORE_OUTCOME: ${{ steps.restore_ws.outcome }}
+          R2651_QUOTA_STOP: ${{ steps.run_opencode.outputs.egress_quota_stop }}
+          R2651_BUDGET_TIMEOUT: ${{ steps.run_opencode.outputs.budget_timeout }}
         run: |
           set +e
           # R2576 (D9): start of the post-opencode phase; paired with
           # OPENCODE_START_T0 to report the non-opencode wall time at run end.
           echo "POST_OPENCODE_T0=$(date +%s)" >> "$GITHUB_ENV"
-          repo="${{ github.repository }}"
-          outcome="${{ steps.run_opencode.outcome }}"
-          watcher_stop="${{ steps.run_opencode.outputs.watcher_stop }}"
-          round_success="${{ steps.run_opencode.outputs.round_success }}"
-          soft_success="${{ steps.run_opencode.outputs.soft_success }}"
-          select_outcome="${{ steps.select_egress.outcome }}"
-          select_reason="${{ steps.select_egress.outputs.reason }}"
-          restore_outcome="${{ steps.restore_ws.outcome }}"
-          quota_stop="${{ steps.run_opencode.outputs.egress_quota_stop }}"
-          budget_timeout="${{ steps.run_opencode.outputs.budget_timeout }}"
+          repo="${R2651_REPO:-}"
+          outcome="${R2651_RUN_OUTCOME:-}"
+          watcher_stop="${R2651_WATCHER_STOP:-}"
+          round_success="${R2651_ROUND_SUCCESS:-}"
+          soft_success="${R2651_SOFT_SUCCESS:-}"
+          select_outcome="${R2651_SELECT_OUTCOME:-}"
+          select_reason="${R2651_SELECT_REASON:-}"
+          restore_outcome="${R2651_RESTORE_OUTCOME:-}"
+          quota_stop="${R2651_QUOTA_STOP:-}"
+          budget_timeout="${R2651_BUDGET_TIMEOUT:-}"
           allow=false
           # R2620 (operator: "改为出现一个429就重启吧"): a quota 429 is an
           # egress-only round; relay immediately instead of pausing on the old
@@ -534,17 +544,21 @@ jobs:
         # R2517: still re-read the LIVE pause variable before dispatching — an
         # operator stop issued while this run was in flight must win over relay.
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.failure_guard.outputs.allow_relay == 'true'
+        env:
+          R2651_REPO: ${{ github.repository }}
+          R2651_RUN_OUTCOME: ${{ steps.run_opencode.outcome }}
+          R2651_RELAY_DELAY: ${{ steps.failure_guard.outputs.relay_delay }}
         run: |
           set +e
-          repo="${{ github.repository }}"
+          repo="${R2651_REPO:-}"
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "")
           if [ "$paused" = "true" ]; then
             echo "relayed=false" >> "$GITHUB_OUTPUT"
             echo "::notice::CI_LOOP_PAUSED=true (live); operator stopped the loop, suppressing relay"
             exit 0
           fi
-          echo "Relaying next run (run_opencode outcome=${{ steps.run_opencode.outcome }})."
-          relay_delay="${{ steps.failure_guard.outputs.relay_delay }}"
+          echo "Relaying next run (run_opencode outcome=${R2651_RUN_OUTCOME})."
+          relay_delay="${R2651_RELAY_DELAY:-}"
           if [ -n "$relay_delay" ] && [ "$relay_delay" -gt 0 ] 2>/dev/null; then
             echo "egress retry backoff: sleeping ${relay_delay}s before dispatching a fresh runner"
             sleep "$relay_delay"
@@ -584,19 +598,32 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+          R2651_REPO: ${{ github.repository }}
+          R2651_RUN_OUTCOME: ${{ steps.run_opencode.outcome }}
+          R2651_WATCHER_STOP: ${{ steps.run_opencode.outputs.watcher_stop }}
+          R2651_WATCHER_REASON: ${{ steps.run_opencode.outputs.watcher_reason }}
+          R2651_SILENT_EXIT: ${{ steps.failure_guard.outputs.silent_exit }}
+          R2651_HEALTHY_FAILURE: ${{ steps.failure_guard.outputs.healthy_failure }}
+          R2651_SELECT_FAILED: ${{ steps.failure_guard.outputs.select_failed }}
+          R2651_SELECT_REASON: ${{ steps.select_egress.outputs.reason }}
+          R2651_RESTORE_FAILED: ${{ steps.failure_guard.outputs.restore_failed }}
+          R2651_EGRESS_RETRY: ${{ steps.failure_guard.outputs.egress_retry }}
+          R2651_EGRESS_N: ${{ steps.failure_guard.outputs.egress_retry_count }}
+          R2651_EXIT_CODE: ${{ steps.run_opencode.outputs.exit_code }}
+          R2651_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
-          repo="${{ github.repository }}"
-          outcome="${{ steps.run_opencode.outcome }}"
-          watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
-          reason="${{ steps.run_opencode.outputs.watcher_reason }}"
-          silent_exit="${{ steps.failure_guard.outputs.silent_exit }}"
-          healthy_failure="${{ steps.failure_guard.outputs.healthy_failure }}"
-          select_failed="${{ steps.failure_guard.outputs.select_failed }}"
-          select_reason="${{ steps.select_egress.outputs.reason }}"
-          restore_failed="${{ steps.failure_guard.outputs.restore_failed }}"
-          egress_retry="${{ steps.failure_guard.outputs.egress_retry }}"
-          egress_n="${{ steps.failure_guard.outputs.egress_retry_count }}"
+          repo="${R2651_REPO:-}"
+          outcome="${R2651_RUN_OUTCOME:-}"
+          watcher="${R2651_WATCHER_STOP:-}"
+          reason="${R2651_WATCHER_REASON:-}"
+          silent_exit="${R2651_SILENT_EXIT:-}"
+          healthy_failure="${R2651_HEALTHY_FAILURE:-}"
+          select_failed="${R2651_SELECT_FAILED:-}"
+          select_reason="${R2651_SELECT_REASON:-}"
+          restore_failed="${R2651_RESTORE_FAILED:-}"
+          egress_retry="${R2651_EGRESS_RETRY:-}"
+          egress_n="${R2651_EGRESS_N:-}"
           # R2622: surface the provider reset window in the TG notice. The
           # watcher / gateway preflight stop reason carries retry_after=N;
           # auto-continue errors carry retry_after_s=N. Convert either to an
@@ -648,7 +675,7 @@ jobs:
           [ "$egress_retry" = "true" ] && streak="${streak}/3 (429 轮)"
           # R2587（D7）：结束通知必须带真实错误证据，而不只是 outcome。退出码
           # 与本次 Run OpenCode 抓到的最后一条错误（已去 ANSI/CR）一并附上。
-          rc="${{ steps.run_opencode.outputs.exit_code }}"
+          rc="${R2651_EXIT_CODE:-}"
           err_line=""
           if [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
             # R2630: prefer a structured provider/OpenCode error over a bare
@@ -662,7 +689,7 @@ jobs:
           fi
           detail="opencode：${outcome}"
           [ -n "$rc" ] && detail="$detail（exit=$rc）"
-          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\n%s；streak：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$detail" "$streak")
+          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\n%s；streak：%s' "$reason" "${R2651_RUN_URL}" "$detail" "$streak")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
@@ -706,16 +733,26 @@ jobs:
           GH_TOKEN: ${{ secrets.CROSS_PAT }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+          R2651_REPO: ${{ github.repository }}
+          R2651_RUN_OUTCOME: ${{ steps.run_opencode.outcome }}
+          R2651_RELAY_OUTCOME: ${{ steps.relay.outcome }}
+          R2651_WATCHER_STOP: ${{ steps.run_opencode.outputs.watcher_stop }}
+          R2651_SELECT_FAILED: ${{ steps.failure_guard.outputs.select_failed }}
+          R2651_SELECT_REASON: ${{ steps.select_egress.outputs.reason }}
+          R2651_RESTORE_FAILED: ${{ steps.failure_guard.outputs.restore_failed }}
+          R2651_QUOTA_ROUND_LIMIT: ${{ steps.failure_guard.outputs.quota_round_limit }}
+          R2651_EXIT_CODE: ${{ steps.run_opencode.outputs.exit_code }}
+          R2651_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
-          repo="${{ github.repository }}"
-          outcome="${{ steps.run_opencode.outcome }}"
-          relay_out="${{ steps.relay.outcome }}"
-          watcher="${{ steps.run_opencode.outputs.watcher_stop }}"
-          select_failed="${{ steps.failure_guard.outputs.select_failed }}"
-          select_reason="${{ steps.select_egress.outputs.reason }}"
-          restore_failed="${{ steps.failure_guard.outputs.restore_failed }}"
-          quota_round_limit="${{ steps.failure_guard.outputs.quota_round_limit }}"
+          repo="${R2651_REPO:-}"
+          outcome="${R2651_RUN_OUTCOME:-}"
+          relay_out="${R2651_RELAY_OUTCOME:-}"
+          watcher="${R2651_WATCHER_STOP:-}"
+          select_failed="${R2651_SELECT_FAILED:-}"
+          select_reason="${R2651_SELECT_REASON:-}"
+          restore_failed="${R2651_RESTORE_FAILED:-}"
+          quota_round_limit="${R2651_QUOTA_ROUND_LIMIT:-}"
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           if [ "$quota_round_limit" = "true" ]; then
             streak=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "3")
@@ -723,7 +760,7 @@ jobs:
           fi
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
           # R2587（D7）：停止卡同样带退出码与最后一条错误证据。
-          rc="${{ steps.run_opencode.outputs.exit_code }}"
+          rc="${R2651_EXIT_CODE:-}"
           err_line=""
           if [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
             # R2630: prefer a structured provider/OpenCode error over a bare
@@ -774,7 +811,7 @@ jobs:
           elif [ "$paused" = "true" ]; then
             reason="循环已暂停（运营者停止或失败阈值），relay 已让路"
           fi
-          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s；relay：%s；streak：%s；pause：%s' "$reason" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "$detail" "$relay_out" "$streak" "$paused")
+          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s；relay：%s；streak：%s；pause：%s' "$reason" "${R2651_RUN_URL}" "$detail" "$relay_out" "$streak" "$paused")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
