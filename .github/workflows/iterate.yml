@@ -378,9 +378,14 @@ jobs:
             # bridge never got to it). Drop pending requests so a later run
             # cannot unexpectedly switch sessions days after the 429 streak.
             rm -f "$HOME/.config/opencode/rollover-requests/"*.json 2>/dev/null || true
+            # R2675: a healthy turn ends the quota sequence. Drop the durable
+            # per-session 429 evidence/counters so an old 429 can never trigger
+            # a switch in a later run.
+            rm -f "$HOME/.config/opencode/quota-429-evidence.json" \
+                  "$HOME/.config/opencode/quota-429-streaks.json" 2>/dev/null || true
           fi
           egress_retry_policy() {
-            local cur next delay q429
+            local cur next delay q429 rollover_out rollover_triggered
             cur=$(gh variable get CI_EGRESS_STREAK --repo "$repo" 2>/dev/null || echo 0)
             case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
             next=$((cur + 1))
@@ -399,31 +404,44 @@ jobs:
               gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               q429=0
             else
+              # R2675 (operator: "没有429的会话不需要换会话，多条会话同时429连续
+              # 两轮时只换先429（时间戳）的那个，并且计数重置为1"): maintain the
+              # per-session counters on EVERY quota round (the first round must
+              # record streak=1 so the second can trigger). The writer reads
+              # auto-continue's durable evidence (full session ids) and writes at
+              # most ONE request: the earliest first-429 session with streak>=2.
+              # Sessions with no 429 evidence in this run are never requested.
+              rollover_out=$(bash "$GITHUB_WORKSPACE/.github/scripts/write-rollover-requests.sh" "quota-round" 2>&1 || true)
+              [ -n "$rollover_out" ] && printf '%s\n' "$rollover_out"
+              rollover_triggered=false
+              printf '%s\n' "$rollover_out" | grep -qx 'rollover_triggered=1' && rollover_triggered=true
               q429=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo 0)
               case "$q429" in ''|*[!0-9]*) q429=0 ;; esac
               q429=$((q429 + 1))
-              gh variable set CI_429_STREAK --body "$q429" --repo "$repo" >/dev/null 2>&1 || true
-              # R2649 (operator): on the SECOND consecutive 429-only round, queue
-              # a durable rollover request for every bound bot session. The request
-              # survives the restart via the env snapshot; the owning bridge then
-              # creates a fresh session, switches to it and injects
-              # "阅读（原会话id）对话历史，继续任务".
-              if [ "$q429" -eq 2 ]; then
-                bash "$GITHUB_WORKSPACE/.github/scripts/write-rollover-requests.sh" "429-streak-2" \
-                  || echo "::warning::rollover request writer failed"
+              if [ "$rollover_triggered" = "true" ]; then
+                # Operator: after switching one session reset the counter to 1
+                # (not 0), so the remaining 429 sessions switch on later rounds
+                # instead of all at once.
+                q429=1
               fi
-              if [ "$q429" -ge 3 ]; then
-                # R2641/R2642 (operator: "没有200的429才计算进连续3轮，并且要求所有bot
-                # 对应的会话都不是活跃（错误/停止）的时候才停" / "只有在输出才算
-                # 活跃，自然结束不算"): reaching the streak is necessary but not
-                # sufficient. Only pause when NO registered bot is still
-                # outputting; a naturally finished, stopped or errored bot does
-                # not block the pause, but an in-flight turn does.
+              gh variable set CI_429_STREAK --body "$q429" --repo "$repo" >/dev/null 2>&1 || true
+              if [ "$rollover_triggered" = "true" ]; then
+                echo "::notice::429 rollover queued for the earliest-429 session; CI_429_STREAK reset to 1"
+              fi
+              # R2641/R2642 (operator: "没有200的429才计算进连续3轮，并且要求所有bot
+              # 对应的会话都不是活跃（错误/停止）的时候才停" / "只有在输出才算
+              # 活跃，自然结束不算"): reaching the streak is necessary but not
+              # sufficient. Only pause when NO registered bot is still
+              # outputting; a naturally finished, stopped or errored bot does
+              # not block the pause, but an in-flight turn does.
+              # R2675: the valve keys on CI_EGRESS_STREAK (`next`), because the
+              # 429 counter is reset to 1 on every switch and may never reach 3.
+              if [ "$next" -ge 3 ]; then
                 if bash "$GITHUB_WORKSPACE/.github/scripts/bot-sessions-active.sh"; then
-                  echo "::notice::quota 429 round $q429/3 (CI_429_STREAK) but at least one bot is still outputting; relaying instead of pausing"
+                  echo "::notice::quota 429 round $q429 (CI_429_STREAK, egress-only #$next) but at least one bot is still outputting; relaying instead of pausing"
                 else
                   gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-                  echo "::error::$q429 consecutive quota 429 rounds without a healthy turn (CI_429_STREAK=$q429/3) and no bot is outputting (all ended/stopped/errored); CI_LOOP_PAUSED=true, no successor"
+                  echo "::error::$next consecutive egress-only rounds without a healthy turn (CI_EGRESS_STREAK=$next/3) and no bot is outputting (all ended/stopped/errored); CI_LOOP_PAUSED=true, no successor"
                   echo "quota_round_limit=true" >> "$GITHUB_OUTPUT"
                   echo "egress_retry=true" >> "$GITHUB_OUTPUT"
                   echo "egress_retry_count=$next" >> "$GITHUB_OUTPUT"
@@ -431,7 +449,7 @@ jobs:
                   return 0
                 fi
               fi
-              echo "::notice::quota 429 round $q429/3 (CI_429_STREAK); will relay a fresh run"
+              echo "::notice::quota 429 round $q429 (CI_429_STREAK), egress-only round $next/3; will relay a fresh run"
             fi
             # Egress quota says nothing about the content loop. Keep the content
             # failure counter clear so a later real failure still pauses after 3.
