@@ -50,6 +50,19 @@ FAIL_LIMIT=3
 # keeps the round alive (see quota_probe_keeps_round).
 QUOTA_LIMIT=1
 FAIL_DEDUPE_SECONDS=20
+# R2684 (operator: "改成消息全部推送完本轮再结束"): the bot plugins live inside
+# the OpenCode process. Killing it immediately can drop cards that are already
+# queued or in flight (e.g. the provider.free-limit error card). Keep the
+# process alive for a bounded drain window instead:
+#   ① always wait STOP_DRAIN_MIN seconds so in-flight sends can finish;
+#   ② then poll the persisted outbound queues (`queue` in tg-chats*.json) and
+#      stop as soon as they are empty;
+#   ③ never exceed STOP_DRAIN_MAX seconds (Telegram 429 can keep a queue busy
+#      for a long time; the next round must still start).
+# Set EGRESS_STOP_DRAIN_SECONDS=0 to disable the wait (tests / manual stops).
+STOP_DRAIN_MAX="${EGRESS_STOP_DRAIN_SECONDS:-60}"
+STOP_DRAIN_MIN="${EGRESS_STOP_DRAIN_MIN_SECONDS:-10}"
+STOP_DRAIN_POLL="${EGRESS_STOP_DRAIN_POLL_SECONDS:-2}"
 
 fail_streak=0
 last_fail_at=0
@@ -118,10 +131,51 @@ while [ ! -f "$LOG" ]; do sleep 1; done
 # of a missing file during the first second.
 [ -f "$PROXY_LOG" ] || : > "$PROXY_LOG"
 
+# R2684: total outbound items still persisted by the Telegram bridges.
+# `queue` is the bridge's outQueue (failed/deferred sends); thinking/tool cards
+# that were delivered immediately are not queued and need no wait. A malformed
+# or missing state file counts as zero so an old/broken bot cannot pin the
+# watcher until the timeout.
+bridge_outbound_pending() {
+  local f n total=0
+  for f in "$HOME"/.config/opencode/tg-chats*.json; do
+    [ -f "$f" ] || continue
+    n=$(jq -r '((.queue // []) | length)' "$f" 2>/dev/null || echo 0)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    total=$((total + n))
+  done
+  printf '%s' "$total"
+}
+
+# R2684: wait for the bridges to push what is already queued before killing
+# the process. The stop marker is written first so a stop-aware bridge can
+# flush immediately; older bridges still flush on their normal poll/timer.
+drain_before_stop() {
+  [ "${STOP_DRAIN_MAX:-0}" -gt 0 ] 2>/dev/null || return 0
+  local start now elapsed pending
+  start=$(egress_now)
+  log "stop drain: waiting up to ${STOP_DRAIN_MAX}s (min ${STOP_DRAIN_MIN}s) for outbound messages"
+  while :; do
+    now=$(egress_now)
+    elapsed=$((now - start))
+    pending=$(bridge_outbound_pending)
+    if [ "$elapsed" -ge "$STOP_DRAIN_MIN" ] && [ "$pending" -eq 0 ]; then
+      log "stop drain: outbound queues empty after ${elapsed}s; stopping round"
+      return 0
+    fi
+    if [ "$elapsed" -ge "$STOP_DRAIN_MAX" ]; then
+      log "stop drain: timeout after ${elapsed}s (pending outbound=${pending}); stopping round"
+      return 0
+    fi
+    sleep "${STOP_DRAIN_POLL:-2}"
+  done
+}
+
 stop_run() {
   local why="${1:-three consecutive egress failures}"
   log "STOP: $why"
   printf '%s\n' "$why" > "$STOP_FILE"
+  drain_before_stop
   # Kill the long-lived interactive OpenCode process, not zengate's private
   # `opencode serve` backend (which has no --standalone flag).
   pkill -TERM -f 'opencode --standalone' 2>/dev/null || true
