@@ -189,16 +189,14 @@ resume_front_of() {
   sid=$(jq -r '.pinned // empty' "$st" 2>/dev/null || true)
   case "$sid" in ses_*) printf '%s' "$sid" ;; esac
 }
-# R2649: a session with a pending 429 rollover request must NOT also receive an
-# Option C resume prompt. The bridge is about to create a fresh session and
-# continue the task there; resuming the old one first would spend a turn (and a
-# free-quota message) right before the switch.
-rollover_pending_for() {
-  local sid="$1"
-  local dir="${ROLLOVER_REQUEST_DIR:-${HOME:-}/.config/opencode/rollover-requests}"
-  [ -n "$sid" ] || return 1
-  [ -f "$dir/$sid.json" ]
-}
+# R2649/R2665: a session with an **actionable** 429 rollover request must NOT
+# also receive an Option C resume prompt. The bridge is about to create a fresh
+# session and continue the task there; resuming the old one first would spend a
+# turn (and a free-quota message) right before the switch.
+# A request that is merely waiting (loop stopped / session halted / Bot offline)
+# is not actionable: the bridge keeps it, so suppressing Option C would deadlock
+# both mechanisms. rollover-pending.sh implements the same gate as the bridge.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rollover-pending.sh"
 RESUME_ONCE_LIST=""
 if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_SID" ] && ! rollover_pending_for "$RESUME_SID"; then
   RESUME_ONCE_LIST="$RESUME_SID"
@@ -212,6 +210,12 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
     _first_bot=1
     while IFS= read -r _botid; do
       [ -n "$_botid" ] || continue
+      # R2665: an offline Bot (token rejected / duplicate of another Bot) has
+      # no process to answer a resume prompt. Arming it only spends quota.
+      if bot_is_offline "$_botid"; then
+        echo "option C resume-once skipped for $_botid (offline: invalid/duplicate token)"
+        continue
+      fi
       # Same convention as auto-continue.resolveExtraTargetPaths:
       # the first registry entry owns tg-chats.json, the rest own
       # tg-chats-<id>.json.
@@ -226,7 +230,7 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
       elif [ -n "$_sid" ]; then
-        echo "option C resume-once skipped for $_sid (pending 429 rollover)"
+        echo "option C resume-once skipped for $_sid (actionable 429 rollover)"
       fi
     done < <(jq -r '.bots[]?.id // empty' "$_bots_json" 2>/dev/null || true)
   else
@@ -234,6 +238,9 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
     # state file. Globbing tg-chats*.json also covers the primary.
     for _state in "$HOME"/.config/opencode/tg-chats.json "$HOME"/.config/opencode/tg-chats-*.json; do
       [ -f "$_state" ] || continue
+      _bid=$(basename "$_state" .json)
+      if [ "$_bid" = "tg-chats" ]; then _bid=primary; else _bid=${_bid#tg-chats-}; fi
+      bot_is_offline "$_bid" && continue
       _sid=$(resume_front_of "$_state")
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
@@ -243,11 +250,16 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
   # Deduplicate (bots may share a front), preserving first-seen order.
   RESUME_ONCE_SIDS=$(printf '%s\n' "$RESUME_ONCE_LIST" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
 fi
-# R2649: make the pending rollover visible in the boot log. The bridge consumes
-# these within its first polling tick and reports the old/new IDs itself.
+# R2649/R2665: make the pending rollover visible in the boot log. Only
+# actionable requests are consumed this run; waiting ones are kept by the bridge
+# for a later /loop start and must not suppress quota-tail recovery.
 if [ -d "$HOME/.config/opencode/rollover-requests" ]; then
   _ro_n=$(find "$HOME/.config/opencode/rollover-requests" -maxdepth 1 -name 'ses_*.json' 2>/dev/null | wc -l)
-  [ "${_ro_n:-0}" -gt 0 ] && echo "429 rollover requests pending: $_ro_n (the bridge will create and switch sessions)"
+  _ro_a=0
+  while IFS= read -r _rf; do
+    rollover_request_actionable "$_rf" && _ro_a=$((_ro_a + 1))
+  done < <(find "$HOME/.config/opencode/rollover-requests" -maxdepth 1 -name 'ses_*.json' 2>/dev/null)
+  [ "${_ro_n:-0}" -gt 0 ] && echo "429 rollover requests pending: $_ro_n ($_ro_a actionable; waiting/orphan requests do not block quota-tail recovery)"
 fi
 if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_ONCE_SIDS" ]; then
   export RESUME_ONCE_SIDS
