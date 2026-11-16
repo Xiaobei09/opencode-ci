@@ -20,7 +20,7 @@ ENV_TAG="env"
 # ROUND 44（防数据丢失，关键）：旧版「先删光资产、再上传」的写侧一旦被取消切在中间，
 # 就会留下「新卷 + 旧 meta.json」的**撕裂包**；此时旧读侧只告警然后 bootstrap **空环境**
 # ⇒ 会话库/桥聊天整体丢失（实测：run 39097256929 被取消 → run 39103651786 读到撕裂包 →
-# 空 DB → 会话 ses_eb626522 消失）。现在：主包 'env' 不可用 ⇒ 改从**保险 tag** 'env-safe'
+# 空 DB → 会话 ses_<redacted> 消失）。现在：主包 'env' 不可用 ⇒ 改从**保险 tag** 'env-safe'
 # 还原；两者都不可用才 bootstrap。env-safe 由运营者的 env-backup.sh 维护为「最近一次完好代」。
 FALLBACK_TAG="${SESSIONS_FALLBACK_TAG:-env-safe}"
 env_try() {
@@ -314,7 +314,7 @@ fi
 #    ROUND 48（真缺陷修复）：跳过表原只列了 5 个文件，其余运行态文件仍被无条件
 #    从仓库覆盖到运行态 ⇒ 每轮启动都会用**仓库里那份陈旧状态**盖掉刚从 release
 #    还原的**实时状态**（实测：loop-sessions 被盖回 3 会话、漏掉已还原的
-#    ses_eb24bf12；inject-card 被盖回旧 session/旧计数；loop-guard 每次被盖回
+#    ses_<redacted>；inject-card 被盖回旧 session/旧计数；loop-guard 每次被盖回
 #    problem:true）。把这些运行态文件一并纳入跳过表，改为「缺失才播种」（见下）。
 if [ -d "$ENV_SRC/config" ]; then
   mkdir -p "$HOME/.config/opencode"

@@ -181,7 +181,7 @@ else
   fi
 fi
 # Option C (resume-once-v2 plugin): arm one post-restart continuation
-# per interrupted session. R2624 (operator: "ses_e2d48872怎么没有跨ci接力"):
+# per interrupted session. R2624 (operator: "ses_<redacted>怎么没有跨ci接力"):
 # the old block armed only RESUME_SID (the single session this run
 # opens), so another bot's interrupted turn was never even evaluated.
 # Arm every registered bot's persisted front/pinned target; the plugin
