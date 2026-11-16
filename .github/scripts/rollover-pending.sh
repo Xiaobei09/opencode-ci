@@ -67,21 +67,42 @@ bot_is_offline() {
 _ro_front() {
   local f="$1" sid=""
   sid=$(jq -r '.front // empty' "$f" 2>/dev/null || true)
-  case "$sid" in ses_*) printf '%s' "$sid"; return 0 ;; esac
+  case "$sid" in ses_*) printf '%s' "$sid" ;; esac
+}
+
+_ro_pinned() {
+  local f="$1" sid=""
   sid=$(jq -r '.pinned // empty' "$f" 2>/dev/null || true)
   case "$sid" in ses_*) printf '%s' "$sid" ;; esac
 }
 
-# Does this Bot own/claim the request's session? Front/pinned is the normal
-# case; loop-ctl sids covers a shared session whose front has already moved.
+# Mirrors tg-bridge's quotaForkMine(): only the Bot whose persisted front or
+# pinned target is this session will claim the request. loop-ctl sids are NOT
+# an ownership source there, so a stale request whose front already moved is
+# an orphan and must not suppress anything.
 _ro_bot_owns() {
-  local id="$1" f="$2" sid="$3" ctl front
-  front=$(_ro_front "$f")
-  [ "$front" = "$sid" ] && return 0
-  ctl="$(_ro_ctl)"
-  [ -s "$ctl" ] && _ro_have_jq || return 1
-  jq -e --arg bot "$id" --arg sid "$sid" \
-    '(.bots[$bot].sids // []) | index($sid) != null' "$ctl" >/dev/null 2>&1
+  local f="$1" sid="$2"
+  [ "$(_ro_front "$f")" = "$sid" ] && return 0
+  [ "$(_ro_pinned "$f")" = "$sid" ] && return 0
+  return 1
+}
+
+# Mirrors tg-bridge's per-Bot rollover switches. If either is off the bridge
+# returns before reading requests; such a request is waiting, not actionable.
+_ro_rollover_enabled_for() {
+  local f="$1"
+  case "${ROLLOVER_ON_429:-1}" in 0) return 1 ;; esac
+  jq -e '.rollover429 == false' "$f" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+# Mirrors halt-release.ts: a released sid is not halted even if it is still
+# present in the Bot's persisted `halted` array.
+_ro_halt_released() {
+  local sid="$1" rel
+  rel="${HALT_RELEASE_PATH:-$(_ro_home)/.config/opencode/halt-release.json}"
+  [ -s "$rel" ] && _ro_have_jq || return 1
+  jq -e --arg sid "$sid" 'type == "object" and has($sid)' "$rel" >/dev/null 2>&1
 }
 
 # Mirrors tg-bridge's rollover gate: !manual && (loopStopped() || haltedSet).
@@ -90,7 +111,7 @@ _ro_bot_owns() {
 _ro_bot_stopped() {
   local id="$1" f="$2" sid="$3" ctl front halted
   halted=$(jq -r --arg sid "$sid" '(.halted // []) | index($sid) != null' "$f" 2>/dev/null || echo false)
-  [ "$halted" = "true" ] && return 0
+  [ "$halted" = "true" ] && ! _ro_halt_released "$sid" && return 0
   ctl="$(_ro_ctl)"
   [ -s "$ctl" ] && _ro_have_jq || return 1
   front=$(_ro_front "$f")
@@ -109,18 +130,23 @@ rollover_request_actionable() {
   local f="$1" ts now sid manual id state
   [ -f "$f" ] || return 1
   _ro_have_jq || return 0 # no jq: keep the old conservative behavior
+  # The bridge does not even read request files when the global switch is off.
+  case "${ROLLOVER_ON_429:-1}" in 0) return 1 ;; esac
   ts=$(jq -r '.ts // 0' "$f" 2>/dev/null || echo 0)
   now=$(date +%s%3N)
   case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
-  if [ "$ts" -gt 0 ] && [ $((now - ts)) -gt 86400000 ]; then
-    return 1 # the bridge deletes requests older than 24h
-  fi
-  manual=$(jq -r '.manual // false' "$f" 2>/dev/null || echo false)
+  # The bridge deletes malformed/expired requests (>24h) instead of consuming.
+  [ "$ts" -gt 0 ] || return 1
+  [ $((now - ts)) -le 86400000 ] || return 1
   sid=$(jq -r '.sid // empty' "$f" 2>/dev/null || true)
   [ -n "$sid" ] || sid=$(basename "$f" .json)
+  [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
+  manual=$(jq -r '.manual // false' "$f" 2>/dev/null || echo false)
   while IFS=$'\t' read -r id state; do
     [ -n "$id" ] || continue
-    _ro_bot_owns "$id" "$state" "$sid" || continue
+    _ro_bot_owns "$state" "$sid" || continue
+    # A Bot with its per-Bot switch off will not consume the request.
+    _ro_rollover_enabled_for "$state" || continue
     # An offline Bot cannot consume even a manual request; do not let an
     # orphan manual request block the next run forever.
     bot_is_offline "$id" && continue
