@@ -693,7 +693,10 @@ jobs:
           reset_hint=""
           if [ -n "$retry_after_s" ] && [ "$retry_after_s" -gt 0 ] 2>/dev/null; then
             reset_epoch=$(( $(date +%s) + retry_after_s ))
-            reset_hint=$(date -u -d "@$reset_epoch" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || true)
+            # R2685: the TG round-end notice uses the same Asia/Shanghai
+            # region as the bridge cards; a bare UTC hint was the remaining
+            # mixed-timezone display.
+            reset_hint=$(TZ="${TG_TZ:-Asia/Shanghai}" date -d "@$reset_epoch" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || true)
           fi
           # R2630 (operator: "CI本轮结束的信息有时候不发送"): every relayed round
           # must send a Telegram notice. R2596 throttled egress retries to

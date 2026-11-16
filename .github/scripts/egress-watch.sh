@@ -308,7 +308,10 @@ record_quota() {
   # close lower bound (the line may be processed a few seconds later).
   if [ -n "$retry_after" ] && [ "$retry_after" != "?" ] \
      && [ "$retry_after" -gt 0 ] 2>/dev/null; then
-    reset_at=$(date -u -d "@$((now + retry_after))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)
+    # R2685 (operator: "统一时间地区"): the reset hint is shown in the TG
+    # round-end notice, so use the same Asia/Shanghai region as the bridge
+    # cards instead of a bare UTC `Z` timestamp.
+    reset_at=$(TZ="${TG_TZ:-Asia/Shanghai}" date -d "@$((now + retry_after))" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || true)
   fi
   log "quota 429 detected (streak=$quota_streak/$QUOTA_LIMIT, upstream=$CUR_UP, retry_after=${retry_after}s${reset_at:+, reset_at=$reset_at})"
   if [ "$quota_streak" -ge "$QUOTA_LIMIT" ]; then
