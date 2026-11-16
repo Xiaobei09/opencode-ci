@@ -1,0 +1,102 @@
+name: publish-bridge
+
+# R2670 (operator: "增加一个ci,用来构建新的干净副本"): keep the public bridge repo
+# a fresh, single-commit clean copy of the sanitized source.
+#
+# The public repo is a distribution artifact, not the development history. Every
+# publish rebuilds an orphan root commit from the current sanitized tree, verifies
+# it (leak scan + install smoke test) and force-pushes it. Old public commits are
+# therefore never a growing leak surface; the private sessions repo remains the
+# only source of truth. See .github/scripts/publish-bridge-clean.sh.
+#
+# Triggers:
+#   - manual dispatch (dry_run by default is false; use force to rebuild with no diff)
+#   - every 6h offset from iterate (in case the loop is paused but the source moved)
+#   - after every successful iterate run (publish new bridge code promptly)
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify only; never commit or push
+        type: boolean
+        required: false
+        default: false
+      force:
+        description: Rebuild the clean copy even when the sanitized tree is unchanged
+        type: boolean
+        required: false
+        default: false
+      tag:
+        description: Tag to publish (empty = v<date>-r<round>, "-" = no tag)
+        type: string
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_run:
+    workflows: ["iterate"]
+    types: [completed]
+
+concurrency:
+  group: publish-bridge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.CROSS_PAT }}
+  SESSIONS_REPO: ${{ vars.SESSIONS_REPO }}
+  # Override with a repository variable if the public repo ever moves.
+  BRIDGE_REPO: ${{ vars.BRIDGE_REPO || 'Xiaobei09/opencode-bridge-plugin' }}
+
+jobs:
+  clean-copy:
+    # A failed/cancelled loop round must not publish anything. Scheduled and
+    # manual runs are always allowed (they still skip when nothing changed).
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out ci-repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure git and gh
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+          fi
+          gh auth setup-git
+          git config --global user.name "opencode-ci"
+          git config --global user.email "opencode-ci@users.noreply.github.com"
+          [ -n "$SESSIONS_REPO" ] || { echo "::error::SESSIONS_REPO repository variable is empty"; exit 1; }
+          echo "publish target: bridge=$BRIDGE_REPO sessions=$SESSIONS_REPO"
+
+      - name: Clone sessions and bridge
+        run: |
+          set -euo pipefail
+          rm -rf "$SESSIONS_DIR" "$BRIDGE_DIR"
+          # Sessions is private and read-only here; depth 1 is enough for the source.
+          gh repo clone "$SESSIONS_REPO" "$SESSIONS_DIR" -- --depth 1
+          # The bridge clone must be complete enough to rewrite its root commit.
+          gh repo clone "$BRIDGE_REPO" "$BRIDGE_DIR"
+          echo "sessions HEAD: $(git -C "$SESSIONS_DIR" rev-parse --short HEAD)"
+          echo "bridge HEAD:   $(git -C "$BRIDGE_DIR" rev-parse --short HEAD)"
+        env:
+          SESSIONS_DIR: /home/runner/work/publish-sessions
+          BRIDGE_DIR: /home/runner/work/publish-bridge
+
+      - name: Build, verify and publish clean copy
+        env:
+          SESSIONS_DIR: /home/runner/work/publish-sessions
+          BRIDGE_DIR: /home/runner/work/publish-bridge
+          # workflow_dispatch inputs are strings in github.event.inputs; schedule
+          # and workflow_run have none, so the fallbacks keep the defaults.
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: bash .github/scripts/publish-bridge-clean.sh
