@@ -35,6 +35,12 @@ REG="$CFG/tg-bots.json"
 INVALID="$CFG/tg-token-invalid.json"
 WINDOW="${BOT_ACTIVE_WINDOW_SECONDS:-900}"
 
+# R2668 follow-up: Actions logs are world-readable. Never echo a complete
+# session id; keep the same 8-character prefix used by run-opencode.sh.
+redact_sid() {
+  printf '%s' "$1" | sed -E 's/^(ses_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+$/\1…/'
+}
+
 # Unknown registry = cannot enumerate bots = never pause.
 if [ ! -f "$REG" ] || ! command -v jq >/dev/null 2>&1; then
   echo "bot-sessions: registry unreadable ($REG); assuming a bot may be outputting (no pause)"
@@ -145,10 +151,10 @@ for id in "${BOTS[@]}"; do
   fi
   act=$(session_activity "$sid")
   if [ "$act" = "active" ]; then
-    echo "bot-sessions: $id ACTIVE (outputting now: $sid, since $SINCE_LABEL) -> do not pause"
+    echo "bot-sessions: $id ACTIVE (outputting now: $(redact_sid "$sid"), since $SINCE_LABEL) -> do not pause"
     exit 0
   fi
-  echo "bot-sessions: $id inactive (session idle/ended/errored: $sid)"
+  echo "bot-sessions: $id inactive (session idle/ended/errored: $(redact_sid "$sid"))"
 done
 
 echo "bot-sessions: no bot is outputting (all idle/ended/stopped/errored) -> pausing is allowed"

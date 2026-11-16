@@ -18,6 +18,12 @@
 #        ROLLOVER_ON_429=0     disables writing entirely
 set +eu
 
+# R2668 follow-up: Actions logs are world-readable. Never echo a complete
+# session id; keep the same 8-character prefix used by run-opencode.sh.
+redact_sid() {
+  printf '%s' "$1" | sed -E 's/^(ses_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+$/\1…/'
+}
+
 REASON="${1:-429-streak-2}"
 if [ "${ROLLOVER_ON_429:-1}" = "0" ]; then
   echo "rollover disabled (ROLLOVER_ON_429=0)"
@@ -60,7 +66,7 @@ SIDS=$(
       *) continue ;;
     esac
     case "$sid" in
-      *[!A-Za-z0-9_-]*) echo "rollover: skip unsafe session id $(printf '%s' "$sid" | cut -c1-40)" >&2 ;;
+      *[!A-Za-z0-9_-]*) echo "rollover: skip unsafe session id $(printf '%s' "$sid" | cut -c1-8)…" >&2 ;;
       *) printf '%s\n' "$sid" ;;
     esac
   done | awk 'NF && !seen[$0]++'
@@ -83,10 +89,10 @@ while IFS= read -r sid; do
       '{sid:$sid,ts:$ts,reason:$reason,run:$run}' > "$tmp" 2>/dev/null \
      && mv -f "$tmp" "$file" 2>/dev/null; then
     n=$((n + 1))
-    echo "rollover request written: $sid (reason=$REASON, dir=$DIR)"
+    echo "rollover request written: $(redact_sid "$sid") (reason=$REASON, dir=$DIR)"
   else
     rm -f "$tmp" 2>/dev/null || true
-    echo "::warning::rollover request write failed: $sid (dir=$DIR)"
+    echo "::warning::rollover request write failed: $(redact_sid "$sid") (dir=$DIR)"
   fi
 done <<< "$SIDS"
 
