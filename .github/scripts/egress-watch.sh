@@ -66,7 +66,19 @@ selected_egress=""
 selected_direct_ip=""
 selected_preflight="unknown"
 
-log() { echo "$(egress_iso) $*" >> "$WATCH_LOG"; }
+# R2668: watch.log is printed into the world-readable public CI log by
+# run-opencode.sh. Shorten session/message ids and mask token-shaped values at
+# the source too, so any future reader of watch.log is safe by default.
+redact_watch() {
+  sed -E \
+    -e 's#(/bot)[0-9]{8,10}:[A-Za-z0-9_-]{30,}#\1<telegram-token>#g' \
+    -e 's/(^|[^0-9A-Za-z_])[0-9]{8,10}:[A-Za-z0-9_-]{30,}/\1<telegram-token>/g' \
+    -e 's/(^|[^0-9A-Za-z_])bot[0-9]{8,10}:[A-Za-z0-9_-]{30,}/\1bot<telegram-token>/g' \
+    -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<redacted>/g' \
+    -e 's/(ses_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+/\1…/g' \
+    -e 's/(msg_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+/\1…/g'
+}
+log() { printf '%s %s\n' "$(egress_iso)" "$*" | redact_watch >> "$WATCH_LOG"; }
 
 # Plugin log lines carry an ISO timestamp. Quota lines without `upstream=`
 # can still be stale after a previous run's state was restored; drop anything

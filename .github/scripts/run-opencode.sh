@@ -10,15 +10,25 @@ set +e
 # clip bounds TUI/stack-trace lines that would otherwise wrap.
 section() { printf '\n== %s ==\n' "$*"; }
 clip() { cut -c1-240; }
-# R2661（运营者：「检查 CI 有没有泄露消息内容/敏感信息」）：这个仓库是 **public**，
-# Actions 日志人人可见。插件 error/warn 行可能带 text=/excerpt=/prompt=（消息正文），
-# 这里在打印前统一打码；同时兜住 Telegram token / Bearer 凭据形状的意外拼接。
+# R2661/R2668（运营者：「检查 CI 有没有泄露消息内容/敏感信息」）：这个仓库是
+# **public**，Actions 日志人人可见。插件 error/warn 行可能带
+# text=/excerpt=/prompt=（消息正文），这里在打印前统一打码；同时兜住
+# Telegram token / Bearer 凭据形状的意外拼接，并把完整 ses_/msg_ id 截成
+# 前 8 位（保留关联性，不能用于回查私有会话）。
 redact() {
   sed -E \
     -e 's/(^|[[:space:]])(text|excerpt|content|prompt|userText|message)=("[^"]*"|[^[:space:]]+)/\1\2=<redacted>/g' \
+    -e 's#(/bot)[0-9]{8,10}:[A-Za-z0-9_-]{30,}#\1<telegram-token>#g' \
     -e 's/(^|[^0-9A-Za-z_])[0-9]{8,10}:[A-Za-z0-9_-]{30,}/\1<telegram-token>/g' \
-    -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<redacted>/g'
+    -e 's/(^|[^0-9A-Za-z_])bot[0-9]{8,10}:[A-Za-z0-9_-]{30,}/\1bot<telegram-token>/g' \
+    -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<redacted>/g' \
+    -e 's/(ses_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+/\1…/g' \
+    -e 's/(msg_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+/\1…/g'
 }
+# R2668: public Actions logs are world-readable. Every diagnostic line goes
+# through redact() before it reaches stdout; keep the helper for plain echoes
+# that are not already piped through a grep/tail chain.
+say() { printf '%s\n' "$*" | redact; }
 # R2576 (D9): stamp the OpenCode phase so the snapshot step can report
 # the real non-opencode wall time (setup + post-run) instead of only
 # the setup half. OPENCODE_START_T0 is the boundary between the two.
@@ -213,7 +223,7 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       # R2665: an offline Bot (token rejected / duplicate of another Bot) has
       # no process to answer a resume prompt. Arming it only spends quota.
       if bot_is_offline "$_botid"; then
-        echo "option C resume-once skipped for $_botid (offline: invalid/duplicate token)"
+        say "option C resume-once skipped for $_botid (offline: invalid/duplicate token)"
         continue
       fi
       # Same convention as auto-continue.resolveExtraTargetPaths:
@@ -230,7 +240,7 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
       elif [ -n "$_sid" ]; then
-        echo "option C resume-once skipped for $_sid (actionable 429 rollover)"
+        say "option C resume-once skipped for $_sid (actionable 429 rollover)"
       fi
     done < <(jq -r '.bots[]?.id // empty' "$_bots_json" 2>/dev/null || true)
   else
@@ -263,7 +273,7 @@ if [ -d "$HOME/.config/opencode/rollover-requests" ]; then
 fi
 if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_ONCE_SIDS" ]; then
   export RESUME_ONCE_SIDS
-  echo "option C resume-once armed: $RESUME_ONCE_SIDS"
+  say "option C resume-once armed: $RESUME_ONCE_SIDS"
 else
   export RESUME_ONCE_SIDS=""
   if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
@@ -466,7 +476,7 @@ else
 fi
 section "egress connections"
 if [ -s "$EGRESS_DIR/proxy.log" ]; then
-  grep -aE 'target=opencode\.ai|epoch [0-9]+:' "$EGRESS_DIR/proxy.log" 2>/dev/null | tail -6 | clip | sed 's/^/  /'
+  grep -aE 'target=opencode\.ai|epoch [0-9]+:' "$EGRESS_DIR/proxy.log" 2>/dev/null | tail -6 | redact | clip | sed 's/^/  /'
 else
   echo "no proxy log"
 fi
@@ -480,11 +490,11 @@ if [ -s "$EGRESS_DIR/watch.log" ]; then
   cnt() { local n; n=$(grep -acE "$1" "$EGRESS_DIR/watch.log" 2>/dev/null || true); echo "${n:-0}"; }
   echo "summary: upstream=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?') path_checks=$(cnt 'egress path check') rechecks=$(cnt 'egress path recheck ok') quota=$(cnt 'quota error detected') failures=$(cnt 'egress failure') blacklisted=$(cnt 'blacklisted') stops=$(cnt 'STOP:') ignored_quota=$(cnt 'ignoring')"
   echo "failures/stops (last 10):"
-  grep -aE 'egress failure|STOP:|blacklisted|selected egress answered 200' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -10 | clip | sed 's/^/  /'
+  grep -aE 'egress failure|STOP:|blacklisted|selected egress answered 200' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -10 | redact | clip | sed 's/^/  /'
   echo "recent signals (last 12, tunnel lines collapsed):"
-  grep -avE 'provider connection established \(diagnostic|provider tunnel closed \(close' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -12 | clip | sed 's/^/  /'
+  grep -avE 'provider connection established \(diagnostic|provider tunnel closed \(close' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -12 | redact | clip | sed 's/^/  /'
   echo "recent tunnels (last 4):"
-  grep -aE 'provider (connection established|tunnel (closed|idle))' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -4 | clip | sed 's/^/  /'
+  grep -aE 'provider (connection established|tunnel (closed|idle))' "$EGRESS_DIR/watch.log" 2>/dev/null | tail -4 | redact | clip | sed 's/^/  /'
 else
   echo "no watch log"
 fi
