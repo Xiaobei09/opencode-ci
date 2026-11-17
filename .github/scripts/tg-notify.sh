@@ -161,9 +161,10 @@ send_via() {
   return 1
 }
 
-# Candidate order: only quota 429 notices are rerouted. Each candidate is then
+# Candidate order (R2732): every global notice (round-end/relay, loop-stop,
+# quota 429, Telegram rate-limit) shares the same route list. Each candidate is
 # checked against its own per-Bot switch in the send loop, so turning one Bot
-# off does not affect the others. Everything else keeps the primary Bot.
+# off does not affect the others.
 # Bot ids end up in a file path (`tg-bot<id>.env`) and a jq argument, so reject
 # anything outside the registry's id alphabet before using it as a route.
 valid_bot() {
