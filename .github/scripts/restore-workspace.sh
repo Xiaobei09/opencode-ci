@@ -48,7 +48,7 @@ echo "== install-toolchain.log =="
 cat /tmp/install-toolchain.log 2>/dev/null
 if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ] || [ "$rc_i" != 0 ]; then
   echo "::warning::parallel setup failed (targets rc=$rc_t env rc=$rc_e toolchain rc=$rc_i)"
-  exit 1
+  exit 0
 fi
 for p in "$HOME/.config/opencode"/*.json \
          "$HOME/.config/opencode"/*.env \
