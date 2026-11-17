@@ -2,15 +2,16 @@
 # R2649 (operator: "在连续两次429后自动创建新会话，切换并且注入：
 # 阅读（原会话id）对话历史，继续任务 的提示词").
 # R2675 (operator: "没有429的会话不需要换会话，多条会话同时429连续两轮时只换
-# 先429（时间戳）的那个，并且计数重置为1"): the old writer queued a rollover for
-# EVERY bound bot session on the second 429-only round, including sessions that
-# never hit 429. The plugin log cannot identify them (session ids are truncated),
-# so auto-continue records durable per-session evidence under
-# ~/.config/opencode (full sid + first/last 429 timestamps + run id). This script
-# joins that evidence with the sessions currently bound to a bot, counts
-# consecutive quota rounds per session, and writes exactly ONE request: the
-# earliest first-429 session that reached streak >= 2. Its streak is reset to 1
-# so the remaining sessions switch on later rounds instead of all at once.
+# 先429（时间戳）的那个"): the old writer queued a rollover for EVERY bound bot
+# session, including sessions that never hit 429. The plugin log cannot identify
+# them (session ids are truncated), so auto-continue records durable per-session
+# evidence under ~/.config/opencode (full sid + first/last 429 timestamps + run
+# id). This script joins that evidence with the sessions currently bound to a
+# bot, counts quota rounds per session, and writes exactly ONE request.
+# R2700 (operator: "改成1就换会话，重置为0，同时显示两个计数器"): switch as soon
+# as a bound session has 429 evidence this round (streak >= 1); after writing the
+# request reset that session's streak to 0. Still one request per round — the
+# earliest first-429 session wins, the rest wait for later rounds.
 #
 # The request lives under $HOME/.config/opencode so the environment snapshot
 # (env-sync / release pack) carries it across the CI restart. It is intentionally
@@ -30,7 +31,7 @@ redact_sid() {
   printf '%s' "$1" | sed -E 's/^(ses_[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+$/\1…/'
 }
 
-REASON="${1:-429-streak-2}"
+REASON="${1:-429-streak-1}"
 if [ "${ROLLOVER_ON_429:-1}" = "0" ]; then
   echo "rollover disabled (ROLLOVER_ON_429=0)"
   echo "rollover_triggered=0"
@@ -119,11 +120,12 @@ while IFS= read -r sid; do
   fi
 done <<< "$SIDS"
 
-# Earliest first-429 wins; sid is only a deterministic tie-break. Exactly one
-# request per invocation even when several sessions reached streak >= 2.
+# R2700: streak >= 1 switches. Earliest first-429 wins; sid is only a
+# deterministic tie-break. Exactly one request per invocation even when several
+# sessions have 429 evidence this round.
 CHOSEN=$(printf '%s' "$NEW" | jq -r '
   [ .sessions | to_entries[]
-    | select((.value.streak | type) == "number" and .value.streak >= 2)
+    | select((.value.streak | type) == "number" and .value.streak >= 1)
     | select((.value.first429At | type) == "number" and .value.first429At > 0)
     | {sid: .key, first: .value.first429At} ]
   | sort_by([.first, .sid]) | .[0].sid // empty' 2>/dev/null || true)
@@ -146,9 +148,9 @@ if [ -n "$CHOSEN" ]; then
       '{sid:$sid,ts:$ts,reason:$reason,run:$run}' > "$TMP" 2>/dev/null \
      && mv -f "$TMP" "$FILE" 2>/dev/null; then
     TRIGGERED=1
-    # Operator: reset the counter to 1 (not 0) after a switch so the next
-    # session waits another quota round instead of all switching at once.
-    NEW=$(printf '%s' "$NEW" | jq -c --arg sid "$CHOSEN" '.sessions[$sid].streak = 1' 2>/dev/null || printf '%s' "$NEW")
+    # R2700 (operator: "重置为0"): reset the switched session's counter to 0;
+    # the remaining sessions wait for later rounds instead of all switching at once.
+    NEW=$(printf '%s' "$NEW" | jq -c --arg sid "$CHOSEN" '.sessions[$sid].streak = 0' 2>/dev/null || printf '%s' "$NEW")
     echo "rollover request written: $(redact_sid "$CHOSEN") (reason=$REASON, dir=$DIR)"
   else
     rm -f "$TMP" 2>/dev/null || true
@@ -157,7 +159,7 @@ if [ -n "$CHOSEN" ]; then
 fi
 
 # Persist the per-session counters even when nothing was selected: the next
-# quota round must see this round's evidence to reach two consecutive rounds.
+# quota round rebuilds from fresh evidence, so a round without 429 clears it.
 TMP_S="$STREAKS.tmp.$$"
 if printf '%s\n' "$NEW" > "$TMP_S" 2>/dev/null && mv -f "$TMP_S" "$STREAKS" 2>/dev/null; then
   :
@@ -169,6 +171,6 @@ fi
 if [ "$TRIGGERED" = "1" ]; then
   echo "rollover_triggered=1"
 else
-  echo "rollover: no session with 429 in 2 consecutive rounds; nothing to switch"
+  echo "rollover: no session with 429 evidence this round; nothing to switch"
   echo "rollover_triggered=0"
 fi

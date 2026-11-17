@@ -278,8 +278,8 @@ jobs:
           # copied; no chat is replayed. Default on; set the repo variable to 0
           # to disable.
           FORK_ON_QUOTA_200: ${{ vars.FORK_ON_QUOTA_200 || '1' }}
-          # R2649: after two consecutive 429-only CI rounds, create a fresh
-          # session per bound bot, switch to it and inject
+          # R2649/R2700: after a 429-only quota round, create a fresh session
+          # per bound bot, switch to it and inject
           # "阅读（原会话id）对话历史，继续任务". The request is written by
           # failure_guard below and handled by the bridge at the next boot.
           # Default on; set the repo variable to 0 to disable.
@@ -404,12 +404,11 @@ jobs:
               gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               q429=0
             else
-              # R2675 (operator: "没有429的会话不需要换会话，多条会话同时429连续
-              # 两轮时只换先429（时间戳）的那个，并且计数重置为1"): maintain the
-              # per-session counters on EVERY quota round (the first round must
-              # record streak=1 so the second can trigger). The writer reads
+              # R2675/R2700 (operator: "没有429的会话不需要换会话，多条会话同时
+              # 429时只换先429（时间戳）的那个；改成1就换会话，重置为0"): maintain
+              # the per-session counters on EVERY quota round. The writer reads
               # auto-continue's durable evidence (full session ids) and writes at
-              # most ONE request: the earliest first-429 session with streak>=2.
+              # most ONE request: the earliest first-429 session with streak>=1.
               # Sessions with no 429 evidence in this run are never requested.
               rollover_out=$(bash "$GITHUB_WORKSPACE/.github/scripts/write-rollover-requests.sh" "quota-round" 2>&1 || true)
               [ -n "$rollover_out" ] && printf '%s\n' "$rollover_out"
@@ -419,14 +418,13 @@ jobs:
               case "$q429" in ''|*[!0-9]*) q429=0 ;; esac
               q429=$((q429 + 1))
               if [ "$rollover_triggered" = "true" ]; then
-                # Operator: after switching one session reset the counter to 1
-                # (not 0), so the remaining 429 sessions switch on later rounds
-                # instead of all at once.
-                q429=1
+                # R2700 (operator: "重置为0"): reset the counter to 0 after one
+                # session switch; remaining 429 sessions switch on later rounds.
+                q429=0
               fi
               gh variable set CI_429_STREAK --body "$q429" --repo "$repo" >/dev/null 2>&1 || true
               if [ "$rollover_triggered" = "true" ]; then
-                echo "::notice::429 rollover queued for the earliest-429 session; CI_429_STREAK reset to 1"
+                echo "::notice::429 rollover queued for the earliest-429 session; CI_429_STREAK reset to 0"
               fi
               # R2641/R2642 (operator: "没有200的429才计算进连续3轮，并且要求所有bot
               # 对应的会话都不是活跃（错误/停止）的时候才停" / "只有在输出才算
@@ -434,8 +432,8 @@ jobs:
               # sufficient. Only pause when NO registered bot is still
               # outputting; a naturally finished, stopped or errored bot does
               # not block the pause, but an in-flight turn does.
-              # R2675: the valve keys on CI_EGRESS_STREAK (`next`), because the
-              # 429 counter is reset to 1 on every switch and may never reach 3.
+              # R2675/R2700: the valve keys on CI_EGRESS_STREAK (`next`), because
+              # the 429 counter is reset to 0 on every switch and may never reach 3.
               if [ "$next" -ge 3 ]; then
                 if bash "$GITHUB_WORKSPACE/.github/scripts/bot-sessions-active.sh"; then
                   echo "::notice::quota 429 round $q429 (CI_429_STREAK, egress-only #$next) but at least one bot is still outputting; relaying instead of pausing"
@@ -726,8 +724,12 @@ jobs:
             reason="opencode 结束（outcome=${outcome:-unknown}），已接力新 run"
           fi
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
-          [ "$egress_retry" = "true" ] && streak=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "?")
-          [ "$egress_retry" = "true" ] && streak="${streak}/3 (429 轮)"
+          # R2700: quota rounds display the egress valve count (CI_EGRESS_STREAK),
+          # not CI_429_STREAK — the latter resets to 0 on every session rollover.
+          if [ "$egress_retry" = "true" ]; then
+            roll=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "?")
+            streak="${egress_n:-?}/3 (额度轮)；会话换号 ${roll}/3"
+          fi
           # R2587（D7）：结束通知必须带真实错误证据，而不只是 outcome。退出码
           # 与本次 Run OpenCode 抓到的最后一条错误（已去 ANSI/CR）一并附上。
           rc="${R2651_EXIT_CODE:-}"
@@ -796,6 +798,7 @@ jobs:
           R2651_SELECT_REASON: ${{ steps.select_egress.outputs.reason }}
           R2651_RESTORE_FAILED: ${{ steps.failure_guard.outputs.restore_failed }}
           R2651_QUOTA_ROUND_LIMIT: ${{ steps.failure_guard.outputs.quota_round_limit }}
+          R2651_EGRESS_N: ${{ steps.failure_guard.outputs.egress_retry_count }}
           R2651_EXIT_CODE: ${{ steps.run_opencode.outputs.exit_code }}
           R2651_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -808,10 +811,13 @@ jobs:
           select_reason="${R2651_SELECT_REASON:-}"
           restore_failed="${R2651_RESTORE_FAILED:-}"
           quota_round_limit="${R2651_QUOTA_ROUND_LIMIT:-}"
+          egress_n="${R2651_EGRESS_N:-}"
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           if [ "$quota_round_limit" = "true" ]; then
-            streak=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "3")
-            streak="${streak}/3 (429 轮)"
+            # R2700: 卡片同时显示两个计数器——阀门计数（额度轮）与换会话计数；
+            # CI_429_STREAK 每次换会话后重置为 0，不能拿来单独表示暂停原因。
+            roll=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "?")
+            streak="${egress_n:-?}/3 (额度轮)；会话换号 ${roll}/3"
           fi
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
           # R2587（D7）：停止卡同样带退出码与最后一条错误证据。
