@@ -255,7 +255,7 @@ while IFS=$'\t' read -r snap_name snap_fp snap_commit; do
   fi
   if [ ! -d "$target_dir" ]; then
     FP_BAD=$((FP_BAD + 1))
-    echo "::error::target restore fingerprint mismatch: dir=$snap_name is missing (want=${snap_fp:0:12})"
+    echo "::warning::target restore fingerprint mismatch: dir=$snap_name is missing (want=${snap_fp:0:12})"
     continue
   fi
   head=$(git -C "$target_dir" rev-parse HEAD 2>/dev/null || true)
