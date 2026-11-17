@@ -58,6 +58,28 @@ if [ -s "$BOT_STATE" ] && command -v jq >/dev/null 2>&1; then
 fi
 case "$OLD_SID" in ses_*) ;; *) OLD_SID="" ;; esac
 
+# Remember the old session's model before the clean-room DB deletion. The bridge
+# normally inherits the model from the old session (R2658), but that session no
+# longer exists once this script deletes opencode.db. Keep the exact
+# provider/model/variant so the repair turn runs on the Bot's current model
+# instead of the host default. Missing DB/table/row is fine: model stays null.
+MODEL_JSON=""
+if [ -n "$OLD_SID" ] && [ -s "$STATE_HOME/opencode.db" ] && command -v python3 >/dev/null 2>&1; then
+  MODEL_JSON=$(python3 - "$STATE_HOME/opencode.db" "$OLD_SID" <<'PYMODEL' 2>/dev/null || true
+import json, sqlite3, sys
+try:
+    con = sqlite3.connect(sys.argv[1])
+    row = con.execute("select model from session_v2 where id = ?", (sys.argv[2],)).fetchone()
+    model = json.loads(row[0]) if row and row[0] else None
+    if isinstance(model, dict) and isinstance(model.get("id"), str) and isinstance(model.get("providerID"), str):
+        print(json.dumps(model, ensure_ascii=False))
+except Exception:
+    pass
+PYMODEL
+)
+fi
+case "$MODEL_JSON" in \{*) ;; *) MODEL_JSON="" ;; esac
+
 # Every session this run knows about must be halted. auto-continue reads the union
 # of all Bot state files, so putting the union into each file is safe and survives
 # a Bot that boots late.
@@ -157,8 +179,9 @@ jq -n \
   --arg run "$RUN" \
   --arg reason "$REASON" \
   --arg runUrl "$RUN_URL" \
+  --argjson model "${MODEL_JSON:-null}" \
   --argjson ts "$(date +%s%3N)" \
-  '{bot:$bot,oldSid:$oldSid,prompt:$prompt,run:$run,reason:$reason,runUrl:$runUrl,ts:$ts,clean:true,haltOthers:true,ephemeral:true}' \
+  '{bot:$bot,oldSid:$oldSid,prompt:$prompt,run:$run,reason:$reason,runUrl:$runUrl,model:$model,ts:$ts,clean:true,haltOthers:true,ephemeral:true}' \
   > "$TMP"
 mv -f "$TMP" "$CFG/ci-recovery.json"
 chmod 600 "$CFG/ci-recovery.json" 2>/dev/null || true
