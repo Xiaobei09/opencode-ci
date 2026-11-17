@@ -12,7 +12,9 @@
 #   * delete the session DB/snapshots (clean room; the save gate is disabled in
 #     recovery mode, so this NEVER reaches the release),
 #   * write ~/.config/opencode/ci-recovery.json for the bridge; the matching Bot
-#     creates the new session, switches to it, and injects the repair prompt.
+#     creates the new session, switches to it, and injects the repair prompt;
+#   * write ci-recovery-active.json so sibling Bot instances cannot adopt the
+#     single fresh session through their boot-time resume fallback.
 #
 # It is intentionally idempotent: a crashed boot can re-run it and still produce one
 # request. No network calls here.
@@ -42,10 +44,6 @@ if ! printf '%s' "$BOT" | grep -Eq '^[A-Za-z0-9_-]+$'; then
   echo "::error::prepare-recovery: unsafe bot id '$BOT'"
   exit 1
 fi
-state_for() {
-  local id="$1" first="$2"
-  if [ "$first" = "1" ]; then printf '%s/tg-chats.json' "$CFG"; else printf '%s/tg-chats-%s.json' "$CFG" "$id"; fi
-}
 BOT_STATE="$CFG/tg-chats-$BOT.json"
 if [ -s "$REG" ] && command -v jq >/dev/null 2>&1; then
   FIRST=$(jq -r '.bots[0].id // empty' "$REG" 2>/dev/null || true)
