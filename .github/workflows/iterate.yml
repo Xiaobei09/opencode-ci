@@ -343,24 +343,39 @@ jobs:
           # R2742 (operator: round gap under one minute): the run-end snapshot
           # only needs OpenCode to have exited, but it used to start after the
           # policy/relay/notify steps (~5s) — pure serial tail in the
-          # round-to-round gap. Start it here and let those steps overlap the
-          # 20-30s env-sync push. The dedicated steps below wait on this pid;
-          # if the runner killed the background job between steps, they fall
-          # back to the original synchronous run (worst case = old timing).
-          if [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "1" ]; then
-            if bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"; then
-              rm -f "$RUNNER_TEMP/snapshot-env.rc"
-              (
-                export POST_OPENCODE_T0="$post_t0"
-                bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh"
-                echo $? > "$RUNNER_TEMP/snapshot-env.rc"
-              ) >"$RUNNER_TEMP/snapshot-env.log" 2>&1 &
-              echo $! > "$RUNNER_TEMP/snapshot-env.pid"
-              echo "run-end snapshot started in parallel with the relay/notify steps (pid $(cat "$RUNNER_TEMP/snapshot-env.pid"))"
-            else
-              echo "::warning::save-workspace-snapshots failed; the snapshot step will run synchronously"
+          # round-to-round gap. Start it in this step and let those steps
+          # overlap the 20-30s env-sync push. The dedicated steps below wait on
+          # this pid; if the runner killed the background job between steps,
+          # they fall back to the original synchronous run (worst case = old
+          # timing).
+          # R2766 (operator: "为什么429换会话不会自动触发了"): the launch must NOT
+          # run before write-rollover-requests.sh. The request lives only in
+          # $HOME, so the env snapshot is its sole durable carrier across runs;
+          # the old unconditional launch at the top of this step captured $HOME
+          # before the request existed (2026-11-17 10:46: snapshot started at
+          # :05.8, request written at :06.98 → successor restored a 10:44 branch
+          # without it, automatic switch silently lost). Normal rounds keep the
+          # early start; quota rounds call start_snapshot only after the writer
+          # has persisted the request AND the reset counters.
+          snapshot_started=0
+          start_snapshot() {
+            [ "$snapshot_started" = 1 ] && return 0
+            snapshot_started=1
+            if [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "1" ]; then
+              if bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"; then
+                rm -f "$RUNNER_TEMP/snapshot-env.rc"
+                (
+                  export POST_OPENCODE_T0="$post_t0"
+                  bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh"
+                  echo $? > "$RUNNER_TEMP/snapshot-env.rc"
+                ) >"$RUNNER_TEMP/snapshot-env.log" 2>&1 &
+                echo $! > "$RUNNER_TEMP/snapshot-env.pid"
+                echo "run-end snapshot started in parallel with the relay/notify steps (pid $(cat "$RUNNER_TEMP/snapshot-env.pid"))"
+              else
+                echo "::warning::save-workspace-snapshots failed; the snapshot step will run synchronously"
+              fi
             fi
-          fi
+          }
           repo="${R2651_REPO:-}"
           outcome="${R2651_RUN_OUTCOME:-}"
           watcher_stop="${R2651_WATCHER_STOP:-}"
@@ -437,6 +452,14 @@ jobs:
             # a switch in a later run.
             rm -f "$HOME/.config/opencode/quota-429-evidence.json" \
                   "$HOME/.config/opencode/quota-429-streaks.json" 2>/dev/null || true
+          fi
+          # R2766: non-quota rounds have no rollover write below, so they keep
+          # the R2742 early launch. Quota rounds defer it to right after
+          # egress_retry_policy/write-rollover-requests.sh. Starting after the
+          # healthy-reset block above also makes the request/evidence deletions
+          # of a recovered round part of the snapshot instead of racing it.
+          if [ "$egress_only" != "true" ]; then
+            start_snapshot
           fi
           egress_retry_policy() {
             local cur next delay q429 rollover_out rollover_triggered
@@ -581,6 +604,9 @@ jobs:
             # 会带 success=true/false；egress watcher 停止按无成功处理。
             if [ "$egress_only" = "true" ]; then
               egress_retry_policy
+              # R2766: the rollover request/counters are now on disk; only now
+              # may the snapshot capture $HOME (see start_snapshot comment).
+              start_snapshot
               echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -663,6 +689,9 @@ jobs:
             fi
             if [ "$egress_only" = "true" ]; then
               egress_retry_policy
+              # R2766: the rollover request/counters are now on disk; only now
+              # may the snapshot capture $HOME (see start_snapshot comment).
+              start_snapshot
               echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -704,6 +733,9 @@ jobs:
             gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
             echo "::notice::unexpected outcome=$outcome; paused the loop and suppressing relay"
           fi
+          # R2766: catch-all for deferred quota paths that never reach an
+          # early exit (e.g. outcome=success with quota evidence). Idempotent.
+          start_snapshot
           echo "allow_relay=$allow" >> "$GITHUB_OUTPUT"
 
       - name: Relay next run
@@ -718,6 +750,10 @@ jobs:
           R2651_REPO: ${{ github.repository }}
           R2651_RUN_OUTCOME: ${{ steps.run_opencode.outcome }}
           R2651_RELAY_DELAY: ${{ steps.failure_guard.outputs.relay_delay }}
+          R2651_RESTORE_OUTCOME: ${{ steps.restore_ws.outcome }}
+          R2651_RECOVERY: ${{ github.event.inputs.recovery }}
+          SPLIT_SIZE: ${{ inputs.split_size }}
+          ROLLOVER_ON_429: ${{ vars.ROLLOVER_ON_429 || '1' }}
         run: |
           set +e
           repo="${R2651_REPO:-}"
@@ -726,6 +762,65 @@ jobs:
             echo "relayed=false" >> "$GITHUB_OUTPUT"
             echo "::notice::CI_LOOP_PAUSED=true (live); operator stopped the loop, suppressing relay"
             exit 0
+          fi
+          # R2766 (operator: "为什么429换会话不会自动触发了"): even after the
+          # writer/snapshot ordering fix, the successor restores the env-sync
+          # branch at boot. If we dispatch before the run-end snapshot has
+          # pushed, it clones the PREVIOUS branch tip and the request is gone
+          # (2026-11-17 10:46: relay at :10, old run's push at :25 → successor
+          # restored the 10:44 branch; no automatic switch). Wait for the
+          # snapshot only while a request the bridge can actually consume is
+          # pending; waiting/orphan requests must not add this tail to every
+          # round (same gate as select-egress/run-opencode).
+          . "$GITHUB_WORKSPACE/.github/scripts/rollover-pending.sh"
+          rollover_pending=0
+          if [ -d "$HOME/.config/opencode/rollover-requests" ]; then
+            while IFS= read -r _rf; do
+              if rollover_request_actionable "$_rf"; then
+                rollover_pending=1
+                break
+              fi
+            done < <(find "$HOME/.config/opencode/rollover-requests" -maxdepth 1 -name 'ses_*.json' -mmin -1440 2>/dev/null)
+          fi
+          if [ "$rollover_pending" = 1 ]; then
+            pidf="$RUNNER_TEMP/snapshot-env.pid"
+            if [ -f "$pidf" ]; then
+              pid=$(cat "$pidf" 2>/dev/null || true)
+              waited=0
+              while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 300 ]; do
+                sleep 1
+                waited=$((waited + 1))
+              done
+              if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                echo "::warning::actionable rollover request pending but the run-end snapshot is still running after ${waited}s; the successor may restore an env without the request"
+              else
+                rc=$(cat "$RUNNER_TEMP/snapshot-env.rc" 2>/dev/null || echo missing)
+                [ -f "$RUNNER_TEMP/snapshot-env.log" ] && tail -8 "$RUNNER_TEMP/snapshot-env.log" | sed 's/^/  snapshot: /'
+                echo "actionable rollover request pending; waited ${waited}s for the run-end snapshot to become durable (rc=$rc)"
+                if [ "$rc" != 0 ]; then
+                  echo "::warning::run-end snapshot rc=$rc; the rollover request is not durably stored"
+                fi
+              fi
+            elif [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "1" ]; then
+              # R2742 anticipated the runner killing the background job between
+              # steps. If that happened on a round with a pending rollover, run
+              # the snapshot synchronously here (the dedicated step is after
+              # relay and would be too late). The `synced` marker makes that
+              # step reuse this result instead of pushing a second, later
+              # generation that could clobber the successor's boot snapshot.
+              echo "::warning::actionable rollover request pending but no parallel run-end snapshot; running the snapshot synchronously before relay"
+              snap_log="$RUNNER_TEMP/snapshot-env.log"
+              bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh" >"$snap_log" 2>&1
+              snap_rc=$?
+              tail -8 "$snap_log" | sed 's/^/  snapshot: /'
+              echo "$snap_rc" > "$RUNNER_TEMP/snapshot-env.rc"
+              : > "$RUNNER_TEMP/snapshot-env.synced"
+              if [ "$snap_rc" != 0 ]; then
+                echo "::warning::synchronous rollover snapshot rc=$snap_rc; the request is not durably stored"
+              fi
+            else
+              echo "::warning::actionable rollover request pending but no snapshot was taken this round (restore=${R2651_RESTORE_OUTCOME:-?} recovery=${R2651_RECOVERY:-0}); the successor may restore an env without the request"
+            fi
           fi
           echo "Relaying next run (run_opencode outcome=${R2651_RUN_OUTCOME})."
           relay_delay="${R2651_RELAY_DELAY:-}"
@@ -1092,6 +1187,14 @@ jobs:
         env:
           SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
+          # R2766: the relay step takes the snapshot synchronously when a
+          # rollover request is pending and the background job disappeared.
+          # Reuse that result; pushing a second generation after the successor
+          # boots could overwrite its boot snapshot with stale state.
+          if [ -f "$RUNNER_TEMP/snapshot-env.synced" ]; then
+            [ -f "$RUNNER_TEMP/snapshot-env.log" ] && cat "$RUNNER_TEMP/snapshot-env.log"
+            exit "$(cat "$RUNNER_TEMP/snapshot-env.rc" 2>/dev/null || echo 1)"
+          fi
           # R2742: normally the snapshot is already running from the policy
           # step. Wait for it, replay its log, and keep its exit status so a
           # snapshot failure still fails this step. A missing log/status means
