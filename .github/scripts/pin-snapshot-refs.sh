@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# R2763（运营者：「继续」后确认执行）— pin native snapshot commits.
+# R2763（运营者：「继续」后确认执行）— pin native snapshot objects.
 #
 # 背景：~/.local/share/opencode/snapshot/<project>/<worktree>/ 是 native
-# snapshot 的 gitdir。会话消息里的 snapshot.start/end 记录了 commit，但 gitdir
-# 的 refs/ 可能是空的（跨 run 还原后只剩 objects）。这些 commit 全部不可达，
-# 一旦 opencode/宿主对该 gitdir 跑 `git gc`，文件历史就会被剪掉（实测：
-# 当前仓库 518 个引用 commit 中 21 个已缺失）。
+# snapshot 的 gitdir。会话消息里的 snapshot.start/end 记录的是 **tree** 哈希
+# （git write-tree 的结果，不是 commit），而 gitdir 的 refs/ 通常是空的（跨
+# run 还原后只剩 objects）。没有 ref 指向的 tree 不可达，一旦 opencode/宿主对
+# 该 gitdir 跑 `git gc`，文件历史就会被剪掉（实测：当前仓库 518 个引用对象中
+# 21 个已缺失）。
 #
-# 本脚本只做一件事：把 DB 里仍然被引用的 commit 挂到 refs/opencode/<hash>，
-# 让它们可达。只增 ref，不删对象、不改工作区、不碰 opencode 自己的 ref。重复
-# 运行是幂等的；对象已缺失的 hash 直接跳过。任何失败都只告警，不影响启动。
+# 本脚本只做一件事：把 DB 里仍然被引用的 tree（以及历史版本可能出现的 commit）
+# 挂到 refs/opencode/<hash>，让它们及其子对象可达。git 允许 ref 直接指向 tree，
+# gc 会按普通可达性保留。只增 ref，不删对象、不改工作区、不碰 opencode 自己
+# 的 ref。重复运行是幂等的；对象已缺失的 hash 直接跳过。任何失败都只告警，
+# 不影响启动。
 set -uo pipefail
 SNAP_ROOT="${SNAP_ROOT:-$HOME/.local/share/opencode/snapshot}"
 DB="${DB:-$HOME/.local/share/opencode/opencode.db}"
@@ -87,7 +90,8 @@ for gdir in gitdirs:
     present = []
     for line in probe.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1] == "commit":
+        # native snapshot 的值是 tree；兼容早期/未来可能写入的 commit。
+        if len(parts) == 2 and parts[1] in ("tree", "commit"):
             present.append(parts[0])
     if not present:
         continue
@@ -108,6 +112,7 @@ for gdir in gitdirs:
         print(f"::warning::snapshot pins: {gdir}: update-ref rc={run.returncode}: {run.stderr.strip()[:200]}")
         continue
     pinned += len(present)
-    print(f"snapshot pins: {project}/{worktree} += {len(present)} ref(s)")
-print(f"snapshot pins: {pinned} ref(s) across {len(gitdirs)} gitdir(s), {len(ordered)} referenced commit(s)")
+    label = os.path.relpath(gdir, root)
+    print(f"snapshot pins: {label} += {len(present)} ref(s)")
+print(f"snapshot pins: {pinned} ref(s) across {len(gitdirs)} gitdir(s), {len(ordered)} referenced object(s)")
 PY
