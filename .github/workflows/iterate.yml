@@ -361,7 +361,11 @@ jobs:
           start_snapshot() {
             [ "$snapshot_started" = 1 ] && return 0
             snapshot_started=1
-            if [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "1" ]; then
+            # R2766: R2651_RECOVERY is the raw dispatch string ("true"/"false"),
+            # not the '1'/'0' CI_RECOVERY normalization. The old `!= "1"` test
+            # was always true, so a recovery round still launched the background
+            # snapshot and pushed the temporary env it is supposed to discard.
+            if [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "true" ]; then
               if bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"; then
                 rm -f "$RUNNER_TEMP/snapshot-env.rc"
                 (
@@ -783,6 +787,23 @@ jobs:
             done < <(find "$HOME/.config/opencode/rollover-requests" -maxdepth 1 -name 'ses_*.json' -mmin -1440 2>/dev/null)
           fi
           if [ "$rollover_pending" = 1 ]; then
+            # R2766: one shared fallback for "no background snapshot" and for
+            # "pid file exists but the runner killed the job before it wrote a
+            # status". Both must persist the request before relay; the `synced`
+            # marker keeps the later Snapshot step from pushing a second
+            # generation over the successor's boot snapshot.
+            run_sync_snapshot() {
+              echo "::warning::actionable rollover request pending but no completed run-end snapshot; running the snapshot synchronously before relay"
+              snap_log="$RUNNER_TEMP/snapshot-env.log"
+              bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh" >"$snap_log" 2>&1
+              snap_rc=$?
+              tail -8 "$snap_log" | sed 's/^/  snapshot: /'
+              echo "$snap_rc" > "$RUNNER_TEMP/snapshot-env.rc"
+              : > "$RUNNER_TEMP/snapshot-env.synced"
+              if [ "$snap_rc" != 0 ]; then
+                echo "::warning::synchronous rollover snapshot rc=$snap_rc; the request is not durably stored"
+              fi
+            }
             pidf="$RUNNER_TEMP/snapshot-env.pid"
             if [ -f "$pidf" ]; then
               pid=$(cat "$pidf" 2>/dev/null || true)
@@ -796,28 +817,17 @@ jobs:
               else
                 rc=$(cat "$RUNNER_TEMP/snapshot-env.rc" 2>/dev/null || echo missing)
                 [ -f "$RUNNER_TEMP/snapshot-env.log" ] && tail -8 "$RUNNER_TEMP/snapshot-env.log" | sed 's/^/  snapshot: /'
-                echo "actionable rollover request pending; waited ${waited}s for the run-end snapshot to become durable (rc=$rc)"
-                if [ "$rc" != 0 ]; then
-                  echo "::warning::run-end snapshot rc=$rc; the rollover request is not durably stored"
+                if [ "$rc" = "missing" ]; then
+                  run_sync_snapshot
+                else
+                  echo "actionable rollover request pending; waited ${waited}s for the run-end snapshot to become durable (rc=$rc)"
+                  if [ "$rc" != 0 ]; then
+                    echo "::warning::run-end snapshot rc=$rc; the rollover request is not durably stored"
+                  fi
                 fi
               fi
-            elif [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "1" ]; then
-              # R2742 anticipated the runner killing the background job between
-              # steps. If that happened on a round with a pending rollover, run
-              # the snapshot synchronously here (the dedicated step is after
-              # relay and would be too late). The `synced` marker makes that
-              # step reuse this result instead of pushing a second, later
-              # generation that could clobber the successor's boot snapshot.
-              echo "::warning::actionable rollover request pending but no parallel run-end snapshot; running the snapshot synchronously before relay"
-              snap_log="$RUNNER_TEMP/snapshot-env.log"
-              bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh" >"$snap_log" 2>&1
-              snap_rc=$?
-              tail -8 "$snap_log" | sed 's/^/  snapshot: /'
-              echo "$snap_rc" > "$RUNNER_TEMP/snapshot-env.rc"
-              : > "$RUNNER_TEMP/snapshot-env.synced"
-              if [ "$snap_rc" != 0 ]; then
-                echo "::warning::synchronous rollover snapshot rc=$snap_rc; the request is not durably stored"
-              fi
+            elif [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "true" ]; then
+              run_sync_snapshot
             else
               echo "::warning::actionable rollover request pending but no snapshot was taken this round (restore=${R2651_RESTORE_OUTCOME:-?} recovery=${R2651_RECOVERY:-0}); the successor may restore an env without the request"
             fi
