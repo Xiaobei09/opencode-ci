@@ -12,6 +12,17 @@
 # as a bound session has 429 evidence this round (streak >= 1); after writing the
 # request reset that session's streak to 0. Still one request per round — the
 # earliest first-429 session wins, the rest wait for later rounds.
+# R2769 (operator: "多个会话都429-下一轮直接给最先429的换；只有一个会话429，
+# 等计数器到1时的新一轮换"):
+#   * multiple sessions with fresh 429 evidence: switch the earliest first-429
+#     session directly (no counter wait); the request is durable and the bridge
+#     consumes it at the start of the next round;
+#   * exactly one session: wait until the 429 counter (CI_429_STREAK, passed in
+#     as ROLLOVER_429_COUNTER after this round's increment) reaches 1; then the
+#     same next-round switch happens. This also covers a lone 429 in a round
+#     that otherwise produced healthy turns.
+# The caller now evaluates this script on ANY round with fresh evidence, not
+# only on egress-only quota rounds, so the evidence is not deleted first.
 #
 # The request lives under $HOME/.config/opencode so the environment snapshot
 # (env-sync / release pack) carries it across the CI restart. It is intentionally
@@ -22,6 +33,7 @@
 #        QUOTA_429_EVIDENCE_PATH  (default $HOME/.config/opencode/quota-429-evidence.json)
 #        QUOTA_429_STREAKS_PATH   (default $HOME/.config/opencode/quota-429-streaks.json)
 #        GITHUB_RUN_ID            current run (evidence freshness)
+#        ROLLOVER_429_COUNTER     post-increment 429 counter (single-session gate)
 #        ROLLOVER_ON_429=0        disables writing entirely
 set +eu
 
@@ -120,15 +132,44 @@ while IFS= read -r sid; do
   fi
 done <<< "$SIDS"
 
-# R2700: streak >= 1 switches. Earliest first-429 wins; sid is only a
-# deterministic tie-break. Exactly one request per invocation even when several
-# sessions have 429 evidence this round.
-CHOSEN=$(printf '%s' "$NEW" | jq -r '
+# R2700/R2769: streak >= 1 means the session has fresh 429 evidence. Order by
+# the earliest first-429 (sid only as a deterministic tie-break). Exactly one
+# request per invocation even when several sessions have 429 evidence.
+CANDIDATES=$(printf '%s' "$NEW" | jq -c '
   [ .sessions | to_entries[]
     | select((.value.streak | type) == "number" and .value.streak >= 1)
     | select((.value.first429At | type) == "number" and .value.first429At > 0)
     | {sid: .key, first: .value.first429At} ]
-  | sort_by([.first, .sid]) | .[0].sid // empty' 2>/dev/null || true)
+  | sort_by([.first, .sid])' 2>/dev/null || true)
+[ -n "$CANDIDATES" ] || CANDIDATES='[]'
+CANDIDATE_N=$(printf '%s' "$CANDIDATES" | jq -r 'length' 2>/dev/null || echo 0)
+case "$CANDIDATE_N" in ''|*[!0-9]*) CANDIDATE_N=0 ;; esac
+
+COUNTER="${ROLLOVER_429_COUNTER:-0}"
+case "$COUNTER" in ''|*[!0-9]*) COUNTER=0 ;; esac
+
+MODE=none
+CHOSEN=""
+if [ "$CANDIDATE_N" -ge 2 ]; then
+  # R2769: multiple sessions 429'd — switch the earliest one directly; the
+  # request is consumed at the start of the next round.
+  MODE=multi
+  CHOSEN=$(printf '%s' "$CANDIDATES" | jq -r '.[0].sid // empty' 2>/dev/null || true)
+  [ -n "$CHOSEN" ] && echo "rollover: ${CANDIDATE_N} sessions with fresh 429 evidence; switching the earliest directly (next round)"
+elif [ "$CANDIDATE_N" -eq 1 ]; then
+  MODE=single
+  # R2769: a lone 429 session waits for the 429 counter to reach 1. The caller
+  # passes the post-increment value, so the first counted round qualifies and
+  # the request is consumed in the new round.
+  if [ "$COUNTER" -ge 1 ]; then
+    CHOSEN=$(printf '%s' "$CANDIDATES" | jq -r '.[0].sid // empty' 2>/dev/null || true)
+    [ -n "$CHOSEN" ] && echo "rollover: single 429 session; counter=$COUNTER/1 reached, switching in the new round"
+  else
+    echo "rollover: single 429 session; waiting for the counter ($COUNTER/1)"
+  fi
+fi
+echo "rollover_candidates=$CANDIDATE_N"
+echo "rollover_mode=$MODE"
 
 TRIGGERED=0
 if [ -n "$CHOSEN" ]; then
@@ -171,6 +212,10 @@ fi
 if [ "$TRIGGERED" = "1" ]; then
   echo "rollover_triggered=1"
 else
-  echo "rollover: no session with 429 evidence this round; nothing to switch"
+  if [ "$CANDIDATE_N" -gt 0 ]; then
+    echo "rollover: $CANDIDATE_N session(s) with 429 evidence but no switch this round (mode=$MODE)"
+  else
+    echo "rollover: no session with 429 evidence this round; nothing to switch"
+  fi
   echo "rollover_triggered=0"
 fi

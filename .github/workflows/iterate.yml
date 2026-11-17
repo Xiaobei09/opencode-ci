@@ -447,22 +447,69 @@ jobs:
           if [ "$egress_only" = "true" ] && [ "$low200" = "true" ]; then
             echo "::notice::quota round produced only ${round_200_count} healthy turn(s) (<10); applying egress-only retry/rollover policy"
           fi
+          # R2769 (operator: "多个会话都429-下一轮直接给最先429的换；只有一个
+          # 会话429，等计数器到1时的新一轮换"): durable per-session 429 evidence
+          # is evaluated on every non-egress-only round that has it — including
+          # rounds that also produced healthy turns. The writer applies the
+          # policy in one place: multiple 429 sessions switch the earliest one
+          # directly; exactly one session waits until the 429 counter reaches 1.
+          # The request is durable, so the bridge consumes it at the start of
+          # the next round. Egress-only quota rounds use the same helper from
+          # egress_retry_policy() below.
+          ROLLOVER_Q429=0
+          ROLLOVER_TRIGGERED=false
+          ROLLOVER_CANDIDATES=0
+          rollover_policy() {
+            local reason="$1" cur out n mode
+            cur=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo 0)
+            case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+            # The caller passes the post-increment counter so a lone 429 can
+            # qualify in the round that counts it and switch in the new round.
+            ROLLOVER_Q429=$((cur + 1))
+            out=$(ROLLOVER_429_COUNTER="$ROLLOVER_Q429" \
+              bash "$GITHUB_WORKSPACE/.github/scripts/write-rollover-requests.sh" "$reason" 2>&1 || true)
+            [ -n "$out" ] && printf '%s\n' "$out"
+            ROLLOVER_TRIGGERED=false
+            printf '%s\n' "$out" | grep -qx 'rollover_triggered=1' && ROLLOVER_TRIGGERED=true
+            n=$(printf '%s\n' "$out" | sed -n 's/^rollover_candidates=//p' | tail -1)
+            case "$n" in ''|*[!0-9]*) n=0 ;; esac
+            ROLLOVER_CANDIDATES="$n"
+            mode=$(printf '%s\n' "$out" | sed -n 's/^rollover_mode=//p' | tail -1)
+            if [ "$n" -gt 0 ]; then
+              if [ "$ROLLOVER_TRIGGERED" = "true" ]; then
+                ROLLOVER_Q429=0
+                echo "::notice::429 rollover queued for the earliest-429 session (${mode:-single}, candidates=$n); CI_429_STREAK reset to 0"
+              fi
+              gh variable set CI_429_STREAK --body "$ROLLOVER_Q429" --repo "$repo" >/dev/null 2>&1 || true
+            fi
+          }
+          # Evaluate before the healthy-reset block below deletes evidence.
+          if [ "$egress_only" != "true" ] \
+             && [ -s "$HOME/.config/opencode/quota-429-evidence.json" ]; then
+            rollover_policy "rollover-round"
+          fi
           # A healthy turn proves the egress works; clear the egress retry and
           # consecutive-429 streaks. R2655: a low-200 quota round is NOT healthy,
-          # even if it had a few 200s before the quota ran out.
+          # even if it had a few 200s before the quota ran out. R2769: a lone 429
+          # in a healthy round is still real; keep its evidence/request so the
+          # queued switch survives into the new round.
           if [ "$egress_only" != "true" ] \
              && { [ -f "$RUNNER_TEMP/round-had-success" ] || [ "$round_success" = "true" ]; }; then
             gh variable set CI_EGRESS_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
-            gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
-            # R2649: quota recovered before any rollover was consumed (or the
-            # bridge never got to it). Drop pending requests so a later run
-            # cannot unexpectedly switch sessions days after the 429 streak.
-            rm -f "$HOME/.config/opencode/rollover-requests/"*.json 2>/dev/null || true
-            # R2675: a healthy turn ends the quota sequence. Drop the durable
-            # per-session 429 evidence/counters so an old 429 can never trigger
-            # a switch in a later run.
-            rm -f "$HOME/.config/opencode/quota-429-evidence.json" \
-                  "$HOME/.config/opencode/quota-429-streaks.json" 2>/dev/null || true
+            if [ "$ROLLOVER_CANDIDATES" -eq 0 ]; then
+              gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+              # R2649: quota recovered before any rollover was consumed (or the
+              # bridge never got to it). Drop pending requests so a later run
+              # cannot unexpectedly switch sessions days after the 429 streak.
+              rm -f "$HOME/.config/opencode/rollover-requests/"*.json 2>/dev/null || true
+              # R2675: a healthy turn ends the quota sequence. Drop the durable
+              # per-session 429 evidence/counters so an old 429 can never trigger
+              # a switch in a later run.
+              rm -f "$HOME/.config/opencode/quota-429-evidence.json" \
+                    "$HOME/.config/opencode/quota-429-streaks.json" 2>/dev/null || true
+            else
+              echo "::notice::healthy round: kept 429 evidence for $ROLLOVER_CANDIDATES session(s); switch waits for the new round"
+            fi
           fi
           # R2766: non-quota rounds have no rollover write below, so they keep
           # the R2742 early launch. Quota rounds defer it to right after
@@ -473,7 +520,7 @@ jobs:
             start_snapshot
           fi
           egress_retry_policy() {
-            local cur next delay q429 rollover_out rollover_triggered
+            local cur next delay q429
             # R2728/R2729/R2732: quota evidence still marks the provider-429
             # card, but every round-end/stop notice now follows the per-Bot
             # switches (operator: "ci结束/开始/tg限流这些全局信息的开关").
@@ -496,27 +543,27 @@ jobs:
               gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
               q429=0
             else
-              # R2675/R2700 (operator: "没有429的会话不需要换会话，多条会话同时
-              # 429时只换先429（时间戳）的那个；改成1就换会话，重置为0"): maintain
-              # the per-session counters on EVERY quota round. The writer reads
-              # auto-continue's durable evidence (full session ids) and writes at
-              # most ONE request: the earliest first-429 session with streak>=1.
-              # Sessions with no 429 evidence in this run are never requested.
-              rollover_out=$(bash "$GITHUB_WORKSPACE/.github/scripts/write-rollover-requests.sh" "quota-round" 2>&1 || true)
-              [ -n "$rollover_out" ] && printf '%s\n' "$rollover_out"
-              rollover_triggered=false
-              printf '%s\n' "$rollover_out" | grep -qx 'rollover_triggered=1' && rollover_triggered=true
-              q429=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo 0)
-              case "$q429" in ''|*[!0-9]*) q429=0 ;; esac
-              q429=$((q429 + 1))
-              if [ "$rollover_triggered" = "true" ]; then
+              # R2675/R2700/R2769 (operator: "没有429的会话不需要换会话，多条
+              # 会话同时429时只换先429（时间戳）的那个；改成1就换会话，重置为0" /
+              # "多个会话都429-下一轮直接给最先429的换；只有一个会话429，等计数器
+              # 到1时的新一轮换"): maintain the per-session counters on EVERY
+              # quota round. The shared rollover_policy() reads auto-continue's
+              # durable evidence (full session ids) and writes at most ONE
+              # request: multiple sessions -> earliest directly; exactly one ->
+              # after the 429 counter reaches 1. Sessions with no 429 evidence in
+              # this run are never requested.
+              rollover_policy "quota-round"
+              q429="$ROLLOVER_Q429"
+              if [ "$ROLLOVER_CANDIDATES" -eq 0 ]; then
+                # No session actually 429'd this run (e.g. a preflight quota
+                # failure): do not invent switch rounds.
+                q429=0
+                gh variable set CI_429_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
+              fi
+              if [ "$ROLLOVER_TRIGGERED" = "true" ]; then
                 # R2700 (operator: "重置为0"): reset the counter to 0 after one
                 # session switch; remaining 429 sessions switch on later rounds.
                 q429=0
-              fi
-              gh variable set CI_429_STREAK --body "$q429" --repo "$repo" >/dev/null 2>&1 || true
-              if [ "$rollover_triggered" = "true" ]; then
-                echo "::notice::429 rollover queued for the earliest-429 session; CI_429_STREAK reset to 0"
               fi
               # R2641/R2642 (operator: "没有200的429才计算进连续3轮，并且要求所有bot
               # 对应的会话都不是活跃（错误/停止）的时候才停" / "只有在输出才算
