@@ -187,5 +187,33 @@ run quota
 ck "R2731: 非法 notifyBot 回退默认 bot6" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
 ck "R2731: 非法 notifyBot 不越级到主 Bot" "$(! grep -q '111:primary-token' "$LOG" && echo yes)"
 
+# R2732: jq-less fallback. The old "tg-bot${bot}.env" guess turned the current
+# id style into "tg-botbot6.env"; a runner without jq could not load any
+# non-primary Bot and every notice silently fell back to primary.
+NOJQ="$TD/nojq"
+mkdir -p "$NOJQ"
+for c in cat sed head tail tr cut grep mktemp rm sleep bash; do
+  ln -s "$(command -v "$c")" "$NOJQ/$c"
+done
+cp "$TD/bin/curl" "$NOJQ/curl"
+setops '{"bots":{"bot6":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"bot6":{"in":200,"seen":300}}'
+: > "$LOG"
+out=$(printf 'normal\n' | PATH="$NOJQ" TG_NOTIFY_NO_SLEEP=1 TG_NOTIFY_MAX_ATTEMPTS=1 \
+  TG_NOTIFY_PREFERRED_ATTEMPTS=1 bash "$SCRIPT" round-end 2>&1)
+rc=$?
+ck "R2732: 无 jq 时仍能按 bot6 的 envFile 兜底加载 token" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+ck "R2732: 无 jq 时不会把 bot6 拼成 tg-botbot6.env" "$(printf '%s' "$out" | grep -q 'missing token/chat' && echo no || echo yes)"
+ck "R2732: 无 jq 时确实调用了 bot6 token" "$(grep -qx '666:bot6-token' "$LOG" && echo yes)"
+
+# Legacy global off is parsed coarsely without jq and must still skip.
+setops '{"enabled":false}'
+: > "$LOG"
+out=$(printf 'normal\n' | PATH="$NOJQ" TG_NOTIFY_NO_SLEEP=1 TG_NOTIFY_MAX_ATTEMPTS=1 \
+  TG_NOTIFY_PREFERRED_ATTEMPTS=1 bash "$SCRIPT" round-end 2>&1)
+rc=$?
+ck "R2732: 无 jq 时旧全局关仍能主动跳过" "$(printf '%s' "$out" | grep -q 'all notice routes disabled' && [ "$rc" = 0 ] && echo yes)"
+ck "R2732: 无 jq 旧全局关不发请求" "$([ ! -s "$LOG" ] && echo yes)"
+
 echo "tg-notify: $([ "$fail" = 0 ] && echo PASS || echo FAIL) ($checks checks)"
 exit "$fail"

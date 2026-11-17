@@ -90,7 +90,19 @@ load_candidate() {
     if command -v jq >/dev/null 2>&1 && [ -s "$REG" ]; then
       envf=$(jq -r --arg id "$bot" '.bots[]? | select(.id == $id) | .envFile // empty' "$REG" 2>/dev/null | head -1)
     fi
-    [ -n "$envf" ] || envf="$CFG/tg-bot${bot}.env"
+    if [ -z "$envf" ]; then
+      # jq-less / registry-less fallback. R2732: the old single guess
+      # "tg-bot${bot}.env" produced "tg-botbot6.env" for the current id style
+      # ("bot6"), so a runner without jq could not load any non-primary Bot.
+      for cand in "$CFG/tg-${bot}.env" "$CFG/tg-bot${bot}.env" \
+                  "$CFG/${bot}.env" "${HOME:-/root}/.opencode/tg-${bot}.env"; do
+        if [ -f "$cand" ]; then
+          envf="$cand"
+          break
+        fi
+      done
+    fi
+    [ -n "$envf" ] || return 1
     case "$envf" in "~/"*) envf="${HOME:-/root}/${envf#\~/}" ;; esac
     [ -f "$envf" ] || return 1
     token=$(env_field "$envf" TG_BOT_TOKEN)
