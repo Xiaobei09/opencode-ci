@@ -550,11 +550,10 @@ jobs:
             # Keep the input single-line/short: it is quoted into the workflow
             # dispatch request and echoed into the recovery prompt.
             why=$(printf '%s' "$why" | tr '\n\r' '  ' | cut -c1-200)
-            out=$(gh workflow run iterate.yml \
+            out=$(gh workflow run iterate.yml --ref main --repo "$repo" \
               -f recovery=true \
               -f "recovery_reason=$why" \
-              -f "recovery_run=${GITHUB_RUN_ID:-}" \
-              --ref main --repo "$repo" 2>&1)
+              -f "recovery_run=${GITHUB_RUN_ID:-}" 2>&1)
             rc=$?
             if [ "$rc" != "0" ]; then
               echo "$out"
