@@ -161,6 +161,22 @@ else
   rm -f "$OUT"/records.tar.gz.* 2>/dev/null || true
 fi
 echo "snapshot timing: records pack $(( $(date +%s) - REC_T0 ))s, $(cat "$OUT"/records.tar.gz.* 2>/dev/null | wc -c) bytes"
+# R2752: the index written by the policy step is already stale by now — env-sync
+# and the records pack take seconds to tens of seconds, and a lingering writer
+# (measured: proxyip/.probe/china-*.log at +7s) can append in that window. Re-hash
+# the worktrees immediately before the carry decision/pack so the index matches
+# what the tar will carry; if the fp changed, the carry check below repacks.
+SAVE_IDX="$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"
+[ -f "$SAVE_IDX" ] || SAVE_IDX="$(dirname "$0")/save-workspace-snapshots.sh"
+if [ -f "$SAVE_IDX" ]; then
+  _reidx_t0=$(date +%s)
+  if bash -e "$SAVE_IDX" --refresh-fp >/tmp/target-reindex.log 2>&1; then
+    echo "target index fp refreshed before pack in $(( $(date +%s) - _reidx_t0 ))s"
+  else
+    echo "::warning::pre-pack target fp refresh failed; using the earlier index"
+  fi
+  sed 's/^/  reindex: /' /tmp/target-reindex.log 2>/dev/null
+fi
 TGT_FP=""; TGT_MODE=""
 IDX="$SESSIONS_DIR/workspace-snapshots/index.json"
 if [ -s "$IDX" ]; then

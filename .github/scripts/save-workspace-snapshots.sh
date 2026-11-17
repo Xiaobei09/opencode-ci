@@ -9,7 +9,22 @@ SNAP="$SESSIONS_DIR/workspace-snapshots"
 mkdir -p "$SNAP"
 INDEX="$SNAP/index.json"
 [ -f "$INDEX" ] || echo '{"snapshots": []}' > "$INDEX"
-echo "target snapshots: index=$INDEX"
+# R2752: one worktree fingerprint formula for both the normal index and the
+# pre-pack refresh. Keep in lockstep with restore-targets.sh (head+branch+
+# worktree, all .git dirs pruned; nested .git is rebuilt on restore).
+fp_of() {
+  local repo_dir="$1" commit="$2" branch="$3"
+  printf 'head=%s\nbranch=%s\nworktree=%s\n' "$commit" "$branch" \
+    "$(cd "$repo_dir" && find . -name .git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)" \
+    | sha256sum | cut -d' ' -f1
+}
+# R2752: --refresh-fp only re-hashes existing entries; snapshot-environment.sh
+# calls it right before packing so a file appended after the first index
+# (env-sync + the records pack can take tens of seconds) is hashed into the
+# same state the tar carries. No fetch/stash/mode changes here.
+REFRESH_FP=0
+[ "${1:-}" = "--refresh-fp" ] && REFRESH_FP=1
+echo "target snapshots: index=$INDEX$([ "$REFRESH_FP" = 1 ] && echo ' (refresh-fp)')"
 find "$SNAP" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
 shopt -s nullglob
 for target_dir in "$TARGETS_DIR"/*/; do
@@ -21,6 +36,23 @@ for target_dir in "$TARGETS_DIR"/*/; do
   [ -L "$repo_dir" ] && continue
   [ -d "$repo_dir/.git" ] || continue
   name=$(basename "$repo_dir")
+  if [ "$REFRESH_FP" = 1 ]; then
+    BRANCH=$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null || true)
+    COMMIT=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)
+    FP=$(fp_of "$repo_dir" "$COMMIT" "$BRANCH")
+    tmp=$(mktemp)
+    if jq --arg d "$name" --arg fp "$FP" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+         '(.snapshots[] | select(.dir == $d) | .fp) = $fp
+          | (.snapshots[] | select(.dir == $d) | .saved_at) = $at' \
+         "$INDEX" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$INDEX"
+      echo "target snapshot fp refreshed: dir=$name commit=${COMMIT:0:12} fp=${FP:0:12}"
+    else
+      rm -f "$tmp"
+      echo "::warning::could not refresh the fingerprint for $name"
+    fi
+    continue
+  fi
   snap_dir="$SNAP/$name"
   rm -rf "$snap_dir"
 
@@ -78,13 +110,10 @@ for target_dir in "$TARGETS_DIR"/*/; do
     printf '%s' "$NESTED" | jq -e 'type == "array"' >/dev/null 2>&1 || NESTED='[]'
   fi
 
-  FP=$( {
-    printf 'head=%s\n' "$COMMIT"
-    printf 'branch=%s\n' "$BRANCH"
-    # R2736: 指纹只看工作树；嵌套 .git 现在不随包走，若仍参与哈希，
-    # 还原侧重建后的 .git 会让每一轮 fp 都对不上。
-    printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -name .git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
-  } | sha256sum | cut -d' ' -f1 )
+  # R2736: the fingerprint only covers the working tree; nested .git is not
+  # part of the slim package and is rebuilt on restore, so hashing it would
+  # make every restore disagree with the index.
+  FP=$(fp_of "$repo_dir" "$COMMIT" "$BRANCH")
 
   ENTRY=$(jq -n \
     --arg repo "$REMOTE" \

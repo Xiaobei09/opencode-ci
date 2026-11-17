@@ -17,6 +17,10 @@ ENV_TAG="env"
 # 压缩格式按魔数判定；manifest 缺失 ⇒ 退回旧的无校验直解。
 # ROUND 44：同 env 读侧——主包不可用时改从保险 tag 'env-safe' 还原，避免撕裂包铺半套/空 targets。
 FALLBACK_TAG="${SESSIONS_FALLBACK_TAG:-env-safe}"
+# R2752: remember the package that was actually applied so a stale index
+# fingerprint (see the check below) can be verified against the package
+# contents instead of failing the run. Set only after a successful extract.
+PKG_DIR=""; PKG_GLOB=""; PKG_TFLAG=""
 tgt_try() {
   local tag="$1" dl="/tmp/tgdl-$1" vols pages bytes expect hdr tflag
   rm -rf "$dl" && mkdir -p "$dl"
@@ -51,6 +55,7 @@ tgt_try() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$SESSIONS_DIR" $tflag 2>/dev/null; then
+    PKG_DIR="$dl"; PKG_GLOB="targets.tar.gz*"; PKG_TFLAG="$tflag"
     echo "target workspace package restored from '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified})"
     return 0
   fi
@@ -95,6 +100,7 @@ tgt_try_staged() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$SESSIONS_DIR" $tflag 2>/dev/null; then
+    PKG_DIR="$dl"; PKG_GLOB="stage-targets.tar.gz*"; PKG_TFLAG="$tflag"
     echo "target workspace package restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified})"
     return 0
   fi
@@ -108,6 +114,21 @@ elif tgt_try_staged "$ENV_TAG"; then
 elif [ "$FALLBACK_TAG" != "$ENV_TAG" ] && tgt_try "$FALLBACK_TAG"; then
   echo "::warning::primary targets package '$ENV_TAG' unusable; restored the insurance generation '$FALLBACK_TAG'"
 fi
+# R2752: the save side writes the index fingerprint in save-workspace-snapshots.sh,
+# then snapshot-environment.sh spends seconds to tens of seconds on env-sync and
+# the records pack before it tars the targets. A lingering writer can append in
+# that window (measured: proxyip/.probe/china-*.log at +7s), so the packed worktree
+# legitimately differs from the index. The package itself was size+sha verified
+# above; on an index mismatch compare the restored tree with the package and only
+# fail when the package disagrees (i.e. extraction really lost/changed files).
+pkg_cmp() {
+  local name="$1" vols
+  [ -n "$PKG_DIR" ] && [ -n "$PKG_GLOB" ] || return 1
+  vols=$(ls "$PKG_DIR"/$PKG_GLOB 2>/dev/null | sort -V)
+  [ -n "$vols" ] || return 1
+  cat $vols | tar ${PKG_TFLAG:+"$PKG_TFLAG"} --compare -f - -C "$TARGETS_DIR" "$name" \
+    >"/tmp/fp-pkg-$name.log" 2>&1
+}
 # ROUND 34 (D6): the target-workspace package is built at the END of a run, so right
 # after an aborted/cancelled run it is OLDER than the fresh clone of the sessions repo.
 # Extracting it above would then downgrade the *tracked* knowledge dirs in the working
@@ -244,6 +265,7 @@ echo "target slim restore timing: ${#SLIM_PIDS[@]} target(s) in $(( $(date +%s) 
 # 不匹配就 fail closed。Save 门控在 restore 成功上，因此坏工作树不会覆盖好快照。
 FP_OK=0
 FP_BAD=0
+FP_STALE=0
 while IFS=$'\t' read -r snap_name snap_fp snap_commit; do
   [ -n "$snap_name" ] || continue
   [ -n "$snap_fp" ] || continue
@@ -268,12 +290,28 @@ while IFS=$'\t' read -r snap_name snap_fp snap_commit; do
   if [ "$got" = "$snap_fp" ]; then
     FP_OK=$((FP_OK + 1))
     echo "target restore fingerprint ok: dir=$snap_name commit=${snap_commit:0:12} fp=${got:0:12}"
+  elif pkg_cmp "$snap_name"; then
+    # R2752: the tree matches the sha-verified package byte-for-byte; the
+    # index fp is stale because the worktree changed between indexing and
+    # packing. Not a restore failure — continue, but record the real fp so
+    # this run's save/repack writes a self-consistent index.
+    FP_STALE=$((FP_STALE + 1))
+    echo "::warning::target restore fingerprint stale: dir=$snap_name index=${snap_fp:0:12} packed=${got:0:12} (package contents verified; continuing)"
+    _tmp=$(mktemp "$INDEX.XXXXXX")
+    if jq --arg d "$snap_name" --arg fp "$got" \
+         '(.snapshots[] | select(.dir == $d) | .fp) = $fp' "$INDEX" > "$_tmp" 2>/dev/null; then
+      mv "$_tmp" "$INDEX"
+    else
+      rm -f "$_tmp"
+      echo "::warning::could not update the restored index fp for $snap_name"
+    fi
   else
     FP_BAD=$((FP_BAD + 1))
     echo "::warning::target restore fingerprint mismatch: dir=$snap_name want=${snap_fp:0:12} got=${got:0:12} (worktree incomplete or changed; refusing to run)"
+    [ -s "/tmp/fp-pkg-$snap_name.log" ] && tail -3 "/tmp/fp-pkg-$snap_name.log" | sed 's/^/  package compare: /'
   fi
 done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | [.dir, .fp // "", .commit // ""] | @tsv' "$INDEX" 2>/dev/null)
-echo "target restore fingerprint summary: ok=$FP_OK mismatch=$FP_BAD"
+echo "target restore fingerprint summary: ok=$FP_OK stale=$FP_STALE mismatch=$FP_BAD"
 if [ "$FP_BAD" -gt 0 ]; then
   exit 1
 fi

@@ -47,8 +47,12 @@ cat /tmp/restore-env.log 2>/dev/null
 echo "== install-toolchain.log =="
 cat /tmp/install-toolchain.log 2>/dev/null
 if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ] || [ "$rc_i" != 0 ]; then
+  # R2752: restore-targets.sh now tolerates a stale index fingerprint only
+  # after verifying the extracted tree against the sha-verified package, so a
+  # nonzero rc here is a real failure. Exiting 0 would mark the step success
+  # and let the save gate overwrite good snapshots with a partial tree.
   echo "::warning::parallel setup failed (targets rc=$rc_t env rc=$rc_e toolchain rc=$rc_i)"
-  exit 0
+  exit 1
 fi
 for p in "$HOME/.config/opencode"/*.json \
          "$HOME/.config/opencode"/*.env \
