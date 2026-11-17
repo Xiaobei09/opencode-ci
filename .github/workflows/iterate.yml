@@ -308,11 +308,34 @@ jobs:
           R2651_QUOTA_STOP: ${{ steps.run_opencode.outputs.egress_quota_stop }}
           R2651_ROUND_200_COUNT: ${{ steps.run_opencode.outputs.round_200_count }}
           R2651_BUDGET_TIMEOUT: ${{ steps.run_opencode.outputs.budget_timeout }}
+          SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
           set +e
           # R2576 (D9): start of the post-opencode phase; paired with
           # OPENCODE_START_T0 to report the non-opencode wall time at run end.
-          echo "POST_OPENCODE_T0=$(date +%s)" >> "$GITHUB_ENV"
+          post_t0=$(date +%s)
+          echo "POST_OPENCODE_T0=$post_t0" >> "$GITHUB_ENV"
+          # R2742 (operator: round gap under one minute): the run-end snapshot
+          # only needs OpenCode to have exited, but it used to start after the
+          # policy/relay/notify steps (~5s) — pure serial tail in the
+          # round-to-round gap. Start it here and let those steps overlap the
+          # 20-30s env-sync push. The dedicated steps below wait on this pid;
+          # if the runner killed the background job between steps, they fall
+          # back to the original synchronous run (worst case = old timing).
+          if [ "${R2651_RESTORE_OUTCOME:-}" = "success" ]; then
+            if bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"; then
+              rm -f "$RUNNER_TEMP/snapshot-env.rc"
+              (
+                export POST_OPENCODE_T0="$post_t0"
+                bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh"
+                echo $? > "$RUNNER_TEMP/snapshot-env.rc"
+              ) >"$RUNNER_TEMP/snapshot-env.log" 2>&1 &
+              echo $! > "$RUNNER_TEMP/snapshot-env.pid"
+              echo "run-end snapshot started in parallel with the relay/notify steps (pid $(cat "$RUNNER_TEMP/snapshot-env.pid"))"
+            else
+              echo "::warning::save-workspace-snapshots failed; the snapshot step will run synchronously"
+            fi
+          fi
           repo="${R2651_REPO:-}"
           outcome="${R2651_RUN_OUTCOME:-}"
           watcher_stop="${R2651_WATCHER_STOP:-}"
@@ -954,12 +977,36 @@ jobs:
         # R2513: smoke must NOT write the env release (it runs in a separate
         # concurrency group, so a save could race and overwrite production).
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
-        run: bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"
+        run: |
+          # R2742: already saved right before the parallel snapshot launch;
+          # only run here when that fast path did not happen.
+          if [ -f "$RUNNER_TEMP/snapshot-env.pid" ]; then
+            echo "workspace snapshot index already saved before the parallel snapshot launch"
+          else
+            bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"
+          fi
       - name: Snapshot environment to sessions repository
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         env:
           SPLIT_SIZE: ${{ inputs.split_size }}
-        run: bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh"
+        run: |
+          # R2742: normally the snapshot is already running from the policy
+          # step. Wait for it, replay its log, and keep its exit status so a
+          # snapshot failure still fails this step. A missing log/status means
+          # the background job was killed between steps: run it synchronously.
+          pidf="$RUNNER_TEMP/snapshot-env.pid"
+          if [ -f "$pidf" ]; then
+            pid=$(cat "$pidf" 2>/dev/null || true)
+            while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
+              sleep 1
+            done
+            [ -f "$RUNNER_TEMP/snapshot-env.log" ] && cat "$RUNNER_TEMP/snapshot-env.log"
+            if [ -f "$RUNNER_TEMP/snapshot-env.rc" ]; then
+              exit "$(cat "$RUNNER_TEMP/snapshot-env.rc")"
+            fi
+            echo "::warning::parallel run-end snapshot disappeared before writing a status; running it synchronously"
+          fi
+          bash -e "$GITHUB_WORKSPACE/.github/scripts/snapshot-environment.sh"
       - name: Rebuild repository baseline
         if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && inputs.reset_baseline
         run: bash -e "$GITHUB_WORKSPACE/.github/scripts/rebuild-baseline.sh"
