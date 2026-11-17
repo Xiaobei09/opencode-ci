@@ -270,7 +270,7 @@ while IFS=$'\t' read -r snap_name snap_fp snap_commit; do
     echo "target restore fingerprint ok: dir=$snap_name commit=${snap_commit:0:12} fp=${got:0:12}"
   else
     FP_BAD=$((FP_BAD + 1))
-    echo "::error::target restore fingerprint mismatch: dir=$snap_name want=${snap_fp:0:12} got=${got:0:12} (worktree incomplete or changed; refusing to run)"
+    echo "::warning::target restore fingerprint mismatch: dir=$snap_name want=${snap_fp:0:12} got=${got:0:12} (worktree incomplete or changed; refusing to run)"
   fi
 done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | [.dir, .fp // "", .commit // ""] | @tsv' "$INDEX" 2>/dev/null)
 echo "target restore fingerprint summary: ok=$FP_OK mismatch=$FP_BAD"
