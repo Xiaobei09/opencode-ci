@@ -784,3 +784,10 @@ if [ -d "$snap_root" ]; then
     fi
   done
 fi
+# R2763: DB 里 snapshot.start/end 引用的 commit 可能没有 ref（refs/ 为空），
+# 对 gitdir 跑 gc 就会把文件历史剪掉。启动前把它们挂到 refs/opencode/*，
+# 只增 ref、幂等；失败不阻塞启动。
+if [ -f "$GITHUB_WORKSPACE/.github/scripts/pin-snapshot-refs.sh" ]; then
+  bash "$GITHUB_WORKSPACE/.github/scripts/pin-snapshot-refs.sh" || \
+    echo "::warning::snapshot pins failed; native snapshot history may be pruned"
+fi
