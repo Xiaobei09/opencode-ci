@@ -118,15 +118,22 @@ echo "RESUME_ONCE_QUOTA_RECOVER=$QR_ENABLED" >> "$GITHUB_ENV"
 echo "R2626/R2665 quota-tail recover: prev=${PREV_UP:-none}/${PREV_EG:-?} new=${NEW_UP:-?}/${NEW_EG:-?} changed=$EGRESS_CHANGED mode=$QR_MODE enabled=$QR_ENABLED actionable_rollover=$ROLLOVER_PENDING"
 if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
   # R2734 (operator: "进一步精简提示，现在很多废话"): show the result the
-  # operator acts on — exit kind, egress IP, direct IP — not the local proxy
-  # address or raw key=value fields (the 🌐 出口代理 panel keeps full details).
+  # operator acts on — exit kind, egress IP, and (only when proxied) direct IP —
+  # not the local proxy address or raw key=value fields (the 🌐 出口代理 panel
+  # keeps full details).
   # R2520's "same keys as exitProxySummary()" no longer applies to this card.
   KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
   UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
   EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-  MSG="🌐 本轮代理：${KIND}"
+  # R2740 (operator: "继续精简提示，现在很多废话"): when the exit is direct,
+  # 出口 and 直连 are the same IP, so show it once. Only a proxied exit needs
+  # the separate direct IP for comparison.
+  MSG="🌐 ${KIND}"
   [ -n "$UP" ] && [ "$UP" != "$KIND" ] && MSG="$MSG (${UP})"
-  MSG="$MSG · 出口 ${EIP} · 直连 $(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+  MSG="$MSG · 出口 ${EIP}"
+  if [ "$KIND" != "direct" ]; then
+    MSG="$MSG · 直连 $(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+  fi
   # R2626: visible proof that this run may recover a pre-boot quota
   # tail once (only when the egress actually changed).
   [ "$QR_ENABLED" = "1" ] && MSG="$MSG · 额度尾恢复"

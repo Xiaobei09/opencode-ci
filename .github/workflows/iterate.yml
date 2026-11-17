@@ -722,29 +722,30 @@ jobs:
             # keyed by exit IP: fresh runner IPs still hit the same wall.
             reason="配额 429（免费额度耗尽）· 第 ${egress_n} 次${reset_hint:+ · 预计 ${reset_hint} 重置}"
           elif [ "$restore_failed" = "true" ]; then
-            reason="环境/工作区还原失败（快照未覆盖），已跳过 OpenCode"
+            reason="环境还原失败，已跳过 OpenCode"
           elif [ "$select_failed" = "true" ]; then
             reason="出口选择失败：${select_reason:-无候选出口}"
           elif [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
           elif [ "$outcome" = "success" ] && [ "$silent_exit" = "true" ]; then
-            reason="opencode 退出但本轮无健康回合（无 200），按失败计数"
+            reason="opencode 退出但本轮无健康回合（按失败计数）"
           elif [ "$outcome" = "success" ]; then
-            reason="opencode 正常结束（预算耗尽或正常收尾）"
+            reason="opencode 正常结束"
           elif [ "$outcome" = "failure" ] && [ "$healthy_failure" = "true" ]; then
-            reason="opencode 异常结束，但本轮有健康回合（200），失败计数已复位"
+            reason="opencode 异常结束（有健康回合，失败计数已复位）"
           elif [ "$outcome" = "failure" ]; then
-            reason="opencode 失败（outcome=failure），按失败计数"
+            reason="opencode 失败（按失败计数）"
           else
             reason="opencode 结束（outcome=${outcome:-unknown}）"
           fi
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           # R2700: quota rounds display the egress valve count (CI_EGRESS_STREAK),
           # not CI_429_STREAK — the latter resets to 0 on every session rollover.
+          quota_meta=""
           if [ "$egress_retry" = "true" ]; then
             roll=$(gh variable get CI_429_STREAK --repo "$repo" 2>/dev/null || echo "?")
-            streak="${egress_n:-?}/3 (额度轮)；会话换号 ${roll}/3"
+            quota_meta="额度轮 ${egress_n:-?}/3 · 换号 ${roll}/3"
           fi
           # R2587（D7）：结束通知必须带真实错误证据，而不只是 outcome。退出码
           # 与本次 Run OpenCode 抓到的最后一条错误（已去 ANSI/CR）一并附上。
@@ -760,19 +761,19 @@ jobs:
             [ -n "$err_src" ] || err_src=$(tail -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null || true)
             err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-300)
           fi
-          # R2734: keep the card short. A normal success needs only cause + run;
-          # outcome/exit and streak appear when they explain a failure or a
-          # quota retry (the title already says the round was relayed).
+          # R2740（运营者：「继续精简提示，现在很多废话」）：正常运行不写结果/streak，
+          # 只有失败或额度重试才补一行；run 用短号，完整 URL 留给 Actions。
           meta=""
-          if [ "$outcome" != "success" ]; then
-            meta="结果：${outcome}"
-            [ -n "$rc" ] && meta="$meta（exit=$rc）"
+          if [ "$outcome" = "failure" ]; then
+            meta="exit=${rc:-?}"
           fi
-          if [ "$outcome" != "success" ] || [ "$egress_retry" = "true" ] \
+          if [ -n "$quota_meta" ]; then
+            meta="${meta:+$meta · }${quota_meta}"
+          elif [ "$outcome" = "failure" ] || [ "$silent_exit" = "true" ] \
              || [ "$restore_failed" = "true" ] || [ "$select_failed" = "true" ]; then
-            meta="${meta:+$meta · }streak：${streak}"
+            meta="${meta:+$meta · }连续失败 ${streak}"
           fi
-          text=$(printf '🔄 CI 本轮结束 · 已接力\n原因：%s\nrun：%s' "$reason" "${R2651_RUN_URL}")
+          text=$(printf '🔄 CI 本轮结束 · 已接力\n原因：%s\nrun %s' "$reason" "${GITHUB_RUN_ID:-?}")
           [ -n "$meta" ] && text=$(printf '%s\n%s' "$text" "$meta")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
@@ -868,7 +869,7 @@ jobs:
           fi
           reason="本轮结束（outcome=$outcome）"
           if [ "$restore_failed" = "true" ]; then
-            reason="环境/工作区还原失败（快照未覆盖），已跳过 OpenCode"
+            reason="环境还原失败，已跳过 OpenCode"
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
               reason="$reason；连续失败 ${streak} 次，循环已暂停"
             elif [ "$relay_out" = "failure" ]; then
@@ -886,7 +887,7 @@ jobs:
               reason="$reason；未接力"
             fi
           elif [ "$quota_round_limit" = "true" ]; then
-            reason="连续 3 轮 429 且无健康回合（免费额度耗尽），循环已暂停"
+            reason="连续 3 轮 429，循环已暂停"
           elif [ "$watcher" = "true" ]; then
             wr=$(tr '\n' ' ' < "$RUNNER_TEMP/egress/stop" 2>/dev/null | cut -c1-300)
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
@@ -895,23 +896,22 @@ jobs:
               reason="watcher 结束本轮，但未接力（${wr:-未知}）"
             fi
           elif [ "$outcome" = "cancelled" ]; then
-            reason="本轮被取消（运营者停止，不自动接力）"
+            reason="已取消（不自动接力）"
           elif [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
             reason="连续失败 3 次，循环已暂停"
           elif [ "$relay_out" = "failure" ]; then
-            reason="接力失败：3 次 dispatch 均未成功，无后继 run"
+            reason="接力失败：3 次 dispatch 均未成功"
           elif [ "$paused" = "true" ]; then
-            reason="循环已暂停（运营者停止或达失败阈值），relay 已让路"
+            reason="已暂停（relay 让路）"
           fi
-          # R2734: concise stop card: cause + run, then only the relay/streak
-          # facts that matter. `pause` is redundant (the card means stopped).
-          meta="relay=${relay_out} · streak=${streak}"
-          if [ "$outcome" != "success" ]; then
-            detail="结果：${outcome}"
-            [ -n "$rc" ] && detail="$detail（exit=$rc）"
-            meta="$detail · $meta"
+          # R2740: stop card = cause + run; only a failure adds exit + streak.
+          # relay= is gone: relay failure/no-relay is already in the reason.
+          meta=""
+          if [ "$outcome" = "failure" ]; then
+            meta="exit=${rc:-?} · 连续失败 ${streak}"
           fi
-          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s' "$reason" "${R2651_RUN_URL}" "$meta")
+          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun %s' "$reason" "${GITHUB_RUN_ID:-?}")
+          [ -n "$meta" ] && text=$(printf '%s\n%s' "$text" "$meta")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
