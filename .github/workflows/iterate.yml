@@ -774,7 +774,10 @@ jobs:
           # 与本次 Run OpenCode 抓到的最后一条错误（已去 ANSI/CR）一并附上。
           rc="${R2651_EXIT_CODE:-}"
           err_line=""
-          if [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
+          # R2743（运营者：「进一步优化提示长度」）：配额轮的「最后错误」就是
+          # 原因行已经写明的 429（还带重置时间），重复后结束卡实测 426 字。
+          # 配额轮不再附错误行；其它失败保留证据，但压到 160 字。
+          if [ "$egress_retry" != "true" ] && [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
             # R2630: prefer a structured provider/OpenCode error over a bare
             # prose match ("HTTP 429" can appear in the agent's own report).
             # Then take the LAST such line, not the first: a quota round's
@@ -782,7 +785,7 @@ jobs:
             # trace and the "cause=" envelope so the card shows the message.
             err_src=$(grep -aiE 'level=ERROR|error target=opencode\.ai|idle_timeout|provider\.(transport|free-limit)|FreeUsageLimit|"type":"error"' "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null | tail -1 || true)
             [ -n "$err_src" ] || err_src=$(tail -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null || true)
-            err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-300)
+            err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-160)
           fi
           # R2740（运营者：「继续精简提示，现在很多废话」）：正常运行不写结果/streak，
           # 只有失败或额度重试才补一行；run 用短号，完整 URL 留给 Actions。
@@ -820,7 +823,7 @@ jobs:
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
                 if(action=="kept-round") label=label "（本轮未停）"
-                printf "429 探针：出口 %s · HTTP %s · %s", (cur==""?"?":cur), (code==""?"?":code), label
+                printf "429 探针：%s", label
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
@@ -878,9 +881,11 @@ jobs:
           fi
           paused=$(gh variable get CI_LOOP_PAUSED --repo "$repo" 2>/dev/null || echo "?")
           # R2587（D7）：停止卡同样带退出码与最后一条错误证据。
+          # R2743：因 3 轮 429 暂停时，原因行已写明额度耗尽，不再重复错误行；
+          # 其它停止原因保留证据（160 字上限）。
           rc="${R2651_EXIT_CODE:-}"
           err_line=""
-          if [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
+          if [ "$quota_round_limit" != "true" ] && [ -s "$RUNNER_TEMP/opencode-errors.txt" ]; then
             # R2630: prefer a structured provider/OpenCode error over a bare
             # prose match ("HTTP 429" can appear in the agent's own report).
             # Then take the LAST such line, not the first: a quota round's
@@ -888,7 +893,7 @@ jobs:
             # trace and the "cause=" envelope so the card shows the message.
             err_src=$(grep -aiE 'level=ERROR|error target=opencode\.ai|idle_timeout|provider\.(transport|free-limit)|FreeUsageLimit|"type":"error"' "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null | tail -1 || true)
             [ -n "$err_src" ] || err_src=$(tail -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null || true)
-            err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-300)
+            err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-160)
           fi
           reason="本轮结束（outcome=$outcome）"
           if [ "$restore_failed" = "true" ]; then
@@ -958,7 +963,7 @@ jobs:
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
                 if(action=="kept-round") label=label "（本轮未停）"
-                printf "429 探针：出口 %s · HTTP %s · %s", (cur==""?"?":cur), (code==""?"?":code), label
+                printf "429 探针：%s", label
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
