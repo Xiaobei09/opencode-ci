@@ -150,5 +150,19 @@ setledger '{"bot5":{"in":300,"seen":300}}'
 run quota
 ck "R2729: 旧全局关 + 单 Bot 显式开启时按该 Bot 推" "$(printf '%s' "$out" | grep -q 'via=bot5' && echo yes)"
 
+# R2731: ids from the ledger/switch file reach a file path and jq args; reject
+# anything outside the registry alphabet instead of trusting the JSON.
+setops '{"bots":{"bot6":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"../../evil":{"in":999,"seen":999},"bot6":{"in":100,"seen":100}}'
+run quota
+ck "R2731: 账本里的非法 bot id 不作为路由" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+ck "R2731: 非法 id 不产生请求" "$(! grep -q 'evil' "$LOG" && echo yes)"
+
+setops '{"bots":{"bot6":{"enabled":true}},"notifyBot":"../evil"}'
+setledger '{}'
+run quota
+ck "R2731: 非法 notifyBot 回退默认 bot6" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+ck "R2731: 非法 notifyBot 不越级到主 Bot" "$(! grep -q '111:primary-token' "$LOG" && echo yes)"
+
 echo "tg-notify: $([ "$fail" = 0 ] && echo PASS || echo FAIL) ($checks checks)"
 exit "$fail"

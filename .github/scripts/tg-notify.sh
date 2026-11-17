@@ -59,7 +59,13 @@ ops_bot_on() {
     [ "$v" = "false" ] && return 1
     return 0
   fi
-  # jq-less fallback: only the legacy global field is safe to read with grep.
+  # jq-less fallback: per-Bot JSON cannot be parsed safely with grep, and a
+  # coarse "any enabled:false" test would let one Bot's OFF suppress every
+  # route. Treat such a file as ON; only the legacy single-switch shape is
+  # read coarsely.
+  if grep -qE '"bots"[[:space:]]*:' "$OPS" 2>/dev/null; then
+    return 0
+  fi
   if grep -qE '"enabled"[[:space:]]*:[[:space:]]*false' "$OPS" 2>/dev/null; then
     return 1
   fi
@@ -146,10 +152,17 @@ send_via() {
 # Candidate order: only quota 429 notices are rerouted. Each candidate is then
 # checked against its own per-Bot switch in the send loop, so turning one Bot
 # off does not affect the others. Everything else keeps the primary Bot.
+# Bot ids end up in a file path (`tg-bot<id>.env`) and a jq argument, so reject
+# anything outside the registry's id alphabet before using it as a route.
+valid_bot() {
+  local bot="$1"
+  case "$bot" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+  [ "${#bot}" -le 32 ]
+}
 CANDIDATES=()
 add_candidate() {
   local bot="$1" c
-  [ -n "$bot" ] || return 0
+  valid_bot "$bot" || return 0
   for c in "${CANDIDATES[@]}"; do
     [ "$c" = "$bot" ] && return 0
   done
@@ -164,8 +177,10 @@ if [ "$notify_class" = "quota" ]; then
   configured="bot6"
   if command -v jq >/dev/null 2>&1 && [ -s "$OPS" ]; then
     configured=$(jq -r '.notifyBot // "bot6"' "$OPS" 2>/dev/null | head -1 || true)
-    [ -n "$configured" ] || configured="bot6"
   fi
+  # A hand-edited/invalid notifyBot falls back to the documented default rather
+  # than silently degrading to primary.
+  valid_bot "$configured" || configured="bot6"
   add_candidate "$configured"
 fi
 add_candidate "primary"
