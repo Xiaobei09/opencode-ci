@@ -103,6 +103,11 @@ find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null 
 # env-sync.sh.
 # R2738: the 17 Chromium probe profiles carry ~94MB of HTTP/GPU/code caches.
 # Cookies and Local Storage stay; only the regenerable rendering caches go.
+# R2739 (operator: "都做"): host runtime state (the managed-service registration
+# `service.json`, locks/pty) must not travel across runs — a stale registration
+# makes the new host fail its 5s self-check and restart (13:59 root cause).
+# Historical per-round probe snapshots and the mihomo test binary are also not
+# environment state; the current china_latest/china_clean_round files stay.
 if ! ( set -o pipefail
   "${TAR_COMP[@]}" -C "$HOME" \
   --exclude='./work' \
@@ -133,6 +138,12 @@ if ! ( set -o pipefail
   --exclude='*/optimization_guide_model_store/*' \
   --exclude='*/__pycache__' \
   --exclude='*/__pycache__/*' \
+  --exclude='./.local/state/opencode/service.json' \
+  --exclude='./.local/state/opencode/locks' \
+  --exclude='./.local/state/opencode/pty' \
+  --exclude='./.config/opencode/service.json' \
+  --exclude='./cnwatch/china_after_*.json' \
+  --exclude='./r72/mihomo' \
   . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." ); then
   echo "::error::environment package failed (tar/split returned nonzero); refusing to publish a partial env package (previous generation kept)"
   exit 1
@@ -233,6 +244,43 @@ upload_par() {
     || fail=1
   return "$fail"
 }
+# R2739 (operator: "都做"): publish in place instead of the stage-* double
+# upload. The stage copy uploaded every byte twice (measured ~4s at run end).
+# Runs are serialized by concurrency.group and meta.json (with per-file sha256)
+# is uploaded last, so a reader never overlaps the swap; if the job dies
+# mid-upload the old manifest points at mismatched bytes, the restore side
+# rejects it, and falls back to the env-sync branch / env-safe. Stale volumes
+# and any leftover stage-* assets are pruned only after a verified upload.
+prune_old_assets() {
+  local pat="$1"; shift
+  local new_names=" " f n
+  for f in "$@"; do new_names+="$(basename "$f") "; done
+  mapfile -t _old < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
+    | grep -E "$pat" || true)
+  local stale=()
+  for n in ${_old[@]+"${_old[@]}"}; do
+    case "$new_names" in *" $n "*) ;; *) stale+=("$n");; esac
+  done
+  for n in ${stale[@]+"${stale[@]}"}; do
+    gh release delete-asset "$ENV_TAG" "$n" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 &
+  done
+  wait
+}
+verify_uploaded() {
+  local js f n l r ok=1
+  js=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets 2>/dev/null) || return 1
+  for f in "$@"; do
+    n=$(basename "$f"); l=$(stat -c%s "$f")
+    r=$(printf '%s' "$js" | jq -r --arg n "$n" '.assets[] | select(.name==$n) | .size' 2>/dev/null)
+    if [ "$l" = "$r" ]; then
+      echo "uploaded ok $n = $l bytes"
+    else
+      ok=0
+      echo "::warning::uploaded size mismatch $n ($l vs ${r:-missing})"
+    fi
+  done
+  [ "$ok" = 1 ]
+}
 if ls "$OUT"/env.tar.gz.* >/dev/null 2>&1; then
   gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" >/dev/null 2>&1 \
     || gh release create "$ENV_TAG" --repo "$SESSIONS_REPO" --title "environment snapshot" \
@@ -250,56 +298,29 @@ if ls "$OUT"/env.tar.gz.* >/dev/null 2>&1; then
           targets:{volumes:$targets_volumes, bytes:$targets_bytes, sha256:$targets_sha, mode:$tgt_mode, fp:$tgt_fp}}
          | (if $rec_ok==1 then .records={volumes:$records_volumes, bytes:$records_bytes, sha256:$records_sha} else . end)' \
         > "$OUT/meta.json" 2>/dev/null
-  mkdir -p "$OUT/stage"
-  for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.* "$OUT/meta.json"; do
-    [ -f "$f" ] || continue
-    cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
+  UPF=()
+  for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.*; do
+    [ -f "$f" ] && UPF+=("$f")
   done
-  stage_ok=0
-  if upload_par "$OUT"/stage/* || gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-    stage_ok=1
-    for f in "$OUT"/stage/stage-*; do
-      n=$(basename "$f"); l=$(stat -c%s "$f")
-      r=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq ".assets[] | select(.name==\"$n\") | .size")
-      if [ "$l" = "$r" ]; then
-        echo "staged ok $n = $l bytes"
-      else
-        stage_ok=0
-        echo "::warning::staged size mismatch $n ($l vs $r)"
-      fi
-    done
-  else
-    echo "::warning::staged upload failed; the previous package is left untouched"
-  fi
-  if [ "$stage_ok" -eq 1 ]; then
-    mapfile -t DELOLD < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-      | grep -E '^(env|home|targets|records)\.tar\.gz(\.|$)|^meta\.json$' || true)
-    for a in ${DELOLD[@]+"${DELOLD[@]}"}; do
-      gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 &
-    done
-    wait
-    UPF=()
-    for f in "$OUT"/env.tar.gz.* "$OUT"/targets.tar.gz.* "$OUT"/records.tar.gz.*; do
-      [ -f "$f" ] && UPF+=("$f")
-    done
-    if upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-      if [ -s "$OUT/meta.json" ]; then
-        gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
-          || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
-      else
-        echo "::warning::failed to build meta.json (readers will fall back to unverified extract)"
-      fi
+  if [ "${#UPF[@]}" -gt 0 ] \
+     && { upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; } \
+     && verify_uploaded "${UPF[@]}"; then
+    meta_ok=1
+    if [ -s "$OUT/meta.json" ]; then
+      gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 || meta_ok=0
+    else
+      meta_ok=0
+    fi
+    if [ "$meta_ok" = 1 ]; then
+      prune_old_assets '^(env|home|targets|records)\.tar\.gz(\.|$)|^meta\.json$|^stage-' "${UPF[@]}" "$OUT/meta.json"
       echo "environment package uploaded: $ENV_N volume(s), $SZ bytes"
       echo "target workspace package uploaded: $TGT_N volume(s), $TZ bytes"
       echo "package manifest: split=$SPLIT_SIZE env=$ENV_N vol targets=$TGT_N vol"
     else
-      echo "::warning::failed to upload packages to release"
+      echo "::warning::assets uploaded but meta.json is missing; keeping the old manifest so readers reject the mixed set and fall back"
     fi
-    for f in "$OUT"/stage/stage-*; do
-      gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
-        && echo "staged copy removed: $(basename "$f")" &
-    done
-    wait
+  else
+    echo "::warning::failed to upload packages to release"
   fi
 elif [ "$SKIP_ENV_PACK" = 1 ] \
   && { [ "${CARRY:-0}" = 1 ] || ls "$OUT"/targets.tar.gz.* >/dev/null 2>&1; }; then
@@ -319,75 +340,38 @@ elif [ "$SKIP_ENV_PACK" = 1 ] \
         (if $rec_ok==1 then .records={volumes:$records_volumes, bytes:$records_bytes, sha256:$records_sha} else del(.records) end)' \
        "$OUT/meta.env-carry.json" > "$OUT/meta.json" 2>/dev/null \
     && [ -s "$OUT/meta.json" ] && jq -e '(.env.bytes // 0) > 0' "$OUT/meta.json" >/dev/null 2>&1; then
-    mkdir -p "$OUT/stage"
-    for f in "$OUT"/records.tar.gz.* "$OUT/meta.json"; do
-      [ -f "$f" ] || continue
-      cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
-    done
+    UPF=()
+    for f in "$OUT"/records.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
     if [ "${CARRY:-0}" != 1 ]; then
-      for f in "$OUT"/targets.tar.gz.*; do
-        [ -f "$f" ] || continue
-        cp -f "$f" "$OUT/stage/stage-$(basename "$f")"
-      done
+      for f in "$OUT"/targets.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
     fi
-    stage_ok=0
-    if upload_par "$OUT"/stage/* || gh release upload "$ENV_TAG" "$OUT"/stage/* --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; then
-      stage_ok=1
-      for f in "$OUT"/stage/stage-*; do
-        n=$(basename "$f"); l=$(stat -c%s "$f")
-        r=$(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq ".assets[] | select(.name==\"$n\") | .size")
-        if [ "$l" = "$r" ]; then
-          echo "staged ok $n = $l bytes"
-        else
-          stage_ok=0
-          echo "::warning::staged size mismatch $n ($l vs $r)"
-        fi
-      done
-    else
-      echo "::warning::staged upload failed; the previous packages are left untouched"
-    fi
-    if [ "$stage_ok" -eq 1 ]; then
-      if [ "${CARRY:-0}" = 1 ]; then
-        DELPAT='^records\.tar\.gz(\.|$)|^meta\.json$'
-      else
-        DELPAT='^records\.tar\.gz(\.|$)|^targets\.tar\.gz(\.|$)|^meta\.json$'
-      fi
-      mapfile -t DELOLD < <(gh release view "$ENV_TAG" --repo "$SESSIONS_REPO" --json assets --jq '.assets[].name' 2>/dev/null \
-        | grep -E "$DELPAT" || true)
-      for a in ${DELOLD[@]+"${DELOLD[@]}"}; do
-        gh release delete-asset "$ENV_TAG" "$a" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 &
-      done
-      wait
-      UPF=()
-      for f in "$OUT"/records.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
-      if [ "${CARRY:-0}" != 1 ]; then
-        for f in "$OUT"/targets.tar.gz.*; do [ -f "$f" ] && UPF+=("$f"); done
-      fi
+    up_ok=0
+    if [ "${#UPF[@]}" -gt 0 ] \
+       && { upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1; } \
+       && verify_uploaded "${UPF[@]}"; then
       up_ok=1
-      if [ "${#UPF[@]}" -gt 0 ]; then
-        upload_par "${UPF[@]}" || gh release upload "$ENV_TAG" "${UPF[@]}" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 || up_ok=0
+    fi
+    if [ "$up_ok" = 1 ]; then
+      meta_ok=1
+      if [ -s "$OUT/meta.json" ]; then
+        gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 || meta_ok=0
       else
-        up_ok=0
+        meta_ok=0
       fi
-      if [ "$up_ok" = 1 ]; then
-        if [ -s "$OUT/meta.json" ]; then
-          gh release upload "$ENV_TAG" "$OUT/meta.json" --repo "$SESSIONS_REPO" --clobber >/dev/null 2>&1 \
-            || echo "::warning::failed to upload meta.json (readers will fall back to unverified extract)"
-        fi
+      if [ "$meta_ok" = 1 ]; then
         if [ "${CARRY:-0}" = 1 ]; then
+          prune_old_assets '^records\.tar\.gz(\.|$)|^meta\.json$|^stage-' "${UPF[@]}" "$OUT/meta.json"
           echo "target workspace package carried (unchanged); records refreshed"
         else
+          prune_old_assets '^records\.tar\.gz(\.|$)|^targets\.tar\.gz(\.|$)|^meta\.json$|^stage-' "${UPF[@]}" "$OUT/meta.json"
           echo "target workspace package updated (env from env-sync branch; retained release env kept as fallback)"
         fi
         echo "package manifest: split=$SPLIT_SIZE env=carried targets=$TGT_N vol carry=${CARRY:-0} records=$REC_N vol"
       else
-        echo "::warning::failed to upload targets/records packages to release"
+        echo "::warning::assets uploaded but meta.json is missing; keeping the old manifest so readers reject the mixed set and fall back"
       fi
-      for f in "$OUT"/stage/stage-*; do
-        gh release delete-asset "$ENV_TAG" "$(basename "$f")" --repo "$SESSIONS_REPO" -y >/dev/null 2>&1 \
-          && echo "staged copy removed: $(basename "$f")" &
-      done
-      wait
+    else
+      echo "::warning::failed to upload targets/records packages to release"
     fi
   else
     echo "::warning::meta rewrite failed; leaving the release untouched (targets stay previous generation)"
