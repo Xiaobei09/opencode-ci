@@ -101,6 +101,8 @@ find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null 
 # R2737: npx's package cache and Go's module cache are download caches, not
 # environment state; excluding them keeps the fallback tar in step with
 # env-sync.sh.
+# R2738: the 17 Chromium probe profiles carry ~94MB of HTTP/GPU/code caches.
+# Cookies and Local Storage stay; only the regenerable rendering caches go.
 if ! ( set -o pipefail
   "${TAR_COMP[@]}" -C "$HOME" \
   --exclude='./work' \
@@ -120,6 +122,13 @@ if ! ( set -o pipefail
   --exclude='./.opencode/.v2lib-live' \
   --exclude='./go/pkg/mod' \
   --exclude='./go/pkg/sumdb' \
+  --exclude='./cleanip_probe/profiles/*/Default/Cache' \
+  --exclude='./cleanip_probe/profiles/*/Default/Code Cache' \
+  --exclude='./cleanip_probe/profiles/*/Default/GPUCache' \
+  --exclude='./cleanip_probe/profiles/*/Default/DawnGraphiteCache' \
+  --exclude='./cleanip_probe/profiles/*/Default/DawnWebGPUCache' \
+  --exclude='./cleanip_probe/profiles/*/Default/ShaderCache' \
+  --exclude='./cleanip_probe/profiles/*/Default/GrShaderCache' \
   --exclude='*/optimization_guide_model_store' \
   --exclude='*/optimization_guide_model_store/*' \
   --exclude='*/__pycache__' \
