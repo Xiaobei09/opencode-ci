@@ -13,6 +13,14 @@
 # gc 会按普通可达性保留。只增 ref，不删对象、不改工作区、不碰 opencode 自己
 # 的 ref。重复运行是幂等的；对象已缺失的 hash 直接跳过。任何失败都只告警，
 # 不影响启动。
+#
+# R2764（启动时序）：restore-env 与 restore-targets 是**并行**的，探测时快照
+# gitdir 的 objects/info/alternates 可能指向还没还原出来的工作区 .git/objects。
+# git 遇到 broken alternate 会直接 fatal，整库一个对象都 probe 不到。因此：
+#   · 探测用临时拼的 gitdir，只软链快照自己的 objects（跳过 info/ ⇒ 不读
+#     alternates），快照对象本来就在自己的 pack/loose 里；
+#   · ref 直接原子写入 refs/opencode/<hash>（update-ref 同样会加载 alternates，
+#     启动时序下会失败），这是本脚本独占的命名空间，格式与 git 完全一致。
 set -uo pipefail
 SNAP_ROOT="${SNAP_ROOT:-$HOME/.local/share/opencode/snapshot}"
 DB="${DB:-$HOME/.local/share/opencode/opencode.db}"
@@ -23,15 +31,17 @@ command -v python3 >/dev/null 2>&1 || exit 0
 SNAP_ROOT="$SNAP_ROOT" DB="$DB" python3 - <<'PY'
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 root = os.environ["SNAP_ROOT"]
 db = os.environ["DB"]
 
 try:
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
     rows = con.execute(
         "select data from session_message where data like '%\"snapshot\"%'"
     ).fetchall()
@@ -73,9 +83,28 @@ for project in sorted(os.listdir(root)):
 
 pinned = 0
 for gdir in gitdirs:
+    # R2764（启动时序）：restore-env 与 restore-targets 并行，探测时工作区的
+    # .git/objects 可能还不存在，而快照 gitdir 的 objects/info/alternates 正
+    # 指向它。broken alternate 会让 `git --git-dir=<gdir> cat-file` 整库报错
+    # （fatal: Invalid path），一个对象都 pin 不上。这里临时拼一个**只含
+    # 自身 objects** 的 gitdir（info/ 跳过 ⇒ 不读 alternates）来探测；快照
+    # 对象本来就在自己的 pack/loose 里。
+    probe_dir = tempfile.mkdtemp(prefix="snapshot-pin-")
     try:
+        obj_dir = os.path.join(probe_dir, "objects")
+        os.makedirs(obj_dir)
+        os.makedirs(os.path.join(probe_dir, "refs"))
+        # Git requires HEAD/refs/objects to treat --git-dir as a repository;
+        # refs themselves are not needed for cat-file.
+        with open(os.path.join(probe_dir, "HEAD"), "w", encoding="ascii") as fh:
+            fh.write("ref: refs/heads/master\n")
+        own = os.path.join(gdir, "objects")
+        for entry in os.listdir(own):
+            if entry == "info":
+                continue
+            os.symlink(os.path.join(own, entry), os.path.join(obj_dir, entry))
         probe = subprocess.run(
-            ["git", "--git-dir", gdir, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            ["git", "--git-dir", probe_dir, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
             input="\n".join(ordered) + "\n",
             capture_output=True,
             text=True,
@@ -84,6 +113,8 @@ for gdir in gitdirs:
     except Exception as exc:  # noqa: BLE001
         print(f"::warning::snapshot pins: {gdir}: cat-file failed: {exc}")
         continue
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
     if probe.returncode != 0:
         print(f"::warning::snapshot pins: {gdir}: cat-file rc={probe.returncode}: {probe.stderr.strip()[:200]}")
         continue
@@ -95,21 +126,27 @@ for gdir in gitdirs:
             present.append(parts[0])
     if not present:
         continue
-    # git update-ref --stdin: one `update <ref> <new>` per reachable snapshot.
-    updates = "".join(f"update refs/opencode/{h} {h}\n" for h in present)
+    # 直接原子写 refs/opencode/<hash>：update-ref 也会加载 alternates，同样会
+    # 在启动时序下失败。refs/opencode 是本脚本独占的命名空间，写 loose ref
+    # 与 git 自身格式一致；gc/pack-refs 之后仍按普通可达性保留。
+    ref_dir = os.path.join(gdir, "refs", "opencode")
     try:
-        run = subprocess.run(
-            ["git", "--git-dir", gdir, "update-ref", "--stdin"],
-            input=updates,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        os.makedirs(ref_dir, exist_ok=True)
+        for h in present:
+            ref = os.path.join(ref_dir, h)
+            content = h + "\n"
+            try:
+                with open(ref, "r", encoding="ascii") as fh:
+                    if fh.read() == content:
+                        continue
+            except OSError:
+                pass
+            tmp_ref = ref + f".tmp{os.getpid()}"
+            with open(tmp_ref, "w", encoding="ascii") as fh:
+                fh.write(content)
+            os.replace(tmp_ref, ref)
     except Exception as exc:  # noqa: BLE001
-        print(f"::warning::snapshot pins: {gdir}: update-ref failed: {exc}")
-        continue
-    if run.returncode != 0:
-        print(f"::warning::snapshot pins: {gdir}: update-ref rc={run.returncode}: {run.stderr.strip()[:200]}")
+        print(f"::warning::snapshot pins: {gdir}: write refs failed: {exc}")
         continue
     pinned += len(present)
     label = os.path.relpath(gdir, root)
