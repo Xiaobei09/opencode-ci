@@ -464,8 +464,10 @@ jobs:
             gh variable set CI_FAIL_STREAK --body 0 --repo "$repo" >/dev/null 2>&1 || true
             delay=0
             if [ "$next" -ge 4 ]; then
-              delay=$(( 15 << (next - 4) ))
-              [ "$delay" -gt 300 ] && delay=300
+              # R2734 (operator: "两轮的间隔时间不应该一分钟"): short retry
+              # backoff only — 5/10/20/30s, never 60s or more.
+              delay=$(( 5 << (next - 4) ))
+              [ "$delay" -gt 30 ] && delay=30
             fi
             echo "::notice::egress-only failure #$next (free-tier quota is not keyed by exit IP alone); relay in ${delay}s; 429 streak is tracked separately"
             echo "egress_retry=true" >> "$GITHUB_OUTPUT"
@@ -712,27 +714,30 @@ jobs:
           # 1/3/6/12/24/48 and skipped retries #2/#4/#5/... entirely, which is
           # exactly the "sometimes missing" the operator saw. The reason line
           # already carries "第 N 次", so no separate milestone rule is needed.
+          # R2734 (operator: "进一步精简提示，现在很多废话"): the title already
+          # says the round was relayed, so reasons no longer repeat it. Keep only
+          # the cause and the counts that change what the operator would do.
           if [ "$egress_retry" = "true" ]; then
             # R2620: every quota 429 ends its round. Do not claim the bucket is
             # keyed by exit IP: fresh runner IPs still hit the same wall.
-            reason="出口配额 429（免费额度耗尽）；本轮已结束并接力新 run（第 ${egress_n} 次）${reset_hint:+；预计 ${reset_hint} 重置}"
+            reason="配额 429（免费额度耗尽）· 第 ${egress_n} 次${reset_hint:+ · 预计 ${reset_hint} 重置}"
           elif [ "$restore_failed" = "true" ]; then
-            reason="环境/工作区还原失败；已跳过 OpenCode，按失败计数并接力（快照未覆盖）"
+            reason="环境/工作区还原失败（快照未覆盖），已跳过 OpenCode"
           elif [ "$select_failed" = "true" ]; then
-            reason="出口选择失败：${select_reason:-无候选出口}；按失败计数并接力"
+            reason="出口选择失败：${select_reason:-无候选出口}"
           elif [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
           elif [ "$outcome" = "success" ] && [ "$silent_exit" = "true" ]; then
-            reason="opencode 退出但本轮无健康回合（无 200），按失败计数并接力新 run"
+            reason="opencode 退出但本轮无健康回合（无 200），按失败计数"
           elif [ "$outcome" = "success" ]; then
-            reason="opencode 正常结束（预算耗尽或正常收尾），已接力新 run"
+            reason="opencode 正常结束（预算耗尽或正常收尾）"
           elif [ "$outcome" = "failure" ] && [ "$healthy_failure" = "true" ]; then
-            reason="opencode 异常结束，但本轮有健康回合（200），已复位失败计数并接力"
+            reason="opencode 异常结束，但本轮有健康回合（200），失败计数已复位"
           elif [ "$outcome" = "failure" ]; then
-            reason="opencode 失败（outcome=failure），按失败计数并重试"
+            reason="opencode 失败（outcome=failure），按失败计数"
           else
-            reason="opencode 结束（outcome=${outcome:-unknown}），已接力新 run"
+            reason="opencode 结束（outcome=${outcome:-unknown}）"
           fi
           streak=$(gh variable get CI_FAIL_STREAK --repo "$repo" 2>/dev/null || echo "?")
           # R2700: quota rounds display the egress valve count (CI_EGRESS_STREAK),
@@ -755,9 +760,20 @@ jobs:
             [ -n "$err_src" ] || err_src=$(tail -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null || true)
             err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-300)
           fi
-          detail="结果：${outcome}"
-          [ -n "$rc" ] && detail="$detail（exit=$rc）"
-          text=$(printf '🔄 CI 本轮结束 · 已接力新 run\n原因：%s\nrun：%s\n%s · streak：%s' "$reason" "${R2651_RUN_URL}" "$detail" "$streak")
+          # R2734: keep the card short. A normal success needs only cause + run;
+          # outcome/exit and streak appear when they explain a failure or a
+          # quota retry (the title already says the round was relayed).
+          meta=""
+          if [ "$outcome" != "success" ]; then
+            meta="结果：${outcome}"
+            [ -n "$rc" ] && meta="$meta（exit=$rc）"
+          fi
+          if [ "$outcome" != "success" ] || [ "$egress_retry" = "true" ] \
+             || [ "$restore_failed" = "true" ] || [ "$select_failed" = "true" ]; then
+            meta="${meta:+$meta · }streak：${streak}"
+          fi
+          text=$(printf '🔄 CI 本轮结束 · 已接力\n原因：%s\nrun：%s' "$reason" "${R2651_RUN_URL}")
+          [ -n "$meta" ] && text=$(printf '%s\n%s' "$text" "$meta")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
@@ -780,7 +796,7 @@ jobs:
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
                 if(action=="kept-round") label=label "（本轮未停）"
-                printf "429 探针：出口 %s · code=%s · reason=%s · %s%s", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":" · note=" note)
+                printf "429 探针：出口 %s · HTTP %s · %s", (cur==""?"?":cur), (code==""?"?":code), label
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
@@ -850,11 +866,9 @@ jobs:
             [ -n "$err_src" ] || err_src=$(tail -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null || true)
             err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-300)
           fi
-          detail="结果：${outcome}"
-          [ -n "$rc" ] && detail="$detail（exit=$rc）"
           reason="本轮结束（outcome=$outcome）"
           if [ "$restore_failed" = "true" ]; then
-            reason="环境/工作区还原失败；已跳过 OpenCode（快照未覆盖）"
+            reason="环境/工作区还原失败（快照未覆盖），已跳过 OpenCode"
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
               reason="$reason；连续失败 ${streak} 次，循环已暂停"
             elif [ "$relay_out" = "failure" ]; then
@@ -889,7 +903,15 @@ jobs:
           elif [ "$paused" = "true" ]; then
             reason="循环已暂停（运营者停止或达失败阈值），relay 已让路"
           fi
-          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s · relay=%s · streak=%s · pause=%s' "$reason" "${R2651_RUN_URL}" "$detail" "$relay_out" "$streak" "$paused")
+          # R2734: concise stop card: cause + run, then only the relay/streak
+          # facts that matter. `pause` is redundant (the card means stopped).
+          meta="relay=${relay_out} · streak=${streak}"
+          if [ "$outcome" != "success" ]; then
+            detail="结果：${outcome}"
+            [ -n "$rc" ] && detail="$detail（exit=$rc）"
+            meta="$detail · $meta"
+          fi
+          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s' "$reason" "${R2651_RUN_URL}" "$meta")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
@@ -913,7 +935,7 @@ jobs:
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
                 if(action=="kept-round") label=label "（本轮未停）"
-                printf "429 探针：出口 %s · code=%s · reason=%s · %s%s", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":" · note=" note)
+                printf "429 探针：出口 %s · HTTP %s · %s", (cur==""?"?":cur), (code==""?"?":code), label
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi

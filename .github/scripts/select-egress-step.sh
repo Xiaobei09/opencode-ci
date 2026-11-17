@@ -117,21 +117,22 @@ fi
 echo "RESUME_ONCE_QUOTA_RECOVER=$QR_ENABLED" >> "$GITHUB_ENV"
 echo "R2626/R2665 quota-tail recover: prev=${PREV_UP:-none}/${PREV_EG:-?} new=${NEW_UP:-?}/${NEW_EG:-?} changed=$EGRESS_CHANGED mode=$QR_MODE enabled=$QR_ENABLED actionable_rollover=$ROLLOVER_PENDING"
 if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
-  # R2520：与 TG 错误卡 exitProxySummary() 使用完全相同的键名/顺序：
-  # kind → upstream → local → egress → direct。旧格式 `CI egress: direct direct`
-  # 与错误卡的 `exit proxy: http://127.0.0.1:8089 ...` 对不上。
+  # R2734 (operator: "进一步精简提示，现在很多废话"): show the result the
+  # operator acts on — exit kind, egress IP, direct IP — not the local proxy
+  # address or raw key=value fields (the 🌐 出口代理 panel keeps full details).
+  # R2520's "same keys as exitProxySummary()" no longer applies to this card.
   KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
   UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-  SCHEME=$(jq -r '.scheme // "http"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-  PROXY=$(jq -r '.proxy // "127.0.0.1:8089"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
   EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-  MSG="exit proxy: kind=${KIND} upstream=${UP} local=${SCHEME}://${PROXY} egress=${EIP} direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
+  MSG="🌐 本轮代理：${KIND}"
+  [ -n "$UP" ] && [ "$UP" != "$KIND" ] && MSG="$MSG (${UP})"
+  MSG="$MSG · 出口 ${EIP} · 直连 $(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
   # R2626: visible proof that this run may recover a pre-boot quota
   # tail once (only when the egress actually changed).
-  [ "$QR_ENABLED" = "1" ] && MSG="$MSG quota-tail-recover=on"
+  [ "$QR_ENABLED" = "1" ] && MSG="$MSG · 额度尾恢复"
   # R2665: only the session with an actionable rollover is skipped; waiting
   # requests no longer disable recovery for every Bot.
-  [ "$ROLLOVER_PENDING" = "1" ] && MSG="$MSG rollover-actionable=yes(that-session-only)"
+  [ "$ROLLOVER_PENDING" = "1" ] && MSG="$MSG · 换会话待处理"
   # R2733: the run-start egress card is a global notice too. Route it through
   # tg-notify.sh so it shares the candidate order and **each Bot's own switch**:
   # a Bot that is OFF is never used, and when every Bot is OFF the notice is
