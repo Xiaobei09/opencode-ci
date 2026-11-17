@@ -122,6 +122,12 @@ jobs:
             fi
           fi
 
+      - name: Self-test Telegram notify routing
+        # R2731: per-Bot switch parsing and 429 routing live in bash, where a
+        # typo only surfaces during a quota failure. This offline matrix uses a
+        # fake curl and a temp HOME, so it costs ~1s and never contacts Telegram.
+        run: bash .github/scripts/tg-notify.test.sh
+
       - name: Install GitHub CLI and configure git
         run: |
           set -euo pipefail
