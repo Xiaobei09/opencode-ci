@@ -6,12 +6,13 @@
 # the round-end notice silently, and a successful send left no evidence at all.
 #
 # Usage: tg-notify.sh <tag>   (message text on stdin)
-#   tag  short label used in logs, e.g. round-end or loop-stop
+#   tag  short label used in logs, e.g. round-end, loop-stop, egress
 # Env:
 #   TG_BOT_TOKEN, TG_PUSH_CHAT  primary Bot credentials; missing means "skipped"
 #   TG_NOTIFY_CLASS             retained for logs/back-compat ("quota" marks a
-#                               provider-429 card). R2732 routes **all** global
-#                               notices through the per-Bot switches.
+#                               provider-429 card, "egress" the run-start proxy
+#                               card). R2732/R2733 route **all** global notices
+#                               through the per-Bot switches.
 # Exit:
 #   0 = sent, or intentionally skipped (no credentials / empty text / all routes
 #       disabled by their own switches)
@@ -21,7 +22,8 @@
 #   ${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}/card-ops.json
 # The same file is read here. "📣 全局通知＋卡片自愈" controls this Bot only:
 # ON  = this Bot self-heals its pin card and may send global notices
-#       (CI round-end/relay, loop-stop, quota 429, Telegram rate-limit);
+#       (CI round-end/relay, run-start egress card, loop-stop, quota 429,
+#       Telegram rate-limit);
 # OFF = no self-heal for this Bot and it is never chosen as a sender.
 # Other bots keep their own setting. A missing/corrupt file means ON.
 set -uo pipefail
@@ -161,10 +163,10 @@ send_via() {
   return 1
 }
 
-# Candidate order (R2732): every global notice (round-end/relay, loop-stop,
-# quota 429, Telegram rate-limit) shares the same route list. Each candidate is
-# checked against its own per-Bot switch in the send loop, so turning one Bot
-# off does not affect the others.
+# Candidate order (R2732/R2733): every global notice (round-end/relay,
+# run-start egress card, loop-stop, quota 429, Telegram rate-limit) shares the
+# same route list. Each candidate is checked against its own per-Bot switch in
+# the send loop, so turning one Bot off does not affect the others.
 # Bot ids end up in a file path (`tg-bot<id>.env`) and a jq argument, so reject
 # anything outside the registry's id alphabet before using it as a route.
 valid_bot() {

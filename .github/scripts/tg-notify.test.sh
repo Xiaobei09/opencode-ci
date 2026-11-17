@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# R2728/R2729/R2732: regression for the per-Bot card-ops switch in tg-notify.sh.
+# R2728/R2729/R2732/R2733: regression for the per-Bot card-ops switch in
+# tg-notify.sh, including the run-start egress card.
 # Operator: "不是全局，是bot单独设置，设置本bot推不推" and
 #           "我说的是ci结束/开始/tg限流这些全局信息的开关".
 # Runs with a fake curl/PATH and a temp HOME; never contacts Telegram.
@@ -128,6 +129,27 @@ setops '{"bots":{"bot5":{"enabled":false},"bot6":{"enabled":false},"primary":{"e
 run ""
 ck "R2732: 普通通知全部关闭时也不推" "$(printf '%s' "$out" | grep -q 'all notice routes disabled' && echo yes)"
 ck "R2732: 普通通知全部关闭时不发请求且不算失败" "$([ ! -s "$LOG" ] && [ "$rc" = 0 ] && echo yes)"
+
+# R2733: the run-start egress card is a global notice; it must use the same
+# helper and obey each Bot's switch instead of always using the primary token.
+setops '{"bots":{"bot6":{"enabled":false},"primary":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"bot6":{"in":300,"seen":300}}'
+: > "$LOG"
+out=$(printf 'exit proxy: kind=direct upstream=direct\n' | TG_NOTIFY_CLASS=egress bash "$SCRIPT" egress 2>&1)
+rc=$?
+ck "R2733: 选代理结果跳过关闭的 bot6，按顺序走主 Bot" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
+ck "R2733: 选代理结果不请求已关闭的 bot6" "$(! grep -qx '666:bot6-token' "$LOG" && echo yes)"
+
+setops '{"bots":{"bot5":{"enabled":false},"bot6":{"enabled":false},"primary":{"enabled":false}},"notifyBot":"bot6"}'
+: > "$LOG"
+out=$(printf 'exit proxy: kind=direct upstream=direct\n' | TG_NOTIFY_CLASS=egress bash "$SCRIPT" egress 2>&1)
+rc=$?
+ck "R2733: 选代理结果全部关闭时也不推" "$(printf '%s' "$out" | grep -q 'all notice routes disabled' && [ "$rc" = 0 ] && echo yes)"
+ck "R2733: 选代理结果全部关闭时不发请求" "$([ ! -s "$LOG" ] && echo yes)"
+
+sel="$HERE/select-egress-step.sh"
+ck "R2733: 选代理结果改走 tg-notify（不再直连 Telegram API）" \
+  "$(grep -q 'tg-notify.sh" egress' "$sel" && ! grep -q 'sendMessage' "$sel" && echo yes)"
 
 # Registry tail: bot6/primary OFF but bot5 ON must still be reachable even
 # though bot5 is neither last-used nor notifyBot.

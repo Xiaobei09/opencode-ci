@@ -132,9 +132,12 @@ if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
   # R2665: only the session with an actionable rollover is skipped; waiting
   # requests no longer disable recovery for every Bot.
   [ "$ROLLOVER_PENDING" = "1" ] && MSG="$MSG rollover-actionable=yes(that-session-only)"
-  curl -sS -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${TG_PUSH_CHAT}" --data-urlencode "text=${MSG}" \
-    >/dev/null 2>&1 || echo "::warning::could not send the exit-proxy notice to telegram"
+  # R2733: the run-start egress card is a global notice too. Route it through
+  # tg-notify.sh so it shares the candidate order and **each Bot's own switch**:
+  # a Bot that is OFF is never used, and when every Bot is OFF the notice is
+  # skipped intentionally (exit 0, no request, no primary fallback).
+  printf '%s' "$MSG" | TG_NOTIFY_CLASS=egress bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" egress \
+    || echo "::warning::could not send the exit-proxy notice to telegram"
 fi
 if [ -n "${PRE_OPENCODE_T0:-}" ]; then
   echo "setup timing: pre-opencode $(( $(date +%s) - PRE_OPENCODE_T0 ))s (target <60s: checkout+restore+install+select)"
