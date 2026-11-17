@@ -843,14 +843,16 @@ jobs:
               else
                 rc=$(cat "$RUNNER_TEMP/snapshot-env.rc" 2>/dev/null || echo missing)
                 [ -f "$RUNNER_TEMP/snapshot-env.log" ] && tail -8 "$RUNNER_TEMP/snapshot-env.log" | sed 's/^/  snapshot: /'
-                if [ "$rc" = "missing" ]; then
-                  run_sync_snapshot
-                else
-                  echo "actionable rollover request pending; waited ${waited}s for the run-end snapshot to become durable (rc=$rc)"
-                  if [ "$rc" != 0 ]; then
-                    echo "::warning::run-end snapshot rc=$rc; the rollover request is not durably stored"
-                  fi
+                # R2766: no durable marker means the env-sync branch was NOT
+                # updated, regardless of the process status. rc=0 can still be
+                # the release-package fallback (lock contention), and restore
+                # prefers the branch — retry before relay instead of losing the
+                # request. run_sync_snapshot writes its own rc/synced markers.
+                if [ "$rc" != "missing" ] && [ "$rc" != 0 ]; then
+                  echo "::warning::run-end snapshot rc=$rc; the rollover request is not durably stored"
                 fi
+                echo "actionable rollover request pending; waited ${waited}s but the env-sync branch is not durable; retrying synchronously"
+                run_sync_snapshot
               fi
             elif [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "true" ]; then
               run_sync_snapshot

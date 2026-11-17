@@ -48,6 +48,15 @@ if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
   SYNC_OK=0
   SYNC_LOG="$RUNNER_TEMP/env-sync-run-end.log"
   : > "$SYNC_LOG"
+  # R2766: a pending 429 rollover request exists only in $HOME. If the bridge's
+  # interval sync happens to hold the lock, the old 8s cap gave up and only the
+  # release package carried the request — but restore prefers the env-sync
+  # branch, so the successor would never see it. Wait longer on these rounds.
+  SYNC_WAIT_SECONDS="${ENV_SYNC_WAIT_SECONDS:-8}"
+  if compgen -G "$HOME/.config/opencode/rollover-requests/ses_*.json" >/dev/null 2>&1; then
+    SYNC_WAIT_SECONDS=60
+    echo "rollover request pending; extending env-sync lock wait to ${SYNC_WAIT_SECONDS}s"
+  fi
   for a in 1 2; do
     # R2518: WAIT_LOCK makes run-end wait for the bridge interval sync
     # instead of silently skipping (rc=75 = still locked → retry).
@@ -57,7 +66,7 @@ if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
     # meant a failed lock wait left no evidence in the run log at all.
     sync_t0=$(date +%s)
     ENV_SYNC_WHY=run-end ENV_SYNC_TIMEOUT=180 ENV_SYNC_WAIT_LOCK=1 \
-      ENV_SYNC_WAIT_SECONDS=8 \
+      ENV_SYNC_WAIT_SECONDS="$SYNC_WAIT_SECONDS" \
       timeout 300 bash "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" >>"$SYNC_LOG" 2>&1
     sync_rc=$?
     sync_took=$(( $(date +%s) - sync_t0 ))
