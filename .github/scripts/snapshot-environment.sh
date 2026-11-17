@@ -98,6 +98,9 @@ find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null 
 # cleanip_probe/profiles/*) and __pycache__ are regenerable; excluding them
 # keeps the fallback env tar small. env-sync.sh has the same excludes for the
 # primary path.
+# R2737: npx's package cache and Go's module cache are download caches, not
+# environment state; excluding them keeps the fallback tar in step with
+# env-sync.sh.
 if ! ( set -o pipefail
   "${TAR_COMP[@]}" -C "$HOME" \
   --exclude='./work' \
@@ -109,11 +112,14 @@ if ! ( set -o pipefail
   --exclude='./.git-credentials' \
   --exclude='./.local/share/opencode/log' \
   --exclude='./.npm/_cacache' \
+  --exclude='./.npm/_npx' \
   --exclude='./.bun' \
   --exclude='./actions-runner' \
   --exclude='./.rustup' \
   --exclude='./.dotnet' \
   --exclude='./.opencode/.v2lib-live' \
+  --exclude='./go/pkg/mod' \
+  --exclude='./go/pkg/sumdb' \
   --exclude='*/optimization_guide_model_store' \
   --exclude='*/optimization_guide_model_store/*' \
   --exclude='*/__pycache__' \
