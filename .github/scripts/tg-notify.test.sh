@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# R2728/R2729: regression for the per-Bot card-ops switch in tg-notify.sh.
-# Operator: "不是全局，是bot单独设置，设置本bot推不推".
+# R2728/R2729/R2732: regression for the per-Bot card-ops switch in tg-notify.sh.
+# Operator: "不是全局，是bot单独设置，设置本bot推不推" and
+#           "我说的是ci结束/开始/tg限流这些全局信息的开关".
 # Runs with a fake curl/PATH and a temp HOME; never contacts Telegram.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -105,14 +106,36 @@ ck "R2729: 被关闭的 bot5 不产生请求" "$(! grep -qx '555:bot5-token' "$L
 # All off -> explicit opt-out: skip with success, no Telegram request at all.
 setops '{"bots":{"bot5":{"enabled":false},"bot6":{"enabled":false},"primary":{"enabled":false}},"notifyBot":"bot6"}'
 run quota
-ck "R2729: 所有 Bot 都关时不推 429（尊重本 Bot 设置）" "$(printf '%s' "$out" | grep -q 'skipped (all quota routes disabled' && echo yes)"
+ck "R2729: 所有 Bot 都关时不推 429（尊重本 Bot 设置）" "$(printf '%s' "$out" | grep -q 'all notice routes disabled' && echo yes)"
 ck "R2729: 全部关闭时不发任何请求" "$([ ! -s "$LOG" ] && echo yes)"
 ck "R2729: 全部关闭是主动跳过，不算失败" "$([ "$rc" = 0 ] && echo yes)"
 
-# Non-quota notice must ignore the switches and still use the primary Bot.
+# R2732: ordinary round-end/relay notices now follow the same per-Bot switch.
+setops '{"bots":{"bot6":{"enabled":true},"bot5":{"enabled":false},"primary":{"enabled":false}},"notifyBot":"bot6"}'
+setledger '{"bot6":{"in":200,"seen":300},"bot5":{"in":100,"seen":100}}'
+run ""
+ck "R2732: 普通结束/接力通知也跟随本 Bot 开关（bot6 开）" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+ck "R2732: 普通通知不会再无视开关硬发主 Bot" "$(! grep -qx '111:primary-token' "$LOG" && echo yes)"
+
+# Ordinary notice with the last-used Bot OFF -> next enabled Bot.
+setops '{"bots":{"bot6":{"enabled":false},"bot5":{"enabled":true},"primary":{"enabled":false}},"notifyBot":"bot6"}'
+run ""
+ck "R2732: 普通通知遇到本 Bot 关闭就换下一个已开启 Bot" "$(printf '%s' "$out" | grep -q 'via=bot5' && echo yes)"
+ck "R2732: 关闭的 bot6 不产生普通通知请求" "$(! grep -qx '666:bot6-token' "$LOG" && echo yes)"
+
+# Ordinary notice all off -> intentional skip, exit 0, no request.
 setops '{"bots":{"bot5":{"enabled":false},"bot6":{"enabled":false},"primary":{"enabled":false}},"notifyBot":"bot6"}'
 run ""
-ck "R2729: 普通结束通知不受 per-Bot 开关影响" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
+ck "R2732: 普通通知全部关闭时也不推" "$(printf '%s' "$out" | grep -q 'all notice routes disabled' && echo yes)"
+ck "R2732: 普通通知全部关闭时不发请求且不算失败" "$([ ! -s "$LOG" ] && [ "$rc" = 0 ] && echo yes)"
+
+# Registry tail: bot6/primary OFF but bot5 ON must still be reachable even
+# though bot5 is neither last-used nor notifyBot.
+setops '{"bots":{"bot6":{"enabled":false},"primary":{"enabled":false},"bot5":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"bot6":{"in":300,"seen":300}}'
+run quota
+ck "R2732: 最近/默认/主 Bot 都关闭时仍能找到注册表里开启的 bot5" "$(printf '%s' "$out" | grep -q 'via=bot5' && echo yes)"
+ck "R2732: 注册表兜底不会请求已关闭的 Bot" "$(! grep -q '666:bot6-token' "$LOG" && ! grep -q '111:primary-token' "$LOG" && echo yes)"
 
 # Primary OFF, latest primary, bot6 ON -> bot6 pushes.
 setops '{"bots":{"primary":{"enabled":false},"bot6":{"enabled":true}},"notifyBot":"bot6"}'
@@ -144,7 +167,7 @@ ck "R2729: 开关文件损坏时按默认开处理" "$(printf '%s' "$out" | grep
 # Legacy R2728 global file: false is the fallback for bots without an entry.
 setops '{"enabled":false,"notifyBot":"bot6"}'
 run quota
-ck "R2729: 旧全局关文件不再误推主 Bot" "$(printf '%s' "$out" | grep -q 'skipped (all quota routes disabled' && echo yes)"
+ck "R2729: 旧全局关文件不再误推主 Bot" "$(printf '%s' "$out" | grep -q 'all notice routes disabled' && echo yes)"
 setops '{"enabled":false,"bots":{"bot5":{"enabled":true}},"notifyBot":"bot6"}'
 setledger '{"bot5":{"in":300,"seen":300}}'
 run quota

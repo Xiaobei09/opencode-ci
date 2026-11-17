@@ -8,21 +8,21 @@
 # Usage: tg-notify.sh <tag>   (message text on stdin)
 #   tag  short label used in logs, e.g. round-end or loop-stop
 # Env:
-#   TG_BOT_TOKEN, TG_PUSH_CHAT  required; missing means "skipped" (exit 0)
-#   TG_NOTIFY_CLASS             "quota" = provider 429 notice. Each candidate Bot
-#                               must have its own card-ops switch ON before it can
-#                               be used; route is last-used bot, then bot6, then
-#                               primary. Non-quota notices ignore the switches.
+#   TG_BOT_TOKEN, TG_PUSH_CHAT  primary Bot credentials; missing means "skipped"
+#   TG_NOTIFY_CLASS             retained for logs/back-compat ("quota" marks a
+#                               provider-429 card). R2732 routes **all** global
+#                               notices through the per-Bot switches.
 # Exit:
-#   0 = sent, or intentionally skipped (no credentials / empty text / all quota
-#       routes disabled by their own switches)
+#   0 = sent, or intentionally skipped (no credentials / empty text / all routes
+#       disabled by their own switches)
 #   1 = all attempted routes failed
 #
-# R2728/R2729: the bridge menu writes one **per-Bot** switch to
+# R2728/R2729/R2732: the bridge menu writes one **per-Bot** switch to
 #   ${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}/card-ops.json
-# The same file is read here. "卡片自愈＋429 提醒" controls this Bot only:
-# ON  = this Bot self-heals its pin card and may push quota 429 notices;
-# OFF = no self-heal for this Bot and it is never chosen as a 429 sender.
+# The same file is read here. "📣 全局通知＋卡片自愈" controls this Bot only:
+# ON  = this Bot self-heals its pin card and may send global notices
+#       (CI round-end/relay, loop-stop, quota 429, Telegram rate-limit);
+# OFF = no self-heal for this Bot and it is never chosen as a sender.
 # Other bots keep their own setting. A missing/corrupt file means ON.
 set -uo pipefail
 
@@ -168,28 +168,42 @@ add_candidate() {
   done
   CANDIDATES+=("$bot")
 }
-if [ "$notify_class" = "quota" ]; then
-  latest=""
-  if command -v jq >/dev/null 2>&1 && [ -s "$LEDGER" ]; then
-    latest=$(jq -r 'to_entries | map(select((.value.in // 0) > 0)) | sort_by(.value.in) | last | .key // empty' "$LEDGER" 2>/dev/null || true)
-  fi
-  add_candidate "$latest"
-  configured="bot6"
-  if command -v jq >/dev/null 2>&1 && [ -s "$OPS" ]; then
-    configured=$(jq -r '.notifyBot // "bot6"' "$OPS" 2>/dev/null | head -1 || true)
-  fi
-  # A hand-edited/invalid notifyBot falls back to the documented default rather
-  # than silently degrading to primary.
-  valid_bot "$configured" || configured="bot6"
-  add_candidate "$configured"
+# R2732: every global notice follows the same per-Bot switch, not only quota.
+# Order: most recently used Bot -> configured notifyBot -> primary -> every
+# other registered Bot. The registry tail matters when the last-used Bot is
+# OFF: an enabled bot5 must still be reachable even if bot6/primary are OFF.
+latest=""
+if command -v jq >/dev/null 2>&1 && [ -s "$LEDGER" ]; then
+  latest=$(jq -r 'to_entries | map(select((.value.in // 0) > 0)) | sort_by(.value.in) | last | .key // empty' "$LEDGER" 2>/dev/null || true)
 fi
+add_candidate "$latest"
+configured="bot6"
+if command -v jq >/dev/null 2>&1 && [ -s "$OPS" ]; then
+  configured=$(jq -r '.notifyBot // "bot6"' "$OPS" 2>/dev/null | head -1 || true)
+fi
+# A hand-edited/invalid notifyBot falls back to the documented default rather
+# than silently degrading to primary.
+valid_bot "$configured" || configured="bot6"
+add_candidate "$configured"
 add_candidate "primary"
+if [ -s "$REG" ]; then
+  if command -v jq >/dev/null 2>&1; then
+    while IFS= read -r id; do add_candidate "$id"; done \
+      < <(jq -r '.bots[]?.id // empty' "$REG" 2>/dev/null || true)
+  else
+    # jq-less fallback for candidate discovery only; switch parsing is still
+    # conservative (per-Bot files are treated as ON when they cannot be read).
+    while IFS= read -r id; do add_candidate "$id"; done \
+      < <(sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)".*/\1/p' "$REG" 2>/dev/null || true)
+  fi
+fi
 
+echo "telegram ${tag} routing (class=${notify_class:-global}): ${CANDIDATES[*]}"
 used_tokens=""
 attempted=0
 disabled=0
 for bot in "${CANDIDATES[@]}"; do
-  if [ "$notify_class" = "quota" ] && ! ops_bot_on "$bot"; then
+  if ! ops_bot_on "$bot"; then
     echo "::notice::telegram ${tag} route ${bot} disabled by its own card-ops switch; skipping"
     disabled=$((disabled + 1))
     continue
@@ -217,8 +231,8 @@ for bot in "${CANDIDATES[@]}"; do
   fi
 done
 
-if [ "$notify_class" = "quota" ] && [ "$attempted" -eq 0 ] && [ "$disabled" -gt 0 ]; then
-  echo "telegram ${tag} skipped (all quota routes disabled by their own card-ops switch)"
+if [ "$attempted" -eq 0 ] && [ "$disabled" -gt 0 ]; then
+  echo "telegram ${tag} skipped (class=${notify_class:-global}; all notice routes disabled by their own card-ops switch)"
   exit 0
 fi
 

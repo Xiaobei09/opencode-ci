@@ -123,9 +123,9 @@ jobs:
           fi
 
       - name: Self-test Telegram notify routing
-        # R2731: per-Bot switch parsing and 429 routing live in bash, where a
-        # typo only surfaces during a quota failure. This offline matrix uses a
-        # fake curl and a temp HOME, so it costs ~1s and never contacts Telegram.
+        # R2731/R2732: per-Bot switch parsing and global-notice routing live in
+        # bash, where a typo only surfaces when a notice is lost. This offline
+        # matrix uses a fake curl and a temp HOME, so it costs ~1s.
         run: bash .github/scripts/tg-notify.test.sh
 
       - name: Install GitHub CLI and configure git
@@ -392,9 +392,9 @@ jobs:
           fi
           egress_retry_policy() {
             local cur next delay q429 rollover_out rollover_triggered
-            # R2728/R2729: expose quota evidence so the notify steps can route
-            # the provider-429 card to a Bot whose own card-ops switch is ON.
-            # Normal round-end/stop cards keep the primary Bot.
+            # R2728/R2729/R2732: quota evidence still marks the provider-429
+            # card, but every round-end/stop notice now follows the per-Bot
+            # switches (operator: "ci结束/开始/tg限流这些全局信息的开关").
             echo "quota_evidence=true" >> "$GITHUB_OUTPUT"
             cur=$(gh variable get CI_EGRESS_STREAK --repo "$repo" 2>/dev/null || echo 0)
             case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
@@ -789,10 +789,9 @@ jobs:
           fi
           # R2630: retry + log the Telegram API result, so a lost notice is
           # visible as a warning with the HTTP code instead of disappearing.
-          # R2729: only provider-quota 429 cards may be rerouted, and each
-          # candidate Bot must have its own switch ON. Normal round-end cards
-          # keep the primary Bot so the operator's chat is not flooded with
-          # every routine completion.
+          # R2732: every round-end/relay card follows the per-Bot switches and
+          # is sent by the most recently used Bot that has its switch ON. All
+          # OFF means intentionally skipped, not a failure.
           notify_class=""
           if [ "${R2651_QUOTA_EVIDENCE:-}" = "true" ]; then notify_class="quota"; fi
           printf '%s' "$text" | TG_NOTIFY_CLASS="$notify_class" bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" round-end || true
@@ -923,8 +922,8 @@ jobs:
           fi
           # R2630: retry + log the Telegram API result, so a lost notice is
           # visible as a warning with the HTTP code instead of disappearing.
-          # R2729: same per-Bot switches for the final stop card when it carries
-          # provider-429 evidence; non-quota stop cards stay on the primary Bot.
+          # R2732: same per-Bot switches for the final stop card; all OFF means
+          # the operator opted out, so a skip is success.
           notify_class=""
           if [ "${R2651_QUOTA_EVIDENCE:-}" = "true" ]; then notify_class="quota"; fi
           printf '%s' "$text" | TG_NOTIFY_CLASS="$notify_class" bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" loop-stop || true
