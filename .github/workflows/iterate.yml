@@ -704,22 +704,22 @@ jobs:
           if [ "$egress_retry" = "true" ]; then
             # R2620: every quota 429 ends its round. Do not claim the bucket is
             # keyed by exit IP: fresh runner IPs still hit the same wall.
-            reason="出口配额 429（免费额度耗尽）；本轮首个 429 已结束并换新 run 重试（第 ${egress_n} 次）${reset_hint:+；预计 ${reset_hint} 重置}"
+            reason="出口配额 429（免费额度耗尽）；本轮已结束并接力新 run（第 ${egress_n} 次）${reset_hint:+；预计 ${reset_hint} 重置}"
           elif [ "$restore_failed" = "true" ]; then
-            reason="环境/工作区还原失败；已跳过 OpenCode 并按失败计数接力新 run（快照未被覆盖）"
+            reason="环境/工作区还原失败；已跳过 OpenCode，按失败计数并接力（快照未覆盖）"
           elif [ "$select_failed" = "true" ]; then
-            reason="出口选择失败：${select_reason:-no candidate answered 200}；已按失败计数接力新 run"
+            reason="出口选择失败：${select_reason:-无候选出口}；按失败计数并接力"
           elif [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
           elif [ "$outcome" = "success" ] && [ "$silent_exit" = "true" ]; then
-            reason="opencode 退出但本轮无健康回合（无 200），按失败计数后接力新 run"
+            reason="opencode 退出但本轮无健康回合（无 200），按失败计数并接力新 run"
           elif [ "$outcome" = "success" ]; then
             reason="opencode 正常结束（预算耗尽或正常收尾），已接力新 run"
           elif [ "$outcome" = "failure" ] && [ "$healthy_failure" = "true" ]; then
-            reason="opencode 异常结束，但本轮有健康回合（200），已复位失败计数并接力新 run"
+            reason="opencode 异常结束，但本轮有健康回合（200），已复位失败计数并接力"
           elif [ "$outcome" = "failure" ]; then
-            reason="opencode 失败（outcome=failure），已按失败计数接力重试"
+            reason="opencode 失败（outcome=failure），按失败计数并重试"
           else
             reason="opencode 结束（outcome=${outcome:-unknown}），已接力新 run"
           fi
@@ -744,9 +744,9 @@ jobs:
             [ -n "$err_src" ] || err_src=$(tail -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null || true)
             err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-300)
           fi
-          detail="opencode：${outcome}"
+          detail="结果：${outcome}"
           [ -n "$rc" ] && detail="$detail（exit=$rc）"
-          text=$(printf '🔄 CI 本轮结束（已接力新 run）\n原因：%s\nrun：%s\n%s；streak：%s' "$reason" "${R2651_RUN_URL}" "$detail" "$streak")
+          text=$(printf '🔄 CI 本轮结束 · 已接力新 run\n原因：%s\nrun：%s\n%s · streak：%s' "$reason" "${R2651_RUN_URL}" "$detail" "$streak")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
@@ -769,7 +769,7 @@ jobs:
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
                 if(action=="kept-round") label=label "（本轮未停）"
-                printf "429 结束探针：当前出口 %s（code=%s，reason=%s，结果=%s%s）", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":"，note=" note)
+                printf "429 探针：出口 %s · code=%s · reason=%s · %s%s", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":" · note=" note)
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
@@ -833,11 +833,11 @@ jobs:
             [ -n "$err_src" ] || err_src=$(tail -1 "$RUNNER_TEMP/opencode-errors.txt" 2>/dev/null || true)
             err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-300)
           fi
-          detail="opencode：${outcome}"
+          detail="结果：${outcome}"
           [ -n "$rc" ] && detail="$detail（exit=$rc）"
-          reason="本轮结束（opencode=$outcome）"
+          reason="本轮结束（outcome=$outcome）"
           if [ "$restore_failed" = "true" ]; then
-            reason="环境/工作区还原失败；已跳过 OpenCode（快照未被覆盖）"
+            reason="环境/工作区还原失败；已跳过 OpenCode（快照未覆盖）"
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
               reason="$reason；连续失败 ${streak} 次，循环已暂停"
             elif [ "$relay_out" = "failure" ]; then
@@ -855,24 +855,24 @@ jobs:
               reason="$reason；未接力"
             fi
           elif [ "$quota_round_limit" = "true" ]; then
-            reason="连续 3 轮 429 且无健康回合（免费额度耗尽），循环已暂停，不再接力新 run"
+            reason="连续 3 轮 429 且无健康回合（免费额度耗尽），循环已暂停"
           elif [ "$watcher" = "true" ]; then
             wr=$(tr '\n' ' ' < "$RUNNER_TEMP/egress/stop" 2>/dev/null | cut -c1-300)
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
-              reason="连续 3 轮无成功，循环已暂停（last: ${wr:-watcher stop}）"
+              reason="连续 3 轮无成功，循环已暂停（last: ${wr:-watcher 停止}）"
             else
-              reason="watcher 结束本轮，但未能接力（${wr:-unknown}）"
+              reason="watcher 结束本轮，但未接力（${wr:-未知}）"
             fi
           elif [ "$outcome" = "cancelled" ]; then
-            reason="本轮被取消（运营者停止信号，不会自动接力）"
+            reason="本轮被取消（运营者停止，不自动接力）"
           elif [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
             reason="连续失败 3 次，循环已暂停"
           elif [ "$relay_out" = "failure" ]; then
-            reason="接力失败：3 次 dispatch 均未成功，没有后继 run"
+            reason="接力失败：3 次 dispatch 均未成功，无后继 run"
           elif [ "$paused" = "true" ]; then
-            reason="循环已暂停（运营者停止或失败阈值），relay 已让路"
+            reason="循环已暂停（运营者停止或达失败阈值），relay 已让路"
           fi
-          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s；relay：%s；streak：%s；pause：%s' "$reason" "${R2651_RUN_URL}" "$detail" "$relay_out" "$streak" "$paused")
+          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun：%s\n%s · relay=%s · streak=%s · pause=%s' "$reason" "${R2651_RUN_URL}" "$detail" "$relay_out" "$streak" "$paused")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")
           fi
@@ -896,7 +896,7 @@ jobs:
                 if(result=="current-exhausted") label="仍无额度"
                 else if(result=="current-ok") label="仍有额度"
                 if(action=="kept-round") label=label "（本轮未停）"
-                printf "429 结束探针：当前出口 %s（code=%s，reason=%s，结果=%s%s）", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":"，note=" note)
+                printf "429 探针：出口 %s · code=%s · reason=%s · %s%s", (cur==""?"?":cur), (code==""?"?":code), (reason==""?"?":reason), label, (note==""?"":" · note=" note)
               }
             ' "$RUNNER_TEMP/egress/quota-probe.meta" 2>/dev/null || true)
           fi
