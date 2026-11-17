@@ -94,6 +94,10 @@ find "$HOME/.local/share/opencode/shell" -type f -size +50M -delete 2>/dev/null 
 # tar 中途失败（文件消失/权限/磁盘）会被 split 的成功掩盖，随后 meta 的
 # bytes/sha 恰好按“半包”计算，读侧校验全绿却永久少数据。必须在同一
 # 子 shell 开 pipefail，失败就退出本步：旧 release 原样保留。
+# R2735: Chromium's optimization-guide model cache (~456MiB under
+# cleanip_probe/profiles/*) and __pycache__ are regenerable; excluding them
+# keeps the fallback env tar small. env-sync.sh has the same excludes for the
+# primary path.
 if ! ( set -o pipefail
   "${TAR_COMP[@]}" -C "$HOME" \
   --exclude='./work' \
@@ -110,6 +114,10 @@ if ! ( set -o pipefail
   --exclude='./.rustup' \
   --exclude='./.dotnet' \
   --exclude='./.opencode/.v2lib-live' \
+  --exclude='*/optimization_guide_model_store' \
+  --exclude='*/optimization_guide_model_store/*' \
+  --exclude='*/__pycache__' \
+  --exclude='*/__pycache__/*' \
   . 2>/dev/null | split -b "$SPLIT_SIZE" - "$OUT/env.tar.gz." ); then
   echo "::error::environment package failed (tar/split returned nonzero); refusing to publish a partial env package (previous generation kept)"
   exit 1
