@@ -192,6 +192,48 @@ while IFS=$'\t' read -r snap_name snap_repo snap_branch snap_commit; do
   ) &
   SLIM_PIDS+=("$!")
 done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | [.dir, .repo, .branch, .commit] | @tsv' "$INDEX" 2>/dev/null)
+# R2736: nested repos are stored as a worktree only (their .git is excluded
+# from the slim package). Rebuild a depth-1 .git in place exactly like the
+# top-level slim restore: the files stay untouched, uncommitted work remains
+# unstaged, and only the commit's objects are fetched.
+while IFS=$'\t' read -r snap_name nested_dir nested_repo nested_branch nested_commit; do
+  [ -n "$snap_name" ] && [ -n "$nested_dir" ] || continue
+  target_dir="$TARGETS_DIR/$snap_name/$nested_dir"
+  [ -d "$target_dir" ] || continue
+  [ -e "$target_dir/.git" ] && continue
+  (
+    set +e
+    cd "$target_dir" || exit 0
+    git init -q 2>/dev/null || exit 0
+    git remote add origin "$nested_repo" 2>/dev/null \
+      || git remote set-url origin "$nested_repo" 2>/dev/null
+    ok=0
+    if [ -n "$nested_commit" ]; then
+      git fetch -q --depth=1 origin "$nested_commit" 2>/dev/null && ok=1
+    fi
+    if [ "$ok" != 1 ] && [ -n "$nested_branch" ]; then
+      git fetch -q --depth=1 origin "$nested_branch" 2>/dev/null \
+        && git cat-file -e "$nested_commit^{commit}" 2>/dev/null && ok=1
+    fi
+    if [ "$ok" = 1 ]; then
+      if [ -n "$nested_branch" ]; then
+        git update-ref "refs/heads/$nested_branch" "$nested_commit" 2>/dev/null
+        git symbolic-ref HEAD "refs/heads/$nested_branch" 2>/dev/null
+        git update-ref "refs/remotes/origin/$nested_branch" "$nested_commit" 2>/dev/null
+      else
+        git update-ref --no-deref HEAD "$nested_commit" 2>/dev/null
+      fi
+      git reset -q --mixed 2>/dev/null
+      echo "nested workspace $snap_name/$nested_dir restored (slim worktree + depth-1 git at ${nested_commit:0:12})"
+    else
+      git add -A 2>/dev/null
+      git -c user.name=opencode-ci -c user.email=opencode-ci@users.noreply.github.com \
+        commit -q -m "slim restore fallback: nested remote fetch failed" 2>/dev/null
+      echo "::warning::nested slim target $snap_name/$nested_dir remote fetch failed; kept worktree as a local commit"
+    fi
+  ) &
+  SLIM_PIDS+=("$!")
+done < <(jq -r '.snapshots[]? | select(((.mode // "") | startswith("dirtar"))) | .dir as $d | (.nested // [])[]? | [$d, .dir, .repo, .branch, .commit] | @tsv' "$INDEX" 2>/dev/null)
 if [ ${#SLIM_PIDS[@]} -gt 0 ]; then
   wait "${SLIM_PIDS[@]}" 2>/dev/null || true
 fi
@@ -218,7 +260,10 @@ while IFS=$'\t' read -r snap_name snap_fp snap_commit; do
   fi
   head=$(git -C "$target_dir" rev-parse HEAD 2>/dev/null || true)
   branch=$(git -C "$target_dir" symbolic-ref --short HEAD 2>/dev/null || true)
-  wt=$( (cd "$target_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1) )
+  # R2736: nested .git is not part of the slim package and is rebuilt on
+  # restore; hash only working-tree files (all .git dirs pruned) so save and
+  # restore agree.
+  wt=$( (cd "$target_dir" && find . -name .git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1) )
   got=$(printf 'head=%s\nbranch=%s\nworktree=%s\n' "$head" "$branch" "$wt" | sha256sum | cut -d' ' -f1)
   if [ "$got" = "$snap_fp" ]; then
     FP_OK=$((FP_OK + 1))

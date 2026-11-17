@@ -57,10 +57,33 @@ for target_dir in "$TARGETS_DIR"/*/; do
     fi
   fi
 
+  # R2736（运营者：「继续」压缩两轮间隔）：slim 目标只存工作树、不存 .git，
+  # 但嵌套仓库（实测 proxyip/pcb 的 .git 有 324MB）此前仍被整包上传，是
+  # targets 包 376MB 的主要来源。为每个 slim 目标的嵌套仓库记录 remote/
+  # branch/commit，打包时排除其 .git，还原时按 top-level 同样的 depth-1
+  # fetch 重建（工作树文件不动，未提交修改仍是 unstaged）。
+  # 只在该 commit 已存在于远端分支时启用；否则保留 .git 整包，宁慢不丢。
+  NESTED='[]'
+  if [ "$MODE" = "dirtar-slim" ]; then
+    NESTED=$(cd "$repo_dir" && find . -mindepth 2 -maxdepth 3 -type d -name .git -print 2>/dev/null | while IFS= read -r g; do
+      nd=${g#./}; nd=${nd%/.git}
+      nrepo=$(git -C "$nd" remote get-url origin 2>/dev/null || true)
+      nbranch=$(git -C "$nd" symbolic-ref --short HEAD 2>/dev/null || true)
+      ncommit=$(git -C "$nd" rev-parse HEAD 2>/dev/null || true)
+      [ -n "$nrepo" ] && [ -n "$nbranch" ] && [ -n "$ncommit" ] || continue
+      git -C "$nd" branch -r --contains "$ncommit" 2>/dev/null | grep -q . || continue
+      jq -n --arg dir "$nd" --arg repo "$nrepo" --arg branch "$nbranch" --arg commit "$ncommit" \
+        '{dir:$dir, repo:$repo, branch:$branch, commit:$commit}'
+    done | jq -s '.')
+    printf '%s' "$NESTED" | jq -e 'type == "array"' >/dev/null 2>&1 || NESTED='[]'
+  fi
+
   FP=$( {
     printf 'head=%s\n' "$COMMIT"
     printf 'branch=%s\n' "$BRANCH"
-    printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -path ./.git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    # R2736: 指纹只看工作树；嵌套 .git 现在不随包走，若仍参与哈希，
+    # 还原侧重建后的 .git 会让每一轮 fp 都对不上。
+    printf 'worktree=%s\n' "$(cd "$repo_dir" && find . -name .git -prune -o -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)"
   } | sha256sum | cut -d' ' -f1 )
 
   ENTRY=$(jq -n \
@@ -71,7 +94,8 @@ for target_dir in "$TARGETS_DIR"/*/; do
     --arg branch "$BRANCH" \
     --arg commit "$COMMIT" \
     --arg saved_at "$SAVED_AT" \
-    '{repo: $repo, dir: $dir, mode: $mode, fp: $fp, bundle: "", worktree: "", branch: $branch, commit: $commit, saved_at: $saved_at}')
+    --argjson nested "$NESTED" \
+    '{repo: $repo, dir: $dir, mode: $mode, fp: $fp, bundle: "", worktree: "", branch: $branch, commit: $commit, saved_at: $saved_at, nested: $nested}')
 
   tmp=$(mktemp)
   jq --arg dir "$name" '.snapshots |= map(select(.dir != $dir))' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"

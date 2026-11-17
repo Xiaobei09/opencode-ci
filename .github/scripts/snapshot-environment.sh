@@ -175,6 +175,11 @@ if [ "$CARRY" != 1 ]; then
     while IFS= read -r sd; do
       [ -n "$sd" ] && SLIM_EXCLUDES+=("--exclude=$sd/.git" "--exclude=$sd/.git/*")
     done < <(jq -r '.snapshots[]? | select(.mode == "dirtar-slim") | .dir // empty' "$IDX" 2>/dev/null)
+    # R2736: nested repos inside slim targets are rebuilt on restore from the
+    # recorded commit; their .git is the bulk of the old 376MB targets package.
+    while IFS= read -r nd; do
+      [ -n "$nd" ] && SLIM_EXCLUDES+=("--exclude=$nd/.git" "--exclude=$nd/.git/*")
+    done < <(jq -r '.snapshots[]? | select(.mode == "dirtar-slim") | .dir as $d | (.nested // [])[]? | "\($d)/\(.dir)"' "$IDX" 2>/dev/null)
   fi
   # R2573（D6）：与 env 同因 —— tar|split 默认只看 split 的退出码。
   # 半包一旦发布，meta 的 bytes/sha 与半包一致，读侧“校验通过”；
