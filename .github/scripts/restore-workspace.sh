@@ -54,6 +54,12 @@ if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ] || [ "$rc_i" != 0 ]; then
   echo "::warning::parallel setup failed (targets rc=$rc_t env rc=$rc_e toolchain rc=$rc_i)"
   exit 1
 fi
+# R2766: a previous round can be killed between the bridge claiming a rollover
+# request (rename to `ses_*.json.claimed-*`) and failure_guard recovering it, so
+# the snapshot may contain only the claimed name. The bridge scans base names
+# only; put the request back before OpenCode starts instead of waiting a full
+# extra round. No bridge is running yet, so the claim is definitely orphaned.
+bash "$GITHUB_WORKSPACE/.github/scripts/recover-rollover-claims.sh" || true
 for p in "$HOME/.config/opencode"/*.json \
          "$HOME/.config/opencode"/*.env \
          "$HOME/.local/state/opencode/service.json" \
