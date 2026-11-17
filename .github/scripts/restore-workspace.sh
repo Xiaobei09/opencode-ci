@@ -29,7 +29,7 @@ install_toolchain() {
     if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
   done
   if [ "$installed" -ne 1 ]; then
-    echo "::error::opencode install failed after 3 attempts (upstream 404?)"
+    echo "::warning::opencode install failed after 3 attempts (upstream 404?)"
     return 1
   fi
   echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
@@ -47,7 +47,7 @@ cat /tmp/restore-env.log 2>/dev/null
 echo "== install-toolchain.log =="
 cat /tmp/install-toolchain.log 2>/dev/null
 if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ] || [ "$rc_i" != 0 ]; then
-  echo "::error::parallel setup failed (targets rc=$rc_t env rc=$rc_e toolchain rc=$rc_i)"
+  echo "::warning::parallel setup failed (targets rc=$rc_t env rc=$rc_e toolchain rc=$rc_i)"
   exit 1
 fi
 for p in "$HOME/.config/opencode"/*.json \
