@@ -6,6 +6,14 @@ set +e
 # into "$TARGETS_DIR/<name>". An unset variable would turn those into
 # root-level paths, so refuse to run without both targets.
 : "${SESSIONS_DIR:?SESSIONS_DIR must be set}" "${TARGETS_DIR:?TARGETS_DIR must be set}"
+# R2755: clean recovery deliberately starts without a restored target workspace.
+# The agent works in the fresh CI checkout / sessions clone; keeping old dirty
+# worktrees would contaminate the repair. Toolchain/env still restore normally.
+if [ "${CI_RECOVERY:-0}" = "1" ]; then
+  echo "clean recovery: skipping target workspace restore (fresh environment)"
+  rm -rf "${TARGETS_DIR:?}"/* 2>/dev/null || true
+  exit 0
+fi
 # R2589 (D9): one wall-clock measurement for the whole targets restore so the
 # run log shows where the non-opencode budget goes.
 RT_T0=$(date +%s)

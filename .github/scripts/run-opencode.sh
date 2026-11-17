@@ -113,6 +113,25 @@ else
   tail -20 "$EGRESS_DIR/proxy.log" 2>/dev/null || true
   exit 1
 fi
+# R2755 (operator: "增加一个恢复模式：要求使用干净环境，自动新增一个会话并且临时将
+# 一个bot的会话切换到这个会话，并且注入提示词，要求其修复ci，同时其他会话都不
+# 运行，完成之后也不保存会话").
+# The clean recovery preparation must run before we probe/choose the bound session,
+# because it deliberately clears every front/pinned target and the session DB.
+# It also disables resume-once and the rolling env-sync: recovery is a one-shot
+# clean room and the workflow must not save this session.
+if [ "${CI_RECOVERY:-0}" = "1" ]; then
+  section "clean recovery prep"
+  bash "$GITHUB_WORKSPACE/.github/scripts/prepare-recovery.sh"
+  export CI_RESUME_ONCE=0
+  export RESUME_ONCE_SIDS=""
+  export ENV_SYNC_SCRIPT=/nonexistent
+else
+  # R2755: a normal run must never inherit a stale recovery marker (it is not
+  # snapshotted, but a cancelled recovery could leave one in a reused HOME).
+  rm -f "$HOME/.config/opencode/ci-recovery-active.json" \
+        "$HOME/.config/opencode/ci-recovery.json" 2>/dev/null || true
+fi
 # R2618: no default per-round timeout. The old 600s budget killed a
 # healthy, still-working turn every 10 minutes and relayed a new run.
 # 0 = run until OpenCode exits or the egress watcher sees a verified
@@ -159,7 +178,16 @@ RECOVER="${RECOVER_LINE%% *}"
 RECOVER_MSGS="${RECOVER_LINE##* }"
 [ -z "$RECOVER_MSGS" ] && RECOVER_MSGS="0"
 echo "recovery probe: recover=$([ -n "$RECOVER" ] && echo yes || echo no) msgs=$RECOVER_MSGS"
-if [ -n "$SID" ] && [ "$SID_PRESENT" = "yes" ]; then
+if [ "${CI_RECOVERY:-0}" = "1" ]; then
+  # R2755: a clean recovery intentionally starts with NO bound session (the
+  # preparation cleared every front and deleted the DB). `--continue` would
+  # create/resume a stray session before the bridge consumes the recovery
+  # request, so boot bare and let processCiRecovery create + switch the single
+  # repair session.
+  ARGS=(--standalone)
+  RESUME_SID=""
+  echo "clean recovery: launching without a bound session; the bridge creates the repair session"
+elif [ -n "$SID" ] && [ "$SID_PRESENT" = "yes" ]; then
   ARGS=(--standalone --session "$SID")
   RESUME_SID="$SID"
   echo "resuming bound session present_in_db=$SID_PRESENT"

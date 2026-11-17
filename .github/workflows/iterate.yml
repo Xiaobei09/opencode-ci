@@ -33,6 +33,21 @@ on:
         type: string
         required: false
         default: "256m"
+      recovery:
+        description: Clean-room CI repair (fresh session, halt other sessions, never save this run's state)
+        type: boolean
+        required: false
+        default: false
+      recovery_reason:
+        description: Failure summary passed into the recovery prompt (auto-filled on failure-triggered recovery)
+        type: string
+        required: false
+        default: ""
+      recovery_run:
+        description: Failed run id passed into the recovery prompt (auto-filled on failure-triggered recovery)
+        type: string
+        required: false
+        default: ""
   schedule:
     - cron: "0 */6 * * *"
 
@@ -53,6 +68,8 @@ env:
   SESSIONS_REPO: ${{ vars.SESSIONS_REPO }}
   SESSIONS_DIR: /home/runner/work/sessions
   TARGETS_DIR: /home/runner/work/targets
+  # R2755: clean-room recovery (workflow input or failure_guard auto-dispatch).
+  CI_RECOVERY: ${{ github.event.inputs.recovery == 'true' && '1' || '0' }}
 
 jobs:
   iterate:
@@ -290,6 +307,9 @@ jobs:
           # failure_guard below and handled by the bridge at the next boot.
           # Default on; set the repo variable to 0 to disable.
           ROLLOVER_ON_429: ${{ vars.ROLLOVER_ON_429 || '1' }}
+          # R2755: prompt context for prepare-recovery.sh (written before launch).
+          CI_RECOVERY_REASON: ${{ inputs.recovery_reason }}
+          CI_RECOVERY_RUN: ${{ inputs.recovery_run }}
         run: bash -e "$GITHUB_WORKSPACE/.github/scripts/run-opencode.sh"
       - name: Update failure streak and stop policy
         id: failure_guard
@@ -308,6 +328,8 @@ jobs:
           R2651_QUOTA_STOP: ${{ steps.run_opencode.outputs.egress_quota_stop }}
           R2651_ROUND_200_COUNT: ${{ steps.run_opencode.outputs.round_200_count }}
           R2651_BUDGET_TIMEOUT: ${{ steps.run_opencode.outputs.budget_timeout }}
+          R2651_RECOVERY: ${{ github.event.inputs.recovery }}
+          R2651_RECOVERY_AUTO: ${{ vars.CI_RECOVERY_AUTO || '1' }}
           SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
           set +e
@@ -322,7 +344,7 @@ jobs:
           # 20-30s env-sync push. The dedicated steps below wait on this pid;
           # if the runner killed the background job between steps, they fall
           # back to the original synchronous run (worst case = old timing).
-          if [ "${R2651_RESTORE_OUTCOME:-}" = "success" ]; then
+          if [ "${R2651_RESTORE_OUTCOME:-}" = "success" ] && [ "${R2651_RECOVERY:-}" != "1" ]; then
             if bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"; then
               rm -f "$RUNNER_TEMP/snapshot-env.rc"
               (
@@ -498,6 +520,52 @@ jobs:
             echo "relay_delay=$delay" >> "$GITHUB_OUTPUT"
             allow=true
           }
+          # R2755 (operator: "增加一个恢复模式…可以在工作流配置处启动或者在ci出现错误后
+          # 自动启动"): a real (non-quota) CI failure dispatches ONE clean-room recovery
+          # run. The recovery run gets a fresh session, halts every other session and
+          # never saves; it is the only place an agent is allowed to repair CI without
+          # contaminating the loop state. Guards:
+          #   * never from a recovery run itself (no cascade),
+          #   * CI_RECOVERY_AUTO=0 disables the automation,
+          #   * 30-minute cooldown via the CI_RECOVERY_LAST_AT repo variable,
+          #   * on success suppress the normal relay (the recovery run is the successor).
+          RECOVERY_COOLDOWN_S=1800
+          maybe_dispatch_recovery() {
+            local why="$1" last now out rc
+            if [ "${R2651_RECOVERY:-}" = "true" ]; then
+              echo "clean recovery: this run is already a recovery run; no auto-dispatch"
+              return 1
+            fi
+            if [ "${R2651_RECOVERY_AUTO:-1}" = "0" ]; then
+              echo "::notice::clean recovery auto-dispatch disabled (CI_RECOVERY_AUTO=0); using the normal round policy"
+              return 1
+            fi
+            now=$(date +%s)
+            last=$(gh variable get CI_RECOVERY_LAST_AT --repo "$repo" 2>/dev/null || echo "")
+            case "$last" in ''|*[!0-9]*) last=0 ;; esac
+            if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$RECOVERY_COOLDOWN_S" ]; then
+              echo "::notice::clean recovery dispatched $((now - last))s ago (< ${RECOVERY_COOLDOWN_S}s cooldown); not dispatching again"
+              return 1
+            fi
+            # Keep the input single-line/short: it is quoted into the workflow
+            # dispatch request and echoed into the recovery prompt.
+            why=$(printf '%s' "$why" | tr '\n\r' '  ' | cut -c1-200)
+            out=$(gh workflow run iterate.yml \
+              -f recovery=true \
+              -f "recovery_reason=$why" \
+              -f "recovery_run=${GITHUB_RUN_ID:-}" \
+              --ref main --repo "$repo" 2>&1)
+            rc=$?
+            if [ "$rc" != "0" ]; then
+              echo "$out"
+              echo "::warning::clean recovery dispatch failed; falling back to the normal round policy"
+              return 1
+            fi
+            gh variable set CI_RECOVERY_LAST_AT --body "$now" --repo "$repo" >/dev/null 2>&1 || true
+            echo "recovery_dispatched=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::dispatched clean-room CI recovery: $why"
+            return 0
+          }
           if [ "$restore_outcome" != "success" ]; then
             # R2580（D2）：restore 失败时 OpenCode/Select 都被跳过；这里只记录真实
             # 原因，后续 skipped 分支按一次失败轮计数并接力。绝不能启动 OpenCode
@@ -574,6 +642,11 @@ jobs:
               else
                 echo "::error::could not update CI_FAIL_STREAK; refusing to relay blindly"
               fi
+              # R2755: a silent exit with no healthy turn is exactly the state a
+              # clean-room repair can fix (old sessions/config may be broken).
+              if maybe_dispatch_recovery "opencode exited 0 without a healthy turn (silent exit, CI_FAIL_STREAK=$next/3)"; then
+                allow=false
+              fi
             fi
           elif [ "$outcome" = "failure" ] || [ "$outcome" = "skipped" ]; then
             # R2559（D5，运营者规则：只有连续 3 轮没有任何 200 才停循环）：
@@ -610,6 +683,16 @@ jobs:
                 fi
               else
                 echo "::error::could not update CI_FAIL_STREAK; refusing to relay blindly"
+              fi
+              # R2755: real failure without any healthy turn → repair in a clean
+              # room instead of retrying the same broken state. A dispatched
+              # recovery is the successor, so the normal relay is suppressed.
+              # A failed environment restore is not repairable by the code agent
+              # (its recovery run would fail at the same step), so keep the old
+              # retry policy instead of burning a clean-room boot.
+              if [ "$restore_outcome" = "success" ] \
+                 && maybe_dispatch_recovery "run outcome=$outcome without a healthy turn (CI_FAIL_STREAK=$next/3)"; then
+                allow=false
               fi
             fi
           elif [ "$outcome" = "cancelled" ]; then
@@ -859,6 +942,7 @@ jobs:
           R2651_QUOTA_ROUND_LIMIT: ${{ steps.failure_guard.outputs.quota_round_limit }}
           R2651_EGRESS_N: ${{ steps.failure_guard.outputs.egress_retry_count }}
           R2651_QUOTA_EVIDENCE: ${{ steps.failure_guard.outputs.quota_evidence }}
+          R2651_RECOVERY_DISPATCHED: ${{ steps.failure_guard.outputs.recovery_dispatched }}
           R2651_EXIT_CODE: ${{ steps.run_opencode.outputs.exit_code }}
           R2651_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -866,6 +950,7 @@ jobs:
           repo="${R2651_REPO:-}"
           outcome="${R2651_RUN_OUTCOME:-}"
           relay_out="${R2651_RELAY_OUTCOME:-}"
+          recovery_dispatched="${R2651_RECOVERY_DISPATCHED:-}"
           watcher="${R2651_WATCHER_STOP:-}"
           select_failed="${R2651_SELECT_FAILED:-}"
           select_reason="${R2651_SELECT_REASON:-}"
@@ -896,7 +981,11 @@ jobs:
             err_line=$(printf '%s\n' "$err_src" | tr -d '\r' | sed -E 's/\\n.*$//; s/^.*cause="//' | cut -c1-160)
           fi
           reason="本轮结束（outcome=$outcome）"
-          if [ "$restore_failed" = "true" ]; then
+          if [ "$recovery_dispatched" = "true" ]; then
+            # R2755: the clean recovery run is the successor; do NOT claim the
+            # loop paused or failed to relay.
+            reason="已启动 CI 干净恢复（新会话修复；其他会话未运行，本轮不保存）"
+          elif [ "$restore_failed" = "true" ]; then
             reason="环境还原失败，已跳过 OpenCode"
             if [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
               reason="$reason；连续失败 ${streak} 次，循环已暂停"
@@ -981,7 +1070,8 @@ jobs:
       - name: Save workspace snapshots
         # R2513: smoke must NOT write the env release (it runs in a separate
         # concurrency group, so a save could race and overwrite production).
-        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
+        # R2755: clean recovery is intentionally ephemeral — never save it.
+        if: always() && github.event.inputs.smoke != 'true' && github.event.inputs.recovery != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         run: |
           # R2742: already saved right before the parallel snapshot launch;
           # only run here when that fast path did not happen.
@@ -991,7 +1081,8 @@ jobs:
             bash -e "$GITHUB_WORKSPACE/.github/scripts/save-workspace-snapshots.sh"
           fi
       - name: Snapshot environment to sessions repository
-        if: always() && github.event.inputs.smoke != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
+        # R2755: clean recovery must not persist the temporary session/env.
+        if: always() && github.event.inputs.smoke != 'true' && github.event.inputs.recovery != 'true' && steps.lock.outputs.acquired == 'true' && steps.restore_ws.outcome == 'success'
         env:
           SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
