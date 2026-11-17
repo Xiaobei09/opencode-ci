@@ -235,7 +235,27 @@ env_sync_try() {
   dbfmt=$(jq -r '.db_format // "raw"' "$json" 2>/dev/null || echo raw)
   dbexp=$(jq -r '.db_bytes // 0' "$json" 2>/dev/null || echo 0)
   case "$dbexp" in (*[!0-9]*) dbexp=0;; esac
-  if [ "$dbfmt" = "gzip" ]; then
+  if [ "$dbfmt" = "zstd" ]; then
+    # R2741（运营者：「继续」压缩两轮间隔）：写入侧改用 zstd -3 -T0（291MB DB
+    # 实测 0.6s / 59.6MB，gzip -6 为 6.6s / 75.8MB）；旧 gzip/chunks 仍兼容。
+    if [ ! -f "$d/payload/.local/share/opencode/opencode.db.zst" ]; then
+      echo "::warning::env-sync zstd db missing; using release packages"
+      return 1
+    fi
+    if ! command -v zstd >/dev/null 2>&1; then
+      echo "::warning::env-sync zstd db present but zstd is unavailable; using release packages"
+      return 1
+    fi
+    if ! zstd -dq -c "$d/payload/.local/share/opencode/opencode.db.zst" \
+          > "$d/payload/.local/share/opencode/opencode.db" 2>/dev/null; then
+      echo "::warning::env-sync zstd db decompress failed; using release packages"
+      return 1
+    fi
+    rm -f "$d"/payload/.local/share/opencode/opencode.db.zst 2>/dev/null
+    # 格式切换拍：清掉残留的 gzip/chunks，避免 rsync 进 $HOME
+    rm -f "$d"/payload/.local/share/opencode/opencode.db.gz \
+          "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part 2>/dev/null
+  elif [ "$dbfmt" = "gzip" ]; then
     if [ ! -f "$d/payload/.local/share/opencode/opencode.db.gz" ]; then
       echo "::warning::env-sync gzip db missing; using release packages"
       return 1
@@ -247,11 +267,13 @@ env_sync_try() {
     fi
     rm -f "$d"/payload/.local/share/opencode/opencode.db.gz 2>/dev/null
     # R579：gzip 形态下若 payload 仍残留旧 chunks（格式切换拍），一并清掉，避免 rsync 进 $HOME
-    rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part 2>/dev/null
+    rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
+          "$d"/payload/.local/share/opencode/opencode.db.zst 2>/dev/null
   elif [ "$dbfmt" = "chunks" ]; then
     cat "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
       > "$d"/payload/.local/share/opencode/opencode.db 2>/dev/null || return 1
-    rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part 2>/dev/null
+    rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
+          "$d"/payload/.local/share/opencode/opencode.db.zst 2>/dev/null
   fi
   dbsz=$(stat -c%s "$d/payload/.local/share/opencode/opencode.db" 2>/dev/null || echo 0)
   if [ "${dbexp:-0}" -gt 0 ] && [ "$dbsz" != "$dbexp" ]; then
