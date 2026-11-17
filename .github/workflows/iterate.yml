@@ -278,7 +278,10 @@ jobs:
           SESSIONS_DIR: /home/runner/work/sessions
           TARGETS_DIR: /home/runner/work/targets
           TG_BRIDGE_FORCE_SERVE: "1"
-          BUDGET_SECONDS: ${{ inputs.budget_seconds }}
+          # R2755: the recovery prompt has no loop protocol ([STATUS: ...]), so
+          # without a bound the one-shot repair would idle until the 360m job cap.
+          # 1800s is the recovery default; a non-zero manual budget still wins.
+          BUDGET_SECONDS: ${{ github.event.inputs.recovery == 'true' && (github.event.inputs.budget_seconds != '0' && github.event.inputs.budget_seconds || '1800') || inputs.budget_seconds }}
           EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
           # Option C: one-shot resume after a CI restart, independent of the
@@ -777,12 +780,14 @@ jobs:
           R2651_EGRESS_RETRY: ${{ steps.failure_guard.outputs.egress_retry }}
           R2651_EGRESS_N: ${{ steps.failure_guard.outputs.egress_retry_count }}
           R2651_QUOTA_EVIDENCE: ${{ steps.failure_guard.outputs.quota_evidence }}
+          R2651_RECOVERY_RUN: ${{ github.event.inputs.recovery }}
           R2651_EXIT_CODE: ${{ steps.run_opencode.outputs.exit_code }}
           R2651_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
           repo="${R2651_REPO:-}"
           outcome="${R2651_RUN_OUTCOME:-}"
+          recovery_run="${R2651_RECOVERY_RUN:-}"
           watcher="${R2651_WATCHER_STOP:-}"
           reason="${R2651_WATCHER_REASON:-}"
           silent_exit="${R2651_SILENT_EXIT:-}"
@@ -835,6 +840,8 @@ jobs:
             reason="watcher：${reason}"
           elif [ "$outcome" = "success" ] && [ "$silent_exit" = "true" ]; then
             reason="opencode 退出但本轮无健康回合（按失败计数）"
+          elif [ "$recovery_run" = "true" ] && [ "$outcome" = "success" ]; then
+            reason="干净恢复结束（本轮未保存）；下一轮恢复正常循环"
           elif [ "$outcome" = "success" ]; then
             reason="opencode 正常结束"
           elif [ "$outcome" = "failure" ] && [ "$healthy_failure" = "true" ]; then
