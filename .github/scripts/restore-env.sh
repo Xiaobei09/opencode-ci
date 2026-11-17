@@ -24,15 +24,22 @@ ENV_TAG="env"
 # 还原；两者都不可用才 bootstrap。env-safe 由运营者的 env-backup.sh 维护为「最近一次完好代」。
 FALLBACK_TAG="${SESSIONS_FALLBACK_TAG:-env-safe}"
 env_try() {
-  local tag="$1" dl="/tmp/envdl-$1" vols pages bytes expect hdr tflag
+  local tag="$1" dl="/tmp/envdl-$1" vols pages bytes expect hdr tflag rel_at t0
   rm -rf "$dl" && mkdir -p "$dl"
+  t0=$(date +%s)
+  # R2773: fetch the (tiny) manifest first so the job log names the generation
+  # and byte size that is about to be downloaded. Before this, a 607MB release
+  # fallback could run for minutes with no line saying what it was doing.
+  timeout --kill-after=10 "${GH_META_TIMEOUT:-30}" gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
+  rel_at=$(jq -r '.env.packed_at // .created_at // empty' "$dl/meta.json" 2>/dev/null || true)
+  expect=$(jq -r '.env.bytes // empty' "$dl/meta.json" 2>/dev/null || true)
+  echo "release '$tag': env package ${expect:-unknown} bytes${rel_at:+, packed $rel_at}; downloading (deadline ${FETCH_ASSET_DEADLINE:-420}s)"
   bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'env.tar.gz*' "$dl" || return 1
   ls "$dl"/env.tar.gz* >/dev/null 2>&1 || return 1
-  gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
   vols=$(ls "$dl"/env.tar.gz* 2>/dev/null | sort -V)
   pages=$(echo "$vols" | wc -l)
   bytes=$(cat $vols 2>/dev/null | wc -c)
-  expect=$(jq -r '.env.bytes // empty' "$dl/meta.json" 2>/dev/null || true)
+  echo "release '$tag': download+verify $(( $(date +%s) - t0 ))s ($bytes bytes)"
   if [ -n "$expect" ] && [ "$bytes" != "$expect" ]; then
     echo "::warning::$tag package incomplete ($bytes of $expect bytes, $pages page(s)); refusing to apply a partial restore"
     return 1
@@ -56,7 +63,7 @@ env_try() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$HOME" $tflag 2>/dev/null; then
-    echo "environment restored from release '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified})"
+    echo "environment restored from release '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified}, packed ${rel_at:-unknown}, total $(( $(date +%s) - t0 ))s)"
     return 0
   fi
   echo "::warning::$tag package failed to extract (tar ${tflag:-plain}, $bytes bytes)"
@@ -68,11 +75,15 @@ env_try() {
 # stage 必须带 stage-meta.json 且字节数完全吻合，半套/无 manifest 的 stage 一律拒绝
 # （宁可用旧的 env-safe，也绝不铺半套 $HOME）。
 env_try_staged() {
-  local tag="$1" dl="/tmp/envdl-$1-staged" vols pages bytes expect hdr tflag
+  local tag="$1" dl="/tmp/envdl-$1-staged" vols pages bytes expect hdr tflag t0
   rm -rf "$dl" && mkdir -p "$dl"
+  t0=$(date +%s)
+  # R2773: same ordering as env_try — manifest first, then the bounded fetch.
+  timeout --kill-after=10 "${GH_META_TIMEOUT:-30}" gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
+  expect=$(jq -r '.env.bytes // empty' "$dl/stage-meta.json" 2>/dev/null || true)
+  echo "release '$tag': staged env package ${expect:-unknown} bytes; downloading (deadline ${FETCH_ASSET_DEADLINE:-420}s)"
   bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'stage-env.tar.gz*' "$dl" || return 1
   ls "$dl"/stage-env.tar.gz* >/dev/null 2>&1 || return 1
-  gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
   expect=$(jq -r '.env.bytes // empty' "$dl/stage-meta.json" 2>/dev/null || true)
   if [ -z "$expect" ]; then
     echo "::warning::$tag staged generation has no manifest; refusing an unverifiable staged restore"
@@ -103,7 +114,7 @@ env_try_staged() {
     *)            tflag="" ;;
   esac
   if cat $vols | tar -xf - -C "$HOME" $tflag 2>/dev/null; then
-    echo "environment restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified})"
+    echo "environment restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified}, total $(( $(date +%s) - t0 ))s)"
     return 0
   fi
   echo "::warning::$tag staged generation failed to extract ($pages page(s), $bytes bytes)"
@@ -116,6 +127,23 @@ env_try_staged() {
 # 分支 tip 则让位 release；否则取分支（两者中较新者）。任一不满足即整体回落
 # 原 release 三层链（env → stage-env → env-safe → bootstrap），语义不变。
 ENV_SYNC_MAX_AGE_MIN="${ENV_SYNC_MAX_AGE_MIN:-1440}"
+# R2773 (operator: "上一轮ci的环境还原耗时特别长"): every network leg below used to
+# be unbounded. A single stalled git/curl/gh socket kept the whole parallel
+# restore silent for 164s and then only ended when the operator cancelled the
+# run. Bound them, retry the clone once, and record *why* env-sync was rejected
+# so the release fallback can be refused when it would downgrade fresh state.
+ENV_SYNC_CLONE_TIMEOUT="${ENV_SYNC_CLONE_TIMEOUT:-60}"
+ENV_SYNC_CLONE_ATTEMPTS="${ENV_SYNC_CLONE_ATTEMPTS:-2}"
+GH_META_TIMEOUT="${GH_META_TIMEOUT:-30}"
+# A release env is never a safe substitute for a fresh env-sync branch: the
+# bridge pushes $HOME back to the branch at boot, so restoring an older DB would
+# overwrite the newer branch with stale sessions. The escape hatch below exists
+# only for a deliberate availability-over-freshness trade-off.
+ENV_ALLOW_STALE_RELEASE="${ENV_ALLOW_STALE_RELEASE:-0}"
+ENV_SYNC_FAIL_REASON="${ENV_SYNC_FAIL_REASON:-}"
+ENV_SYNC_COMMIT="${ENV_SYNC_COMMIT:-}"
+ENV_SYNC_EPOCH="${ENV_SYNC_EPOCH:-}"
+ENV_SYNC_AGE_MIN="${ENV_SYNC_AGE_MIN:-}"
 # R2545（token 跨 CI 保存的兜底）：env-sync 分支被拒（release 更新 / 分支过旧）时，
 # 分支里仍可能持有 release 包**缺失**的 bot token（典型：某个 release 仍由旧排除集
 # 生成，bot5 只在分支上）。这里只补“目标不存在或为空”的文件，绝不覆盖 release
@@ -191,30 +219,63 @@ PY
 env_sync_try() {
   local repo="${SESSIONS_REPO:-Xiaobei09/opencode-sessions}"
   local d="/tmp/envsync-restore" json epoch age dbfmt dbexp dbsz sha
-  local carried rel_at rel_epoch
+  local carried rel_at rel_epoch attempt clone_ok t_clone t_all t_step
   rm -rf "$d" 2>/dev/null
-  if ! git clone --depth 1 --single-branch --branch env-sync \
-        "https://github.com/$repo.git" "$d" >/dev/null 2>&1; then
-    echo "::warning::env-sync branch not available; using release packages"
+  t_all=$(date +%s)
+  # R2773: bounded clone + one retry. A force-push or a transient GitHub
+  # hiccup must not turn into an unbounded hang (the old clone had no timeout
+  # and discarded stderr, so a stall looked exactly like a slow restore).
+  clone_ok=0
+  for attempt in $(seq 1 "$ENV_SYNC_CLONE_ATTEMPTS"); do
+    rm -rf "$d" 2>/dev/null
+    t_clone=$(date +%s)
+    echo "env-sync: cloning branch env-sync (attempt ${attempt}/${ENV_SYNC_CLONE_ATTEMPTS}, timeout ${ENV_SYNC_CLONE_TIMEOUT}s)"
+    if timeout --signal=TERM --kill-after=15 "$ENV_SYNC_CLONE_TIMEOUT" \
+         git clone --depth 1 --single-branch --branch env-sync \
+           "https://github.com/$repo.git" "$d" >/dev/null 2>&1; then
+      clone_ok=1
+      echo "env-sync: clone ok in $(( $(date +%s) - t_clone ))s"
+      break
+    fi
+    echo "::warning::env-sync clone attempt ${attempt}/${ENV_SYNC_CLONE_ATTEMPTS} failed/timed out after $(( $(date +%s) - t_clone ))s"
+    if [ "$attempt" -lt "$ENV_SYNC_CLONE_ATTEMPTS" ]; then sleep 3; fi
+  done
+  if [ "$clone_ok" -ne 1 ]; then
+    ENV_SYNC_FAIL_REASON="clone"
+    rm -rf "$d" 2>/dev/null
+    echo "::warning::env-sync branch not available after ${ENV_SYNC_CLONE_ATTEMPTS} attempt(s); considering release packages"
     return 1
   fi
   sha=$(git -C "$d" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  ENV_SYNC_COMMIT="$sha"
   json="$d/env-sync.json"
   if [ ! -s "$json" ] || [ ! -d "$d/payload/.config/opencode" ]; then
-    echo "::warning::env-sync payload missing or incomplete; using release packages"
+    ENV_SYNC_FAIL_REASON="payload"
+    rm -rf "$d" 2>/dev/null
+    echo "::warning::env-sync payload missing or incomplete; considering release packages"
     return 1
   fi
   epoch=$(jq -r '.epoch // empty' "$json" 2>/dev/null || true)
-  case "$epoch" in (*[!0-9]*|'') echo "::warning::env-sync manifest epoch invalid; using release packages"; return 1;; esac
+  case "$epoch" in
+    (*[!0-9]*|'')
+      ENV_SYNC_FAIL_REASON="epoch"
+      rm -rf "$d" 2>/dev/null
+      echo "::warning::env-sync manifest epoch invalid; considering release packages"
+      return 1
+      ;;
+  esac
+  ENV_SYNC_EPOCH="$epoch"
   age=$(( ( $(date +%s) - epoch ) / 60 ))
+  ENV_SYNC_AGE_MIN="$age"
   if [ "$age" -gt "$ENV_SYNC_MAX_AGE_MIN" ]; then
+    ENV_SYNC_FAIL_REASON="too-old"
     echo "::warning::env-sync branch too old (${age}min > ${ENV_SYNC_MAX_AGE_MIN}min cap); using release packages"
     # R2545: the branch is stale, but tokens rarely rotate; fill only missing files
     # (applied after the release restore, see the call site below).
     BOT_TOKEN_BRANCH="$d"
     return 1
   fi
-  gh release download "$ENV_TAG" --repo "$repo" --pattern 'meta.json' --dir "$d" --clobber >/dev/null 2>&1 || true
+  timeout --kill-after=10 "$GH_META_TIMEOUT" gh release download "$ENV_TAG" --repo "$repo" --pattern 'meta.json' --dir "$d" --clobber >/dev/null 2>&1 || true
   if [ -s "$d/meta.json" ]; then
     carried=$(jq -r '.env.carried // false' "$d/meta.json" 2>/dev/null || echo false)
     if [ "$carried" = "true" ]; then
@@ -224,6 +285,7 @@ env_sync_try() {
     fi
     rel_epoch=$(date -u -d "$rel_at" +%s 2>/dev/null || true)
     if [ -n "$rel_epoch" ] && [ "$rel_epoch" -gt "$epoch" ]; then
+      ENV_SYNC_FAIL_REASON="release-newer"
       echo "::warning::release env (packed ${rel_at}) is newer than the branch tip; using release packages"
       # R2545: don't lose bot creds that only exist on the branch. The overlay is
       # applied AFTER the release restore — doing it here would be overwritten by
@@ -235,20 +297,27 @@ env_sync_try() {
   dbfmt=$(jq -r '.db_format // "raw"' "$json" 2>/dev/null || echo raw)
   dbexp=$(jq -r '.db_bytes // 0' "$json" 2>/dev/null || echo 0)
   case "$dbexp" in (*[!0-9]*) dbexp=0;; esac
+  t_step=$(date +%s)
   if [ "$dbfmt" = "zstd" ]; then
     # R2741（运营者：「继续」压缩两轮间隔）：写入侧改用 zstd -3 -T0（291MB DB
     # 实测 0.6s / 59.6MB，gzip -6 为 6.6s / 75.8MB）；旧 gzip/chunks 仍兼容。
     if [ ! -f "$d/payload/.local/share/opencode/opencode.db.zst" ]; then
-      echo "::warning::env-sync zstd db missing; using release packages"
+      ENV_SYNC_FAIL_REASON="db"
+      rm -rf "$d" 2>/dev/null
+      echo "::warning::env-sync zstd db missing; considering release packages"
       return 1
     fi
     if ! command -v zstd >/dev/null 2>&1; then
-      echo "::warning::env-sync zstd db present but zstd is unavailable; using release packages"
+      ENV_SYNC_FAIL_REASON="db"
+      rm -rf "$d" 2>/dev/null
+      echo "::warning::env-sync zstd db present but zstd is unavailable; considering release packages"
       return 1
     fi
     if ! zstd -dq -c "$d/payload/.local/share/opencode/opencode.db.zst" \
           > "$d/payload/.local/share/opencode/opencode.db" 2>/dev/null; then
-      echo "::warning::env-sync zstd db decompress failed; using release packages"
+      ENV_SYNC_FAIL_REASON="db"
+      rm -rf "$d" 2>/dev/null
+      echo "::warning::env-sync zstd db decompress failed; considering release packages"
       return 1
     fi
     rm -f "$d"/payload/.local/share/opencode/opencode.db.zst 2>/dev/null
@@ -257,12 +326,16 @@ env_sync_try() {
           "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part 2>/dev/null
   elif [ "$dbfmt" = "gzip" ]; then
     if [ ! -f "$d/payload/.local/share/opencode/opencode.db.gz" ]; then
-      echo "::warning::env-sync gzip db missing; using release packages"
+      ENV_SYNC_FAIL_REASON="db"
+      rm -rf "$d" 2>/dev/null
+      echo "::warning::env-sync gzip db missing; considering release packages"
       return 1
     fi
     if ! gzip -dc "$d/payload/.local/share/opencode/opencode.db.gz" \
           > "$d/payload/.local/share/opencode/opencode.db" 2>/dev/null; then
-      echo "::warning::env-sync gzip db decompress failed; using release packages"
+      ENV_SYNC_FAIL_REASON="db"
+      rm -rf "$d" 2>/dev/null
+      echo "::warning::env-sync gzip db decompress failed; considering release packages"
       return 1
     fi
     rm -f "$d"/payload/.local/share/opencode/opencode.db.gz 2>/dev/null
@@ -270,14 +343,20 @@ env_sync_try() {
     rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
           "$d"/payload/.local/share/opencode/opencode.db.zst 2>/dev/null
   elif [ "$dbfmt" = "chunks" ]; then
-    cat "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
-      > "$d"/payload/.local/share/opencode/opencode.db 2>/dev/null || return 1
+    if ! cat "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
+      > "$d"/payload/.local/share/opencode/opencode.db 2>/dev/null; then
+      ENV_SYNC_FAIL_REASON="db"
+      rm -rf "$d" 2>/dev/null
+      return 1
+    fi
     rm -f "$d"/payload/.local/share/opencode/opencode.db.[0-9][0-9].part \
           "$d"/payload/.local/share/opencode/opencode.db.zst 2>/dev/null
   fi
   dbsz=$(stat -c%s "$d/payload/.local/share/opencode/opencode.db" 2>/dev/null || echo 0)
   if [ "${dbexp:-0}" -gt 0 ] && [ "$dbsz" != "$dbexp" ]; then
-    echo "::warning::env-sync db size mismatch (${dbsz} vs ${dbexp}); using release packages"
+    ENV_SYNC_FAIL_REASON="db"
+    rm -rf "$d" 2>/dev/null
+    echo "::warning::env-sync db size mismatch (${dbsz} vs ${dbexp}); considering release packages"
     return 1
   fi
   # R2569 (D2): a same-size but corrupt SQLite file must never be applied. The
@@ -296,30 +375,124 @@ except Exception:
     sys.exit(1)
 PY
     then
-      echo "::warning::env-sync db quick_check failed (corrupt payload); using release packages"
+      ENV_SYNC_FAIL_REASON="db"
       rm -rf "$d" 2>/dev/null
+      echo "::warning::env-sync db quick_check failed (corrupt payload); considering release packages"
       return 1
     fi
-    echo "env-sync db quick_check ok (${dbsz} bytes)"
+    echo "env-sync db quick_check ok (${dbsz} bytes, ${dbfmt}, decompress+check $(( $(date +%s) - t_step ))s)"
   fi
+  t_step=$(date +%s)
+  echo "env-sync: applying payload to \$HOME"
   if ! rsync -a "$d"/payload/ "$HOME"/ 2>/dev/null; then
-    echo "::warning::env-sync payload apply failed; using release packages"
+    ENV_SYNC_FAIL_REASON="apply"
+    rm -rf "$d" 2>/dev/null
+    echo "::warning::env-sync payload apply failed; considering release packages"
     return 1
   fi
   rm -rf "$d" 2>/dev/null
-  echo "environment restored from env-sync branch (commit=${sha}, age=${age}min, db=${dbfmt} ${dbsz} bytes)"
+  echo "environment restored from env-sync branch (commit=${sha}, age=${age}min, db=${dbfmt} ${dbsz} bytes, apply $(( $(date +%s) - t_step ))s, total $(( $(date +%s) - t_all ))s)"
   return 0
 }
-if env_sync_try; then
+# R2773: release freshness probe + stale-fallback guard.
+#
+# If env-sync is the fresh source but applying it failed transiently, the old
+# code silently restored the release env. Those release assets can be days old
+# (meta.json says env.carried=true and keeps the original packed_at), and the
+# bridge pushes $HOME back to env-sync at boot — so a stale restore would
+# overwrite the fresh branch with old sessions. Fail closed instead, unless the
+# operator explicitly forces it.
+release_env_meta() {
+  local dl="/tmp/env-meta-guard" carried rel_at epoch
+  rm -rf "$dl"; mkdir -p "$dl"
+  if ! timeout --kill-after=10 "$GH_META_TIMEOUT" gh release download "$ENV_TAG" \
+         --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 \
+     || [ ! -s "$dl/meta.json" ]; then
+    rm -rf "$dl"
+    return 1
+  fi
+  carried=$(jq -r '.env.carried // false' "$dl/meta.json" 2>/dev/null || echo false)
+  if [ "$carried" = "true" ]; then
+    rel_at=$(jq -r '.env.packed_at // empty' "$dl/meta.json" 2>/dev/null || true)
+  else
+    rel_at=$(jq -r '.created_at // empty' "$dl/meta.json" 2>/dev/null || true)
+  fi
+  epoch=$(date -u -d "$rel_at" +%s 2>/dev/null || true)
+  rm -rf "$dl"
+  [ -n "$epoch" ] || return 1
+  printf '%s|%s\n' "$epoch" "$rel_at"
+}
+
+env_sync_branch_epoch() {
+  local repo="${SESSIONS_REPO:-Xiaobei09/opencode-sessions}" date_s
+  date_s=$(timeout --kill-after=10 20 gh api "repos/$repo/commits/env-sync" \
+    --jq '.commit.committer.date' 2>/dev/null || true)
+  [ -n "$date_s" ] || return 1
+  date -u -d "$date_s" +%s 2>/dev/null
+}
+
+stale_release_guard() {
+  local reason="${ENV_SYNC_FAIL_REASON:-unknown}" meta rel_epoch rel_at rel_age
+  local branch_epoch branch_age
+  case "$reason" in
+    clone|payload|db|apply|epoch) ;;
+    *) return 0 ;;
+  esac
+  meta=$(release_env_meta) || {
+    echo "::warning::env-sync failed ($reason) and release env metadata is unavailable; using release without a freshness comparison"
+    return 0
+  }
+  rel_epoch=${meta%%|*}
+  rel_at=${meta#*|}
+  rel_age=$(( ( $(date +%s) - rel_epoch ) / 60 ))
+  branch_epoch="${ENV_SYNC_EPOCH:-}"
+  if [ -z "$branch_epoch" ]; then
+    branch_epoch=$(env_sync_branch_epoch 2>/dev/null || true)
+  fi
+  if [ -z "$branch_epoch" ]; then
+    echo "::warning::env-sync failed ($reason) and its branch freshness could not be verified; falling back to release env packed ${rel_at} (${rel_age}min old)"
+    return 0
+  fi
+  branch_age=$(( ( $(date +%s) - branch_epoch ) / 60 ))
+  if [ "$branch_age" -gt "$ENV_SYNC_MAX_AGE_MIN" ]; then
+    echo "env-sync branch is stale (${branch_age}min > ${ENV_SYNC_MAX_AGE_MIN}min cap); release fallback allowed"
+    return 0
+  fi
+  if [ "$branch_epoch" -le "$rel_epoch" ]; then
+    echo "release env (packed ${rel_at}) is not older than env-sync (${branch_age}min); release fallback allowed"
+    return 0
+  fi
+  if [ "$ENV_ALLOW_STALE_RELEASE" = "1" ]; then
+    echo "::warning::ENV_ALLOW_STALE_RELEASE=1: forcing older release env (packed ${rel_at}, ${rel_age}min) over fresh env-sync (${branch_age}min)"
+    return 0
+  fi
+  echo "::error::env-sync restore failed ($reason) but the branch is fresh (${branch_age}min, commit=${ENV_SYNC_COMMIT:-unknown}) and newer than the release env (packed ${rel_at}, ${rel_age}min). Refusing the older release env: boot would push that old \$HOME back over the fresh env-sync branch and lose recent sessions. The next round retries the clone; set ENV_ALLOW_STALE_RELEASE=1 only to force an older restore."
+  return 1
+}
+
+# R2773: let the offline self-test source the helpers without running a restore.
+if [ "${RESTORE_ENV_LIB_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+es_rc=0
+env_sync_try || es_rc=$?
+if [ "$es_rc" -eq 0 ]; then
   echo "environment source: env-sync"
-elif env_try "$ENV_TAG"; then
-  echo "environment source: $ENV_TAG"
-elif env_try_staged "$ENV_TAG"; then
-  echo "::warning::primary env was mid-swap; restored the verified staged generation (skipped the stale env-safe)"
-elif [ "$FALLBACK_TAG" != "$ENV_TAG" ] && env_try "$FALLBACK_TAG"; then
-  echo "::warning::primary env package '$ENV_TAG' unusable; restored the insurance generation '$FALLBACK_TAG'"
 else
-  echo "no usable environment package; bootstrapping from the repository baseline"
+  echo "env-sync unavailable (reason=${ENV_SYNC_FAIL_REASON:-unknown}); evaluating release fallback"
+  if ! stale_release_guard; then
+    exit 1
+  fi
+  if env_try "$ENV_TAG"; then
+    echo "environment source: $ENV_TAG"
+  elif env_try_staged "$ENV_TAG"; then
+    echo "::warning::primary env was mid-swap; restored the verified staged generation (skipped the stale env-safe)"
+  elif [ "$FALLBACK_TAG" != "$ENV_TAG" ] && env_try "$FALLBACK_TAG"; then
+    echo "::warning::primary env package '$ENV_TAG' unusable; restored the insurance generation '$FALLBACK_TAG'"
+  else
+    echo "no usable environment package; bootstrapping from the repository baseline"
+  fi
 fi
 
 # R2545: token rescue runs AFTER the restore decision. Doing it inside

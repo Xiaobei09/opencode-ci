@@ -17,6 +17,12 @@ fi
 # R2589 (D9): one wall-clock measurement for the whole targets restore so the
 # run log shows where the non-opencode budget goes.
 RT_T0=$(date +%s)
+# R2773: every remote leg below gets a wall-clock bound. Before this, a stalled
+# slim `git fetch` (4 targets in parallel) or a bundle clone could hold the
+# whole parallel restore open forever with no line in the job log.
+TGT_NET_TIMEOUT="${TGT_NET_TIMEOUT:-120}"
+TGT_SLIM_FETCH_TIMEOUT="${TGT_SLIM_FETCH_TIMEOUT:-60}"
+TGT_META_TIMEOUT="${TGT_META_TIMEOUT:-30}"
 # Target workspace bundles also live in the release now (a whole tar of the
 # repo's runtime dirs), not in git, so the repository can stay a clean baseline.
 ENV_TAG="env"
@@ -30,13 +36,15 @@ FALLBACK_TAG="${SESSIONS_FALLBACK_TAG:-env-safe}"
 # contents instead of failing the run. Set only after a successful extract.
 PKG_DIR=""; PKG_GLOB=""; PKG_TFLAG=""
 tgt_try() {
-  local tag="$1" dl="/tmp/tgdl-$1" vols pages bytes expect hdr tflag
+  local tag="$1" dl="/tmp/tgdl-$1" vols pages bytes expect hdr tflag t0
   rm -rf "$dl" && mkdir -p "$dl"
+  t0=$(date +%s)
+  echo "targets: fetching release '$tag' package (deadline ${FETCH_ASSET_DEADLINE:-420}s)"
   # R341: parallel multi-range fetch; the helper itself falls back to
   # plain single-stream `gh release download` on any internal failure.
   bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'targets.tar.gz*' "$dl" || return 1
   ls "$dl"/targets.tar.gz* >/dev/null 2>&1 || return 1
-  gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
+  timeout --kill-after=10 "$TGT_META_TIMEOUT" gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
   vols=$(ls "$dl"/targets.tar.gz* 2>/dev/null | sort -V)
   pages=$(echo "$vols" | wc -l)
   bytes=$(cat $vols 2>/dev/null | wc -c)
@@ -64,7 +72,7 @@ tgt_try() {
   esac
   if cat $vols | tar -xf - -C "$SESSIONS_DIR" $tflag 2>/dev/null; then
     PKG_DIR="$dl"; PKG_GLOB="targets.tar.gz*"; PKG_TFLAG="$tflag"
-    echo "target workspace package restored from '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified})"
+    echo "target workspace package restored from '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified}, total $(( $(date +%s) - t0 ))s)"
     return 0
   fi
   echo "::warning::$tag target workspace package failed to extract (tar ${tflag:-plain}, $bytes bytes)"
@@ -73,11 +81,13 @@ tgt_try() {
 # ROUND 53：与 env 读侧同口径——换装窗口里 targets 也可能只剩 stage-*；
 # 用 stage-targets.tar.gz* + stage-meta.json 严格校验后再应用，否则退回 env-safe。
 tgt_try_staged() {
-  local tag="$1" dl="/tmp/tgdl-$1-staged" vols pages bytes expect hdr tflag
+  local tag="$1" dl="/tmp/tgdl-$1-staged" vols pages bytes expect hdr tflag t0
   rm -rf "$dl" && mkdir -p "$dl"
+  t0=$(date +%s)
+  echo "targets: fetching release '$tag' staged package (deadline ${FETCH_ASSET_DEADLINE:-420}s)"
   bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$tag" 'stage-targets.tar.gz*' "$dl" || return 1
   ls "$dl"/stage-targets.tar.gz* >/dev/null 2>&1 || return 1
-  gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
+  timeout --kill-after=10 "$TGT_META_TIMEOUT" gh release download "$tag" --repo "$SESSIONS_REPO" --pattern 'stage-meta.json' --dir "$dl" --clobber >/dev/null 2>&1 || true
   expect=$(jq -r '.targets.bytes // empty' "$dl/stage-meta.json" 2>/dev/null || true)
   if [ -z "$expect" ]; then
     echo "::warning::$tag staged targets have no manifest; refusing an unverifiable staged restore"
@@ -109,7 +119,7 @@ tgt_try_staged() {
   esac
   if cat $vols | tar -xf - -C "$SESSIONS_DIR" $tflag 2>/dev/null; then
     PKG_DIR="$dl"; PKG_GLOB="stage-targets.tar.gz*"; PKG_TFLAG="$tflag"
-    echo "target workspace package restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified})"
+    echo "target workspace package restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified}, total $(( $(date +%s) - t0 ))s)"
     return 0
   fi
   echo "::warning::$tag staged targets failed to extract ($pages page(s), $bytes bytes)"
@@ -193,10 +203,10 @@ while IFS=$'\t' read -r snap_name snap_repo snap_branch snap_commit; do
       || git remote set-url origin "$snap_repo" 2>/dev/null
     ok=0
     if [ -n "$snap_commit" ]; then
-      git fetch -q --depth=1 origin "$snap_commit" 2>/dev/null && ok=1
+      timeout --kill-after=10 "$TGT_SLIM_FETCH_TIMEOUT" git fetch -q --depth=1 origin "$snap_commit" 2>/dev/null && ok=1
     fi
     if [ "$ok" != 1 ] && [ -n "$snap_branch" ]; then
-      git fetch -q --depth=1 origin "$snap_branch" 2>/dev/null \
+      timeout --kill-after=10 "$TGT_SLIM_FETCH_TIMEOUT" git fetch -q --depth=1 origin "$snap_branch" 2>/dev/null \
         && git cat-file -e "$snap_commit^{commit}" 2>/dev/null && ok=1
     fi
     if [ "$ok" = 1 ]; then
@@ -238,10 +248,10 @@ while IFS=$'\t' read -r snap_name nested_dir nested_repo nested_branch nested_co
       || git remote set-url origin "$nested_repo" 2>/dev/null
     ok=0
     if [ -n "$nested_commit" ]; then
-      git fetch -q --depth=1 origin "$nested_commit" 2>/dev/null && ok=1
+      timeout --kill-after=10 "$TGT_SLIM_FETCH_TIMEOUT" git fetch -q --depth=1 origin "$nested_commit" 2>/dev/null && ok=1
     fi
     if [ "$ok" != 1 ] && [ -n "$nested_branch" ]; then
-      git fetch -q --depth=1 origin "$nested_branch" 2>/dev/null \
+      timeout --kill-after=10 "$TGT_SLIM_FETCH_TIMEOUT" git fetch -q --depth=1 origin "$nested_branch" 2>/dev/null \
         && git cat-file -e "$nested_commit^{commit}" 2>/dev/null && ok=1
     fi
     if [ "$ok" = 1 ]; then
@@ -330,7 +340,7 @@ fi
 RDL=/tmp/rec-dl; rm -rf "$RDL"; mkdir -p "$RDL"
 if bash "$GITHUB_WORKSPACE/.github/scripts/fetch-asset.sh" "$SESSIONS_REPO" "$ENV_TAG" 'records.tar.gz*' "$RDL" 2>/dev/null \
    && ls "$RDL"/records.tar.gz* >/dev/null 2>&1; then
-  gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$RDL" --clobber >/dev/null 2>&1 || true
+  timeout --kill-after=10 "$TGT_META_TIMEOUT" gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$RDL" --clobber >/dev/null 2>&1 || true
   REXP=$(jq -r '.records.bytes // empty' "$RDL/meta.json" 2>/dev/null || true)
   RVOLS=$(ls "$RDL"/records.tar.gz* 2>/dev/null | sort -V)
   RBYTES=$(cat $RVOLS 2>/dev/null | wc -c)
@@ -375,9 +385,9 @@ for i in $(seq 0 $((COUNT - 1))); do
   # necessary objects`），而这里原先只打一句 warning 就 skip ⇒ 换 runner 时该目标
   # 工作区**整个缺失**（R202 实测：那一代靠代理自己从 GitHub clone 才补回）。
   # 只影响失败路径：bundle 正常时行为与本补丁前完全一致。
-  if ! git clone "$SESSIONS_DIR/$bundle" "$target_dir"; then
+  if ! timeout --kill-after=15 "$TGT_NET_TIMEOUT" git clone "$SESSIONS_DIR/$bundle" "$target_dir"; then
     rm -rf "$target_dir"
-    if [ -z "$repo" ] || ! git clone "$repo" "$target_dir"; then
+    if [ -z "$repo" ] || ! timeout --kill-after=15 "$TGT_NET_TIMEOUT" git clone "$repo" "$target_dir"; then
       echo "::warning::clone failed for $dir (bundle and remote), skipping"
       continue
     fi
@@ -394,11 +404,11 @@ for i in $(seq 0 $((COUNT - 1))); do
     if [ -n "$commit" ]; then
       git rev-parse --verify HEAD >/dev/null 2>&1 || git checkout "$commit" 2>/dev/null || true
     fi
-    git fetch origin '+refs/stash:refs/stash' 2>/dev/null || true
+    timeout --kill-after=10 "$TGT_SLIM_FETCH_TIMEOUT" git fetch origin '+refs/stash:refs/stash' 2>/dev/null || true
     # R203：`worktree.tar.gz` 缺失是**良性**的（`workferry pack` 对干净仓不产出
     # 文件）⇒ 路径为空/文件不存在时静默跳过，不再每轮打一条误导告警。
     if [ -n "$worktree" ] && [ -f "$SESSIONS_DIR/$worktree" ] \
-      && ! workferry apply --dir "$target_dir" "$SESSIONS_DIR/$worktree"; then
+      && ! timeout --kill-after=10 "$TGT_NET_TIMEOUT" workferry apply --dir "$target_dir" "$SESSIONS_DIR/$worktree"; then
       echo "::warning::workferry apply failed for $dir, untracked files may be lost"
     fi
     if git rev-parse --verify refs/stash >/dev/null 2>&1; then

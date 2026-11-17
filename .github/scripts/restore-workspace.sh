@@ -4,48 +4,121 @@
 # blocks alone were most of a round's log. Keeping the logic in a file makes the
 # log show only real output. Behavior is unchanged: the step invokes
 # `bash -e <file>`, matching the previous default shell.
+#
+# R2773 (operator: "上一轮ci的环境还原耗时特别长"): the three tasks used to write
+# only to /tmp/restore-*.log and the job log showed nothing until all of them
+# finished. When run 44098155757 hung in restore for 164s there was no way to
+# tell whether env-sync clone, the 607MB release fallback, the targets slim
+# fetch or npm had stalled. Now every task is streamed live with a `[name]`
+# prefix, annotations keep their `::warning::`/`::error::` position, a
+# heartbeat is printed while a task is silent, and every task has a hard
+# wall-clock ceiling so one dead TCP connection cannot hang the step.
 set +e
-bash "$GITHUB_WORKSPACE/.github/scripts/restore-targets.sh" > /tmp/restore-targets.log 2>&1 &
-p_t=$!
-bash "$GITHUB_WORKSPACE/.github/scripts/restore-env.sh" > /tmp/restore-env.log 2>&1 &
-p_e=$!
+RESTORE_T0=$(date +%s)
+
+declare -A TASK_PID=()
+declare -A TASK_T0=()
+declare -A TASK_WATCH=()
+
+stream_filter() {  # $1 = task name; keep ::warning::/::error:: at line start
+  local name="$1"
+  # GitHub only renders an annotation when `::warning::` starts the line, so
+  # prefix the message after the marker instead of before it.
+  sed -u -E "s/^(::(warning|error|notice|debug)::)/&[${name}] /; t; s/^/[${name}] /"
+}
+
+start_task() {  # start_task <name> <log> <command...>
+  local name="$1" log="$2"
+  shift 2
+  TASK_T0["$name"]=$(date +%s)
+  echo "[$name] start ($(date -u +%H:%M:%SZ))"
+  # pipefail makes the subshell return the task's status, not sed/tee's.
+  ( set -o pipefail; "$@" 2>&1 | stream_filter "$name" | stdbuf -oL tee "$log" ) &
+  TASK_PID["$name"]=$!
+  (
+    while kill -0 "${TASK_PID[$name]}" 2>/dev/null; do
+      sleep 15
+      kill -0 "${TASK_PID[$name]}" 2>/dev/null || break
+      echo "[$name] still running $(( $(date +%s) - ${TASK_T0[$name]} ))s"
+    done
+  ) &
+  TASK_WATCH["$name"]=$!
+}
+
+finish_task() {  # finish_task <name> -> task rc
+  local name="$1" rc
+  wait "${TASK_PID[$name]}"
+  rc=$?
+  if [ -n "${TASK_WATCH[$name]:-}" ]; then
+    kill "${TASK_WATCH[$name]}" 2>/dev/null
+    wait "${TASK_WATCH[$name]}" 2>/dev/null
+  fi
+  local elapsed=$(( $(date +%s) - ${TASK_T0[$name]} ))
+  if [ "$rc" = 124 ]; then
+    echo "::error::[$name] exceeded its hard timeout after ${elapsed}s; refusing to boot OpenCode with a half-restored environment"
+  fi
+  echo "[$name] done rc=$rc in ${elapsed}s"
+  return "$rc"
+}
+
 # R2554: the toolchain install used to be a separate 12s step after the
 # restore finished. It only writes $HOME/.opencode/bin (excluded from
 # the env snapshot) and the node prefix, so it is safe to run beside
 # the two restores; this removes 12s from the pre-opencode budget.
 install_toolchain() {
   set -euo pipefail
+  local t_all t_step
+  t_all=$(date +%s)
   # R2520: the opencode.ai installer can transiently 404 while the latest
   # release asset is propagating (run 41143504097 died here and the
   # skipped prerequisite counted toward the 3-strike pause). Retry the
   # whole installer before burning a loop slot.
+  #
+  # R2773: curl used to have no connect/max time, so a stalled TLS handshake
+  # held the whole parallel restore open forever. Bound each attempt.
   installed=0
   for attempt in 1 2 3; do
-    if curl -fsSL --retry 2 --retry-delay 2 https://opencode.ai/v2/install | bash; then
+    t_step=$(date +%s)
+    if timeout --signal=TERM --kill-after=15 "${TOOLCHAIN_INSTALL_TIMEOUT:-150}" \
+         bash -c 'set -o pipefail; curl -fsSL --connect-timeout 15 --max-time 120 \
+                    --retry 2 --retry-delay 2 https://opencode.ai/v2/install | bash'; then
       installed=1
+      echo "opencode installer ok in $(( $(date +%s) - t_step ))s (attempt ${attempt}/3)"
       break
     fi
-    echo "::warning::opencode install attempt ${attempt}/3 failed"
+    echo "::warning::opencode install attempt ${attempt}/3 failed/timed out after $(( $(date +%s) - t_step ))s"
     if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
   done
   if [ "$installed" -ne 1 ]; then
-    echo "::warning::opencode install failed after 3 attempts (upstream 404?)"
+    echo "::warning::opencode install failed after 3 attempts (upstream 404/network stall?)"
     return 1
   fi
   echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-  npm install -g workferry zengate@1.3.1
+  t_step=$(date +%s)
+  # npm can also sit on a dead socket; give it a bounded window and surface a
+  # real warning instead of letting the parallel `wait` hang.
+  if ! timeout --signal=TERM --kill-after=15 "${NPM_INSTALL_TIMEOUT:-300}" \
+       npm install -g workferry zengate@1.3.1; then
+    echo "::warning::npm install failed/timed out after $(( $(date +%s) - t_step ))s"
+    return 1
+  fi
+  echo "toolchain ready in $(( $(date +%s) - t_all ))s"
 }
-install_toolchain > /tmp/install-toolchain.log 2>&1 &
-p_i=$!
-wait "$p_t"; rc_t=$?
-wait "$p_e"; rc_e=$?
-wait "$p_i"; rc_i=$?
-echo "== restore-targets.log =="
-cat /tmp/restore-targets.log 2>/dev/null
-echo "== restore-env.log =="
-cat /tmp/restore-env.log 2>/dev/null
-echo "== install-toolchain.log =="
-cat /tmp/install-toolchain.log 2>/dev/null
+
+# Hard ceilings are the safety net behind the per-operation timeouts inside
+# restore-env/restore-targets. A timeout returns 124 and the step fails closed
+# (OpenCode is skipped, so a partial environment cannot be saved back).
+start_task targets /tmp/restore-targets.log \
+  timeout --signal=TERM --kill-after=15 "${RESTORE_TARGETS_DEADLINE:-480}" \
+  bash "$GITHUB_WORKSPACE/.github/scripts/restore-targets.sh"
+start_task env /tmp/restore-env.log \
+  timeout --signal=TERM --kill-after=15 "${RESTORE_ENV_DEADLINE:-600}" \
+  bash "$GITHUB_WORKSPACE/.github/scripts/restore-env.sh"
+start_task toolchain /tmp/install-toolchain.log install_toolchain
+
+rc_t=0; finish_task targets || rc_t=$?
+rc_e=0; finish_task env || rc_e=$?
+rc_i=0; finish_task toolchain || rc_i=$?
 if [ "$rc_t" != 0 ] || [ "$rc_e" != 0 ] || [ "$rc_i" != 0 ]; then
   # R2752: restore-targets.sh now tolerates a stale index fingerprint only
   # after verifying the extracted tree against the sha-verified package, so a
@@ -66,4 +139,4 @@ for p in "$HOME/.config/opencode"/*.json \
          "$HOME/.opencode"/*.env; do
   [ -f "$p" ] && chmod 600 "$p" 2>/dev/null || true
 done
-echo "targets, environment and toolchain restored in parallel"
+echo "targets, environment and toolchain restored in parallel in $(( $(date +%s) - RESTORE_T0 ))s"

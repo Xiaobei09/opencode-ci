@@ -145,6 +145,12 @@ jobs:
         # matrix uses a fake curl and a temp HOME, so it costs ~1s.
         run: bash .github/scripts/tg-notify.test.sh
 
+      - name: Self-test restore freshness guard
+        # R2773: the stale-release refusal protects the env-sync branch from
+        # being overwritten by a days-old release restore. Offline matrix with a
+        # fake gh; runs before gh is installed on purpose.
+        run: bash .github/scripts/restore-guard.test.sh
+
       - name: Install GitHub CLI and configure git
         run: |
           set -euo pipefail
@@ -219,6 +225,11 @@ jobs:
       - name: Restore workspace snapshots, environment and toolchain (parallel)
         id: restore_ws
         if: steps.lock.outputs.acquired == 'true'
+        # R2773: hard ceiling for the whole parallel setup. Every network leg is
+        # individually bounded, but a wedged process must never eat the 360m job
+        # cap; a timeout fails the step so OpenCode is skipped and no partial
+        # environment is saved back.
+        timeout-minutes: 15
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_ALLOWED_CHAT: ${{ secrets.TG_ALLOWED_CHAT }}
@@ -229,6 +240,10 @@ jobs:
           # R2593（D4）：默认保留 env-sync 里 /addbots 写入的最新 token；
           # 设为 1 可强制用上面的 legacy secret 覆盖（运营者明确轮换时用）。
           TG_BOT_SECRET_OVERRIDE: ${{ vars.TG_BOT_SECRET_OVERRIDE }}
+          # R2773: break-glass only. Default 0 refuses to restore a stale release
+          # env over a fresh env-sync branch (that would overwrite recent
+          # sessions at boot). Set the repo variable to 1 to force availability.
+          ENV_ALLOW_STALE_RELEASE: ${{ vars.ENV_ALLOW_STALE_RELEASE || '0' }}
         run: bash -e "$GITHUB_WORKSPACE/.github/scripts/restore-workspace.sh"
       - name: Select egress proxy
         id: select_egress
