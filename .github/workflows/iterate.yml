@@ -805,14 +805,40 @@ jobs:
               fi
             }
             pidf="$RUNNER_TEMP/snapshot-env.pid"
+            durable="$RUNNER_TEMP/snapshot-env.durable"
             if [ -f "$pidf" ]; then
               pid=$(cat "$pidf" 2>/dev/null || true)
               waited=0
-              while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 300 ]; do
+              # R2766: the env-sync push runs first inside snapshot-environment;
+              # the release packaging/upload that follows cannot change whether
+              # the request is durable, so stop waiting at the marker instead of
+              # at process exit (keeps the quota-round gap as short as safe).
+              while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+                    && [ ! -f "$durable" ] && [ "$waited" -lt 300 ]; do
                 sleep 1
                 waited=$((waited + 1))
               done
-              if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              if [ -f "$durable" ]; then
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                  echo "actionable rollover request pending; env-sync branch became durable after ${waited}s (snapshot packaging continues in the background)"
+                else
+                  rc=$(cat "$RUNNER_TEMP/snapshot-env.rc" 2>/dev/null || echo missing)
+                  if [ "$rc" = "missing" ]; then
+                    # The push is already durable but the runner killed the job
+                    # before it wrote a status. Do not rerun the snapshot later:
+                    # a post-relay push could overwrite the successor's boot
+                    # snapshot. The release tail is skipped for this round.
+                    echo "::warning::env-sync is durable but the snapshot process died before writing a status; keeping the durable push and skipping the release tail"
+                    echo 0 > "$RUNNER_TEMP/snapshot-env.rc"
+                    : > "$RUNNER_TEMP/snapshot-env.synced"
+                  else
+                    echo "actionable rollover request pending; env-sync branch became durable after ${waited}s (rc=$rc)"
+                    if [ "$rc" != 0 ]; then
+                      echo "::warning::snapshot rc=$rc after a durable env-sync push; the rollover request is still stored"
+                    fi
+                  fi
+                fi
+              elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
                 echo "::warning::actionable rollover request pending but the run-end snapshot is still running after ${waited}s; the successor may restore an env without the request"
               else
                 rc=$(cat "$RUNNER_TEMP/snapshot-env.rc" 2>/dev/null || echo missing)

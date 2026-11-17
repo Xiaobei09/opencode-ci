@@ -75,6 +75,11 @@ if [ -f "$SESSIONS_DIR/opencode/config/scripts/env-sync.sh" ]; then
   done
   if [ "$SYNC_OK" = 1 ]; then
     echo "run-end env-sync pushed; the env-sync branch now holds the final state"
+    # R2766: the branch push above is the durable carrier for a pending 429
+    # rollover request. Relay may dispatch the successor as soon as this marker
+    # exists; the remaining release packaging/upload cannot make the request
+    # any more durable and only lengthens the quota-round gap.
+    : > "$RUNNER_TEMP/snapshot-env.durable"
     gh release download "$ENV_TAG" --repo "$SESSIONS_REPO" --pattern 'meta.json' --dir "$OUT" --clobber >/dev/null 2>&1 || true
     if [ -s "$OUT/meta.json" ] && jq -e '(.env.bytes // 0) > 0' "$OUT/meta.json" >/dev/null 2>&1; then
       cp -f "$OUT/meta.json" "$OUT/meta.env-carry.json"
