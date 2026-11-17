@@ -520,7 +520,7 @@ jobs:
             start_snapshot
           fi
           egress_retry_policy() {
-            local cur next delay q429
+            local cur next delay q429 rollover_actionable
             # R2728/R2729/R2732: quota evidence still marks the provider-429
             # card, but every round-end/stop notice now follows the per-Bot
             # switches (operator: "ci结束/开始/tg限流这些全局信息的开关").
@@ -573,7 +573,28 @@ jobs:
               # not block the pause, but an in-flight turn does.
               # R2675/R2700: the valve keys on CI_EGRESS_STREAK (`next`), because
               # the 429 counter is reset to 0 on every switch and may never reach 3.
-              if [ "$next" -ge 3 ]; then
+              # R2770 (operator: "429换会话又不会进行了，你看上一次"): a queued
+              # session switch IS the recovery action. The 2026-11-17 13:02 run
+              # wrote the rollover request and then paused at 3/3 with no
+              # successor, so the request sat unconsumed until a manual resume.
+              # Never pause while an actionable switch is queued; relay so the
+              # next run's bridge can consume it. A request for a stopped,
+              # halted or offline Bot is not actionable, so the old pause still
+              # applies there.
+              rollover_actionable=false
+              if [ "$ROLLOVER_TRIGGERED" = "true" ]; then
+                . "$GITHUB_WORKSPACE/.github/scripts/rollover-pending.sh" 2>/dev/null || true
+                if [ -d "$HOME/.config/opencode/rollover-requests" ]; then
+                  while IFS= read -r _rf; do
+                    if rollover_request_actionable "$_rf"; then
+                      rollover_actionable=true
+                      break
+                    fi
+                  done < <(find "$HOME/.config/opencode/rollover-requests" -maxdepth 1 -name 'ses_*.json' -mmin -1440 2>/dev/null)
+                fi
+              fi
+              if [ "$next" -ge 3 ] \
+                 && { [ "$ROLLOVER_TRIGGERED" != "true" ] || [ "$rollover_actionable" != "true" ]; }; then
                 if bash "$GITHUB_WORKSPACE/.github/scripts/bot-sessions-active.sh"; then
                   echo "::notice::quota 429 round $q429 (CI_429_STREAK, egress-only #$next) but at least one bot is still outputting; relaying instead of pausing"
                 else
@@ -585,6 +606,10 @@ jobs:
                   allow=false
                   return 0
                 fi
+              fi
+              if [ "$next" -ge 3 ] \
+                 && [ "$ROLLOVER_TRIGGERED" = "true" ] && [ "$rollover_actionable" = "true" ]; then
+                echo "::notice::quota 429 rollover queued and actionable; relaying a fresh run to switch sessions instead of pausing (egress-only #$next/3)"
               fi
               echo "::notice::quota 429 round $q429 (CI_429_STREAK), egress-only round $next/3; will relay a fresh run"
             fi
