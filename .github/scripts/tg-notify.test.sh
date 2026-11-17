@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# R2728: regression for the unified card-ops switch in tg-notify.sh.
+# R2728/R2729: regression for the per-Bot card-ops switch in tg-notify.sh.
+# Operator: "不是全局，是bot单独设置，设置本bot推不推".
 # Runs with a fake curl/PATH and a temp HOME; never contacts Telegram.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -54,12 +55,14 @@ cat > "$HOME/.config/opencode/tg-bots.json" <<EOF
   {"id":"bot6","label":"@codecilbot","envFile":"$HOME/.config/opencode/tg-bot6.env"}
 ]}
 EOF
-cat > "$HOME/.config/opencode/card-ops.json" <<'EOF'
-{"enabled":true,"notifyBot":"bot6"}
-EOF
-cat > "$TG_NOTIFY_PEER_LEDGER" <<'EOF'
-{"bot6":{"in":200,"seen":300},"bot5":{"in":100,"seen":100},"primary":{"in":50,"seen":50}}
-EOF
+OPS="$HOME/.config/opencode/card-ops.json"
+setops() { printf '%s\n' "$1" > "$OPS"; }
+setledger() {
+  printf '%s\n' "$1" > "$TG_NOTIFY_PEER_LEDGER"
+}
+# Default: bot6 was used last; all bots default ON.
+setledger '{"bot6":{"in":200,"seen":300},"bot5":{"in":100,"seen":100},"primary":{"in":50,"seen":50}}'
+setops '{"bots":{"bot6":{"enabled":true}},"notifyBot":"bot6"}'
 
 checks=0
 fail=0
@@ -80,43 +83,72 @@ run() {
   rc=$?
 }
 
-# ON + quota: peer ledger says bot6 was used last -> bot6 token.
+# Per-Bot ON: bot6 was used last -> bot6 token.
 run quota
-ck "R2728: 429 通知跟最近使用的 Bot（bot6）" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
-ck "R2728: bot6 成功后不再打扰主 Bot" "$(grep -qx '666:bot6-token' "$LOG" && ! grep -qx '111:primary-token' "$LOG" && echo yes)"
+ck "R2729: 429 通知跟最近使用的 Bot（bot6）" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+ck "R2729: bot6 成功后不再打扰主 Bot" "$(grep -qx '666:bot6-token' "$LOG" && ! grep -qx '111:primary-token' "$LOG" && echo yes)"
 
-# OFF: same quota notice falls back to the primary Bot.
-cat > "$HOME/.config/opencode/card-ops.json" <<'EOF'
-{"enabled":false,"notifyBot":"bot6"}
-EOF
+# Only bot6 OFF: latest bot5 is still allowed, so bot5 must be used.
+setops '{"bots":{"bot6":{"enabled":false},"bot5":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"bot5":{"in":300,"seen":300},"bot6":{"in":200,"seen":200}}'
 run quota
-ck "R2728: 开关关闭时 429 仍走主 Bot（旧行为）" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
-ck "R2728: 关闭时没有请求非主 Bot" "$(grep -qx '111:primary-token' "$LOG" && ! grep -q 'bot6-token' "$LOG" && echo yes)"
+ck "R2729: 关掉 bot6 不影响 bot5 自己推" "$(printf '%s' "$out" | grep -q 'via=bot5' && echo yes)"
+ck "R2729: bot5 已推时不再发 bot6/主 Bot" "$(grep -qx '555:bot5-token' "$LOG" && ! grep -q '666:bot6-token' "$LOG" && ! grep -q '111:primary-token' "$LOG" && echo yes)"
 
-# Non-quota notices never reroute, even when the switch is ON.
-cat > "$HOME/.config/opencode/card-ops.json" <<'EOF'
-{"enabled":true,"notifyBot":"bot6"}
-EOF
+# Latest bot5 OFF, bot6 ON -> fall back to bot6, not primary.
+setops '{"bots":{"bot5":{"enabled":false},"bot6":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"bot5":{"in":300,"seen":300},"bot6":{"in":200,"seen":200}}'
+run quota
+ck "R2729: 最近使用的 bot5 关了就换 bot6（不越级到主 Bot）" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+ck "R2729: 被关闭的 bot5 不产生请求" "$(! grep -qx '555:bot5-token' "$LOG" && echo yes)"
+
+# All off -> explicit opt-out: skip with success, no Telegram request at all.
+setops '{"bots":{"bot5":{"enabled":false},"bot6":{"enabled":false},"primary":{"enabled":false}},"notifyBot":"bot6"}'
+run quota
+ck "R2729: 所有 Bot 都关时不推 429（尊重本 Bot 设置）" "$(printf '%s' "$out" | grep -q 'skipped (all quota routes disabled' && echo yes)"
+ck "R2729: 全部关闭时不发任何请求" "$([ ! -s "$LOG" ] && echo yes)"
+ck "R2729: 全部关闭是主动跳过，不算失败" "$([ "$rc" = 0 ] && echo yes)"
+
+# Non-quota notice must ignore the switches and still use the primary Bot.
+setops '{"bots":{"bot5":{"enabled":false},"bot6":{"enabled":false},"primary":{"enabled":false}},"notifyBot":"bot6"}'
 run ""
-ck "R2728: 普通结束通知仍走主 Bot（不误改 429 以外的消息）" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
+ck "R2729: 普通结束通知不受 per-Bot 开关影响" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
 
-# Preferred bot missing token -> primary fallback.
+# Primary OFF, latest primary, bot6 ON -> bot6 pushes.
+setops '{"bots":{"primary":{"enabled":false},"bot6":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"primary":{"in":400,"seen":400},"bot6":{"in":200,"seen":200}}'
+run quota
+ck "R2729: 主 Bot 自己关了就由 bot6 推" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+
+# Preferred bot missing token -> next enabled route (primary).
+setops '{"bots":{"bot6":{"enabled":true}}}'
+setledger '{"bot6":{"in":200,"seen":300},"bot5":{"in":100,"seen":100}}'
 mv "$HOME/.config/opencode/tg-bot6.env" "$TD/bot6.bak"
 run quota
-ck "R2728: 目标 Bot 缺 token 时回退主 Bot" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
+ck "R2729: 目标 Bot 缺 token 时回退下一个已开启的路由" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
 mv "$TD/bot6.bak" "$HOME/.config/opencode/tg-bot6.env"
 
-# Preferred send fails -> primary fallback (not repeated forever).
+# Preferred send fails -> primary fallback (primary default ON).
+setops '{"bots":{"bot6":{"enabled":true}}}'
 export FAKE_FAIL_TOKENS="666:bot6-token"
 run quota
-ck "R2728: 目标 Bot 发送失败时回退主 Bot" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
-ck "R2728: 回退失败路径有明确 warning" "$(printf '%s' "$out" | grep -q 'falling back' && echo yes)"
+ck "R2729: 目标 Bot 发送失败时回退主 Bot" "$(printf '%s' "$out" | grep -q 'via=primary' && echo yes)"
+ck "R2729: 回退失败路径有明确 warning" "$(printf '%s' "$out" | grep -q 'falling back' && echo yes)"
 export FAKE_FAIL_TOKENS=""
 
 # Corrupt switch file behaves like ON (same default as the bridge).
-printf '{bad' > "$HOME/.config/opencode/card-ops.json"
+printf '{bad' > "$OPS"
 run quota
-ck "R2728: 开关文件损坏时按默认开处理" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+ck "R2729: 开关文件损坏时按默认开处理" "$(printf '%s' "$out" | grep -q 'via=bot6' && echo yes)"
+
+# Legacy R2728 global file: false is the fallback for bots without an entry.
+setops '{"enabled":false,"notifyBot":"bot6"}'
+run quota
+ck "R2729: 旧全局关文件不再误推主 Bot" "$(printf '%s' "$out" | grep -q 'skipped (all quota routes disabled' && echo yes)"
+setops '{"enabled":false,"bots":{"bot5":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"bot5":{"in":300,"seen":300}}'
+run quota
+ck "R2729: 旧全局关 + 单 Bot 显式开启时按该 Bot 推" "$(printf '%s' "$out" | grep -q 'via=bot5' && echo yes)"
 
 echo "tg-notify: $([ "$fail" = 0 ] && echo PASS || echo FAIL) ($checks checks)"
 exit "$fail"

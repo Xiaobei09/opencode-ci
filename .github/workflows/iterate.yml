@@ -386,9 +386,9 @@ jobs:
           fi
           egress_retry_policy() {
             local cur next delay q429 rollover_out rollover_triggered
-            # R2728: expose quota evidence so the notify steps can route the
-            # provider-429 card to the Bot the operator last used. Normal
-            # round-end/stop cards keep the primary Bot.
+            # R2728/R2729: expose quota evidence so the notify steps can route
+            # the provider-429 card to a Bot whose own card-ops switch is ON.
+            # Normal round-end/stop cards keep the primary Bot.
             echo "quota_evidence=true" >> "$GITHUB_OUTPUT"
             cur=$(gh variable get CI_EGRESS_STREAK --repo "$repo" 2>/dev/null || echo 0)
             case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
@@ -783,9 +783,10 @@ jobs:
           fi
           # R2630: retry + log the Telegram API result, so a lost notice is
           # visible as a warning with the HTTP code instead of disappearing.
-          # R2728: only provider-quota 429 cards follow the active Bot. Normal
-          # round-end cards keep the primary Bot so the operator's chat is not
-          # flooded with every routine completion.
+          # R2729: only provider-quota 429 cards may be rerouted, and each
+          # candidate Bot must have its own switch ON. Normal round-end cards
+          # keep the primary Bot so the operator's chat is not flooded with
+          # every routine completion.
           notify_class=""
           if [ "${R2651_QUOTA_EVIDENCE:-}" = "true" ]; then notify_class="quota"; fi
           printf '%s' "$text" | TG_NOTIFY_CLASS="$notify_class" bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" round-end || true
@@ -916,7 +917,7 @@ jobs:
           fi
           # R2630: retry + log the Telegram API result, so a lost notice is
           # visible as a warning with the HTTP code instead of disappearing.
-          # R2728: same unified switch for the final stop card when it carries
+          # R2729: same per-Bot switches for the final stop card when it carries
           # provider-429 evidence; non-quota stop cards stay on the primary Bot.
           notify_class=""
           if [ "${R2651_QUOTA_EVIDENCE:-}" = "true" ]; then notify_class="quota"; fi

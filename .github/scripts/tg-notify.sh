@@ -9,18 +9,21 @@
 #   tag  short label used in logs, e.g. round-end or loop-stop
 # Env:
 #   TG_BOT_TOKEN, TG_PUSH_CHAT  required; missing means "skipped" (exit 0)
-#   TG_NOTIFY_CLASS             "quota" = provider 429 notice. When the operator's
-#                               card-ops switch is ON, send it through the bot the
-#                               operator last used, then bot6, then primary.
+#   TG_NOTIFY_CLASS             "quota" = provider 429 notice. Each candidate Bot
+#                               must have its own card-ops switch ON before it can
+#                               be used; route is last-used bot, then bot6, then
+#                               primary. Non-quota notices ignore the switches.
 # Exit:
-#   0 = sent, or intentionally skipped (no credentials / empty text)
-#   1 = all attempts failed
+#   0 = sent, or intentionally skipped (no credentials / empty text / all quota
+#       routes disabled by their own switches)
+#   1 = all attempted routes failed
 #
-# R2728: the bridge menu writes one global switch to
+# R2728/R2729: the bridge menu writes one **per-Bot** switch to
 #   ${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}/card-ops.json
-# The same file is read here, so "卡片自愈＋429 提醒" is genuinely one option:
-# ON  = pin self-heal + quota 429 notices follow the active Bot;
-# OFF = no pin self-heal + quota 429 notices stay on the primary Bot (old behavior).
+# The same file is read here. "卡片自愈＋429 提醒" controls this Bot only:
+# ON  = this Bot self-heals its pin card and may push quota 429 notices;
+# OFF = no self-heal for this Bot and it is never chosen as a 429 sender.
+# Other bots keep their own setting. A missing/corrupt file means ON.
 set -uo pipefail
 
 tag="${1:-notice}"
@@ -42,15 +45,21 @@ if [ -z "$text" ]; then
   exit 0
 fi
 
-# A malformed/missing switch file means ON (same default as the bridge): a bad
-# file must not silently disable the operator's 429 visibility.
-ops_on() {
+# R2729: per-Bot switch. A malformed/missing file means ON (same default as the
+# bridge): a bad file must not silently disable the operator's 429 visibility.
+# Precedence: bots[<id>].enabled -> legacy global enabled -> ON.
+ops_bot_on() {
+  local bot="$1" v
   [ -s "$OPS" ] || return 0
   if command -v jq >/dev/null 2>&1; then
-    v=$(jq -r 'if .enabled == false then "0" else "1" end' "$OPS" 2>/dev/null || echo 1)
-    [ "$v" = "0" ] && return 1
+    v=$(jq -r --arg b "$bot" '
+      if (.bots[$b].enabled? | type) == "boolean" then (.bots[$b].enabled | tostring)
+      elif (.enabled? | type) == "boolean" then (.enabled | tostring)
+      else "true" end' "$OPS" 2>/dev/null || echo true)
+    [ "$v" = "false" ] && return 1
     return 0
   fi
+  # jq-less fallback: only the legacy global field is safe to read with grep.
   if grep -qE '"enabled"[[:space:]]*:[[:space:]]*false' "$OPS" 2>/dev/null; then
     return 1
   fi
@@ -134,8 +143,9 @@ send_via() {
   return 1
 }
 
-# Candidate order: only quota 429 notices are rerouted, and only while the one
-# operator switch is ON. Everything else keeps the primary Bot exactly as before.
+# Candidate order: only quota 429 notices are rerouted. Each candidate is then
+# checked against its own per-Bot switch in the send loop, so turning one Bot
+# off does not affect the others. Everything else keeps the primary Bot.
 CANDIDATES=()
 add_candidate() {
   local bot="$1" c
@@ -145,7 +155,7 @@ add_candidate() {
   done
   CANDIDATES+=("$bot")
 }
-if [ "$notify_class" = "quota" ] && ops_on; then
+if [ "$notify_class" = "quota" ]; then
   latest=""
   if command -v jq >/dev/null 2>&1 && [ -s "$LEDGER" ]; then
     latest=$(jq -r 'to_entries | map(select((.value.in // 0) > 0)) | sort_by(.value.in) | last | .key // empty' "$LEDGER" 2>/dev/null || true)
@@ -161,8 +171,15 @@ fi
 add_candidate "primary"
 
 used_tokens=""
-final_rc=1
+attempted=0
+disabled=0
 for bot in "${CANDIDATES[@]}"; do
+  if [ "$notify_class" = "quota" ] && ! ops_bot_on "$bot"; then
+    echo "::notice::telegram ${tag} route ${bot} disabled by its own card-ops switch; skipping"
+    disabled=$((disabled + 1))
+    continue
+  fi
+  attempted=$((attempted + 1))
   if ! load_candidate "$bot"; then
     echo "::warning::telegram ${tag} route ${bot} unavailable (missing token/chat); trying next"
     continue
@@ -184,6 +201,11 @@ for bot in "${CANDIDATES[@]}"; do
     echo "::warning::telegram ${tag} preferred route ${bot} failed; falling back"
   fi
 done
+
+if [ "$notify_class" = "quota" ] && [ "$attempted" -eq 0 ] && [ "$disabled" -gt 0 ]; then
+  echo "telegram ${tag} skipped (all quota routes disabled by their own card-ops switch)"
+  exit 0
+fi
 
 echo "::warning::could not send ${tag} notice to telegram after all routes"
 exit 1
