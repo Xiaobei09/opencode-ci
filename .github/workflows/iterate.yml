@@ -340,6 +340,13 @@ jobs:
           # OPENCODE_START_T0 to report the non-opencode wall time at run end.
           post_t0=$(date +%s)
           echo "POST_OPENCODE_T0=$post_t0" >> "$GITHUB_ENV"
+          # R2766: OpenCode (and every bridge instance) has exited by now. A
+          # rollover claim interrupted by the quota watcher survives only as
+          # `ses_*.json.claimed-*`, which the consumer never scans. Recover it
+          # before the snapshot captures $HOME and before Relay decides whether
+          # a request is pending; otherwise the automatic switch disappears
+          # without a user stop.
+          bash "$GITHUB_WORKSPACE/.github/scripts/recover-rollover-claims.sh" || true
           # R2742 (operator: round gap under one minute): the run-end snapshot
           # only needs OpenCode to have exited, but it used to start after the
           # policy/relay/notify steps (~5s) — pure serial tail in the
