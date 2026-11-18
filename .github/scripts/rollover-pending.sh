@@ -124,24 +124,16 @@ _ro_bot_stopped() {
   ' "$ctl" >/dev/null 2>&1
 }
 
-# 0 = the bridge can consume this request this run (so do not also resume the
-#     session), 1 = waiting/orphan/expired (so quota-tail recovery may proceed).
-rollover_request_actionable() {
-  local f="$1" ts now sid manual id state
-  [ -f "$f" ] || return 1
+# 0 = a request for this sid can be consumed this run. `manual=true` bypasses
+# loop/halted gates, exactly like the bridge. Shared by the request reader and
+# the CI-side writer (R2780: an earlier 429 on a stopped Bot must not starve an
+# active Bot's switch).
+rollover_sid_actionable() {
+  local sid="$1" manual="${2:-false}" id state
+  [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
   _ro_have_jq || return 0 # no jq: keep the old conservative behavior
   # The bridge does not even read request files when the global switch is off.
   case "${ROLLOVER_ON_429:-1}" in 0) return 1 ;; esac
-  ts=$(jq -r '.ts // 0' "$f" 2>/dev/null || echo 0)
-  now=$(date +%s%3N)
-  case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
-  # The bridge deletes malformed/expired requests (>24h) instead of consuming.
-  [ "$ts" -gt 0 ] || return 1
-  [ $((now - ts)) -le 86400000 ] || return 1
-  sid=$(jq -r '.sid // empty' "$f" 2>/dev/null || true)
-  [ -n "$sid" ] || sid=$(basename "$f" .json)
-  [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
-  manual=$(jq -r '.manual // false' "$f" 2>/dev/null || echo false)
   while IFS=$'\t' read -r id state; do
     [ -n "$id" ] || continue
     _ro_bot_owns "$state" "$sid" || continue
@@ -157,6 +149,27 @@ rollover_request_actionable() {
   done < <(_ro_bot_states)
   # No online, non-stopped owner can consume it -> not actionable.
   return 1
+}
+
+# 0 = the bridge can consume this request this run (so do not also resume the
+#     session), 1 = waiting/orphan/expired (so quota-tail recovery may proceed).
+rollover_request_actionable() {
+  local f="$1" ts now sid manual
+  [ -f "$f" ] || return 1
+  _ro_have_jq || return 0 # no jq: keep the old conservative behavior
+  # The bridge does not even read request files when the global switch is off.
+  case "${ROLLOVER_ON_429:-1}" in 0) return 1 ;; esac
+  ts=$(jq -r '.ts // 0' "$f" 2>/dev/null || echo 0)
+  now=$(date +%s%3N)
+  case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+  # The bridge deletes malformed/expired requests (>24h) instead of consuming.
+  [ "$ts" -gt 0 ] || return 1
+  [ $((now - ts)) -le 86400000 ] || return 1
+  sid=$(jq -r '.sid // empty' "$f" 2>/dev/null || true)
+  [ -n "$sid" ] || sid=$(basename "$f" .json)
+  [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
+  manual=$(jq -r '.manual // false' "$f" 2>/dev/null || echo false)
+  rollover_sid_actionable "$sid" "$manual"
 }
 
 rollover_pending_for() {

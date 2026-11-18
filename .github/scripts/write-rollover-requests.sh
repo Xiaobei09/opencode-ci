@@ -54,6 +54,10 @@ CFG="$HOME/.config/opencode"
 DIR="${ROLLOVER_REQUEST_DIR:-$CFG/rollover-requests}"
 EVIDENCE="${QUOTA_429_EVIDENCE_PATH:-$CFG/quota-429-evidence.json}"
 STREAKS="${QUOTA_429_STREAKS_PATH:-$CFG/quota-429-streaks.json}"
+# R2780: reuse the exact "can the bridge consume this request now?" gate so a
+# stopped/halted/offline Bot cannot monopolize the one request per round.
+_RO_PENDING="$(dirname "$0")/rollover-pending.sh"
+[ -f "$_RO_PENDING" ] && . "$_RO_PENDING" 2>/dev/null || true
 [ -d "$CFG" ] || { echo "rollover: no $CFG; skip"; echo "rollover_triggered=0"; exit 0; }
 if ! mkdir -p "$DIR" 2>/dev/null; then
   echo "::warning::rollover: cannot create request dir $DIR"
@@ -145,33 +149,73 @@ CANDIDATES=$(printf '%s' "$NEW" | jq -c '
 CANDIDATE_N=$(printf '%s' "$CANDIDATES" | jq -r 'length' 2>/dev/null || echo 0)
 case "$CANDIDATE_N" in ''|*[!0-9]*) CANDIDATE_N=0 ;; esac
 
+# R2780 (2026-11-18): bot6 was stopped with the earliest-429 session, so every
+# round wrote a request the bridge could only keep waiting in. The active bot5
+# session (later 429) never got its own request and kept hitting quota for
+# 1h23m. Prefer the earliest session whose owner can consume the switch NOW;
+# if none can, keep the legacy waiting request so it survives until the Bot
+# resumes.
+CANDIDATES_ACTIONABLE='[]'
+if declare -F rollover_sid_actionable >/dev/null 2>&1; then
+  while IFS=$'\t' read -r _sid _first; do
+    [ -n "$_sid" ] || continue
+    case "$_first" in ''|*[!0-9]*) _first=0 ;; esac
+    if rollover_sid_actionable "$_sid"; then
+      CANDIDATES_ACTIONABLE=$(printf '%s' "$CANDIDATES_ACTIONABLE" | jq -c \
+        --arg sid "$_sid" --argjson first "$_first" '. + [{sid:$sid,first:$first}]' 2>/dev/null) \
+        || CANDIDATES_ACTIONABLE='[]'
+    fi
+  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring)] | @tsv' 2>/dev/null)"
+else
+  # Older/partial checkout without rollover-pending.sh: preserve the legacy
+  # behavior (treat every candidate as actionable) instead of marking all as
+  # waiting forever.
+  CANDIDATES_ACTIONABLE="$CANDIDATES"
+fi
+ACTIONABLE_N=$(printf '%s' "$CANDIDATES_ACTIONABLE" | jq -r 'length' 2>/dev/null || echo 0)
+case "$ACTIONABLE_N" in ''|*[!0-9]*) ACTIONABLE_N=0 ;; esac
+
+POOL="$CANDIDATES"
+POOL_N="$CANDIDATE_N"
+CHOSEN_ACTIONABLE=0
+if [ "$ACTIONABLE_N" -gt 0 ]; then
+  POOL="$CANDIDATES_ACTIONABLE"
+  POOL_N="$ACTIONABLE_N"
+  CHOSEN_ACTIONABLE=1
+  if [ "$CANDIDATE_N" -gt "$ACTIONABLE_N" ]; then
+    echo "rollover: skipping $((CANDIDATE_N - ACTIONABLE_N)) waiting session(s) (stopped/halted/offline owner); active 429 session takes the switch"
+  fi
+fi
+
 COUNTER="${ROLLOVER_429_COUNTER:-0}"
 case "$COUNTER" in ''|*[!0-9]*) COUNTER=0 ;; esac
 
 MODE=none
 CHOSEN=""
-if [ "$CANDIDATE_N" -ge 2 ]; then
+if [ "$POOL_N" -ge 2 ]; then
   # R2769: multiple sessions 429'd — switch the earliest one directly; the
   # request is consumed at the start of the next round.
   MODE=multi
-  CHOSEN=$(printf '%s' "$CANDIDATES" | jq -r '.[0].sid // empty' 2>/dev/null || true)
-  [ -n "$CHOSEN" ] && echo "rollover: ${CANDIDATE_N} sessions with fresh 429 evidence; switching the earliest directly (next round)"
-elif [ "$CANDIDATE_N" -eq 1 ]; then
+  CHOSEN=$(printf '%s' "$POOL" | jq -r '.[0].sid // empty' 2>/dev/null || true)
+  [ -n "$CHOSEN" ] && echo "rollover: ${POOL_N} session(s) with fresh 429 evidence; switching the earliest (next round)"
+elif [ "$POOL_N" -eq 1 ]; then
   MODE=single
   # R2769: a lone 429 session waits for the 429 counter to reach 1. The caller
   # passes the post-increment value, so the first counted round qualifies and
   # the request is consumed in the new round.
   if [ "$COUNTER" -ge 1 ]; then
-    CHOSEN=$(printf '%s' "$CANDIDATES" | jq -r '.[0].sid // empty' 2>/dev/null || true)
+    CHOSEN=$(printf '%s' "$POOL" | jq -r '.[0].sid // empty' 2>/dev/null || true)
     [ -n "$CHOSEN" ] && echo "rollover: single 429 session; counter=$COUNTER/1 reached, switching in the new round"
   else
     echo "rollover: single 429 session; waiting for the counter ($COUNTER/1)"
   fi
 fi
 echo "rollover_candidates=$CANDIDATE_N"
+echo "rollover_actionable=$ACTIONABLE_N"
 echo "rollover_mode=$MODE"
 
 TRIGGERED=0
+WAITING=0
 if [ -n "$CHOSEN" ]; then
   case "$CHOSEN" in
     ses_*) ;;
@@ -188,11 +232,19 @@ if [ -n "$CHOSEN" ]; then
       --arg run "$RUN" \
       '{sid:$sid,ts:$ts,reason:$reason,run:$run}' > "$TMP" 2>/dev/null \
      && mv -f "$TMP" "$FILE" 2>/dev/null; then
-    TRIGGERED=1
-    # R2700 (operator: "重置为0"): reset the switched session's counter to 0;
-    # the remaining sessions wait for later rounds instead of all switching at once.
-    NEW=$(printf '%s' "$NEW" | jq -c --arg sid "$CHOSEN" '.sessions[$sid].streak = 0' 2>/dev/null || printf '%s' "$NEW")
-    echo "rollover request written: $(redact_sid "$CHOSEN") (reason=$REASON, dir=$DIR)"
+    if [ "$CHOSEN_ACTIONABLE" = "1" ]; then
+      TRIGGERED=1
+      # R2700 (operator: "重置为0"): reset the switched session's counter to 0;
+      # the remaining sessions wait for later rounds instead of all switching at once.
+      NEW=$(printf '%s' "$NEW" | jq -c --arg sid "$CHOSEN" '.sessions[$sid].streak = 0' 2>/dev/null || printf '%s' "$NEW")
+      echo "rollover request written: $(redact_sid "$CHOSEN") (reason=$REASON, dir=$DIR)"
+    else
+      # R2780: the owner is stopped/halted/offline. Keep the request durable so
+      # it switches when the Bot resumes, but do NOT report it as a completed
+      # switch or reset the 429 counter.
+      WAITING=1
+      echo "rollover request kept for waiting session: $(redact_sid "$CHOSEN") (reason=$REASON, dir=$DIR)"
+    fi
   else
     rm -f "$TMP" 2>/dev/null || true
     echo "::warning::rollover request write failed: $(redact_sid "$CHOSEN") (dir=$DIR)"
@@ -212,7 +264,10 @@ fi
 if [ "$TRIGGERED" = "1" ]; then
   echo "rollover_triggered=1"
 else
-  if [ "$CANDIDATE_N" -gt 0 ]; then
+  if [ "$WAITING" = "1" ]; then
+    echo "rollover: request queued for a waiting session; switch happens after the Bot resumes"
+    echo "rollover_waiting=1"
+  elif [ "$CANDIDATE_N" -gt 0 ]; then
     echo "rollover: $CANDIDATE_N session(s) with 429 evidence but no switch this round (mode=$MODE)"
   else
     echo "rollover: no session with 429 evidence this round; nothing to switch"
