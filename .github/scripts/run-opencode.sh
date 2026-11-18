@@ -251,13 +251,12 @@ resume_front_of() {
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rollover-pending.sh"
 RESUME_ONCE_LIST=""
 if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_SID" ] && ! rollover_pending_for "$RESUME_SID"; then
-  # R2800: the --session id is usually the primary Bot's front. It used to be
-  # pre-armed here without the R2785 stop gate, so a stopped primary still got
-  # a resume prompt while every other arming path skipped stopped Bots. Defer
-  # to the Bot loop below when the owner is stopped/halted; that loop applies
-  # the R2797 rollover-seed one-shot exception.
-  if sid_owner_stopped "$RESUME_SID"; then
-    say "option C resume-once deferred for $RESUME_SID (owner stopped/halted; seed check in bot loop)"
+  # R2805 (operator: "stopping is only the loop; tail recovery is to finish the
+  # output"): a stopped Bot still needs its interrupted turn finished, so the
+  # explicit --session is armed unless the session is ⏹ halted. The bot loop
+  # below also arms stopped fronts (dedup preserves this first position).
+  if sid_owner_halted "$RESUME_SID"; then
+    say "option C resume-once skipped for $RESUME_SID (halted)"
   else
     RESUME_ONCE_LIST="$RESUME_SID"
   fi
@@ -288,21 +287,16 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       fi
       [ -f "$_state" ] || continue
       _sid=$(resume_front_of "$_state")
-      # R2785: `/loop stop` is a hard gate. Do not even arm a stopped Bot for
-      # quota-tail recovery; the old code armed it, the plugin woke the
-      # exhausted session, the 429 ended the round, and every relay repeated
-      # the same 2-3 minute restart. The request/evidence stays durable for a
-      # later `/loop start`.
+      # R2805: `/loop stop` only stops the auto-loop. Tail recovery exists to
+      # finish an interrupted output, so a stopped Bot is still armed; the
+      # plugin decides from the actual tail (clean turns stay skipped).
+      # ⏹ halted remains the hard gate — skip arming entirely.
+      if [ -n "$_sid" ] && bot_sid_halted "$_botid" "$_state" "$_sid"; then
+        say "option C resume-once skipped for $_sid (halted)"
+        continue
+      fi
       if [ -n "$_sid" ] && bot_sid_stopped "$_botid" "$_state" "$_sid"; then
-        # R2797: a rollover-created successor whose seed prompt immediately hit
-        # 429 gets exactly one recovery even if /loop stop was issued earlier.
-        # The ⏹ halt still wins; attempts>=1 / stale seeds do not arm.
-        if ! bot_sid_halted "$_botid" "$_state" "$_sid" && rollover_seed_pending "$_sid"; then
-          say "option C resume-once armed for $_sid (rollover seed one-shot; bot stopped)"
-        else
-          say "option C resume-once skipped for $_sid (bot stopped)"
-          continue
-        fi
+        say "option C resume-once armed for $_sid (tail recovery; loop stopped)"
       fi
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
@@ -319,13 +313,12 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       if [ "$_bid" = "tg-chats" ]; then _bid=primary; else _bid=${_bid#tg-chats-}; fi
       bot_is_offline "$_bid" && continue
       _sid=$(resume_front_of "$_state")
+      if [ -n "$_sid" ] && bot_sid_halted "$_bid" "$_state" "$_sid"; then
+        say "option C resume-once skipped for $_sid (halted)"
+        continue
+      fi
       if [ -n "$_sid" ] && bot_sid_stopped "$_bid" "$_state" "$_sid"; then
-        if ! bot_sid_halted "$_bid" "$_state" "$_sid" && rollover_seed_pending "$_sid"; then
-          say "option C resume-once armed for $_sid (rollover seed one-shot; bot stopped)"
-        else
-          say "option C resume-once skipped for $_sid (bot stopped)"
-          continue
-        fi
+        say "option C resume-once armed for $_sid (tail recovery; loop stopped)"
       fi
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"

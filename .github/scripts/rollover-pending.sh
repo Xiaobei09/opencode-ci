@@ -222,6 +222,17 @@ sid_owner_stopped() {
   _ro_bot_stopped "$id" "$state" "$sid"
 }
 
+# R2805: ⏹ halted is the hard gate for tail recovery; `/loop stop` is not.
+# Arming skips halted sessions so we do not even query them, but a stopped Bot
+# is still armed — resume-once only injects when the tail is actually
+# interrupted (clean tails stay skipped).
+sid_owner_halted() {
+  local raw="$1" resolved _state sid
+  resolved=$(sid_owner_resolve "$raw") || return 1
+  IFS=$'\t' read -r _ _state sid <<< "$resolved"
+  _ro_bot_halted "$_state" "$sid"
+}
+
 # R2800: a rollover successor whose seed prompt 429'd must end the round even
 # when its Bot's loop is stopped, otherwise the watcher ignores the synthetic
 # 429 and the successor stays dead until something else ends the run. The next
