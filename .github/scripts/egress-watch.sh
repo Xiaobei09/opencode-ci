@@ -306,9 +306,10 @@ quota_probe_keeps_round() {
 # the same failed message share msg_at, so one provider failure cannot produce
 # several stops. A healthy turn resets the streak.
 # R2629: before the stop, re-probe the current egress; a 200 keeps the round.
-# Auto-continue has its own 3-consecutive-error limit, so the round still ends
-# even if the retry keeps failing or the watcher misses the quota line in the
-# shutdown race.
+# R2806: auto-continue no longer retries a this-run quota 429 in-run, so this
+# watcher is the normal end-of-round path. The plugin has a bounded fallback
+# (AC_QUOTA_RESTART_GRACE_MS, default 180s) if the watcher misses the line; it
+# still goes through the same workflow relay.
 record_quota() {
   local line="$1" retry_after="${2:-?}" msg_at="${3:-}" now reset_at="" sid=""
   now=$(egress_now)
