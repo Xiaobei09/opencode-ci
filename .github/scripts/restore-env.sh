@@ -138,7 +138,11 @@ ENV_SYNC_MAX_AGE_MIN="${ENV_SYNC_MAX_AGE_MIN:-1440}"
 # restore silent for 164s and then only ended when the operator cancelled the
 # run. Bound them, retry the clone once, and record *why* env-sync was rejected
 # so the release fallback can be refused when it would downgrade fresh state.
-ENV_SYNC_CLONE_TIMEOUT="${ENV_SYNC_CLONE_TIMEOUT:-60}"
+# R2808: the env-sync payload is ~686MB (13x32MB DB chunks). 60s required
+# >11MB/s and timed out twice on 2026-11-18 14:33Z, failing the whole round.
+# 180s keeps 2 attempts (6min worst case) well under the 15min restore ceiling
+# and tolerates ~4MB/s; the next round still retries if the network is down.
+ENV_SYNC_CLONE_TIMEOUT="${ENV_SYNC_CLONE_TIMEOUT:-180}"
 ENV_SYNC_CLONE_ATTEMPTS="${ENV_SYNC_CLONE_ATTEMPTS:-2}"
 GH_META_TIMEOUT="${GH_META_TIMEOUT:-30}"
 # A release env is never a safe substitute for a fresh env-sync branch: the
