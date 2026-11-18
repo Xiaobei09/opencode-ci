@@ -150,6 +150,37 @@ bot_sid_stopped() {
   _ro_bot_stopped "$id" "$f" "$sid"
 }
 
+# R2797: the ⏹ halt part of the stop gate, exposed separately. A rollover seed
+# may bypass `/loop stop` for its one recovery attempt, but never a session the
+# user explicitly halted.
+bot_sid_halted() {
+  local id="$1" f="$2" sid="$3"
+  [ -n "$id" ] && [ -n "$f" ] && [ -n "$sid" ] || return 1
+  _ro_bot_halted "$f" "$sid"
+}
+
+_ro_seed_dir() { printf '%s' "${ROLLOVER_SEED_DIR:-$(_ro_home)/.config/opencode/rollover-seeds}"; }
+
+# R2797: a 429 rollover-created successor whose seed prompt immediately 429'd
+# must still be armed for Option C even when the Bot's loop is stopped. The
+# seed is one-shot: attempts>=1 or older than 24h no longer arms anything.
+rollover_seed_pending() {
+  local sid="$1" f at attempts now
+  [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
+  f="$(_ro_seed_dir)/$sid.json"
+  [ -s "$f" ] && _ro_have_jq || return 1
+  attempts=$(jq -r '.attempts // 0' "$f" 2>/dev/null || echo 0)
+  at=$(jq -r '.at // 0' "$f" 2>/dev/null || echo 0)
+  case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
+  case "$at" in ''|*[!0-9]*) at=0 ;; esac
+  [ "$attempts" -lt 1 ] || return 1
+  [ "$at" -gt 0 ] || return 1
+  [ "$(jq -r --arg sid "$sid" '.sid // empty' "$f" 2>/dev/null)" = "$sid" ] || return 1
+  now=$(date +%s%3N)
+  [ $((now - at)) -le 86400000 ] || return 1
+  return 0
+}
+
 # R2785: map a session id from a plugin log line (auto-continue truncates it to
 # 8 chars in public logs) to its unique Bot owner, then apply the stop/halt
 # gate. Returns 1 for orphan/shared prefixes so a real 429 is never hidden.

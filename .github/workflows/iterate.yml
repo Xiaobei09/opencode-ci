@@ -825,8 +825,27 @@ jobs:
               fi
             fi
           elif [ "$outcome" = "cancelled" ]; then
-            gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
-            echo "::notice::run cancelled by operator; CI_LOOP_PAUSED=true, no successor"
+            # R2797 (operator: "还是没有429换会话/重启ci"): a cancellation is not
+            # always an operator stop. If a successor run is already queued or
+            # in progress (the old run was superseded), pausing here kills that
+            # successor and falsely reports "no successor". Use the same
+            # in-flight definition as watchdog.yml, excluding this run.
+            cancelled_successor=$(gh run list --repo "$repo" --workflow iterate.yml --limit 20 \
+              --json databaseId,status 2>/dev/null \
+              | jq -r --arg self "${GITHUB_RUN_ID:-}" '
+                  [ .[]
+                    | select((.databaseId|tostring) != $self)
+                    | select(.status == "in_progress" or .status == "queued"
+                             or .status == "pending" or .status == "waiting"
+                             or .status == "requested") ]
+                  | (.[0].databaseId // empty) | tostring' 2>/dev/null || true)
+            if [ -n "$cancelled_successor" ]; then
+              echo "cancelled_successor=$cancelled_successor" >> "$GITHUB_OUTPUT"
+              echo "::notice::run cancelled but successor run $cancelled_successor is already queued/in_progress; leaving CI_LOOP_PAUSED unchanged and suppressing relay"
+            else
+              gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
+              echo "::notice::run cancelled by operator; CI_LOOP_PAUSED=true, no successor"
+            fi
           else
             gh variable set CI_LOOP_PAUSED --body true --repo "$repo" >/dev/null 2>&1 || true
             echo "::notice::unexpected outcome=$outcome; paused the loop and suppressing relay"
@@ -1177,11 +1196,13 @@ jobs:
           R2651_QUOTA_EVIDENCE: ${{ steps.failure_guard.outputs.quota_evidence }}
           R2651_RECOVERY_DISPATCHED: ${{ steps.failure_guard.outputs.recovery_dispatched }}
           R2651_EXIT_CODE: ${{ steps.run_opencode.outputs.exit_code }}
+          R2651_CANCELLED_SUCCESSOR: ${{ steps.failure_guard.outputs.cancelled_successor }}
           R2651_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
           repo="${R2651_REPO:-}"
           outcome="${R2651_RUN_OUTCOME:-}"
+          cancelled_successor="${R2651_CANCELLED_SUCCESSOR:-}"
           relay_out="${R2651_RELAY_OUTCOME:-}"
           recovery_dispatched="${R2651_RECOVERY_DISPATCHED:-}"
           watcher="${R2651_WATCHER_STOP:-}"
@@ -1246,7 +1267,11 @@ jobs:
               reason="watcher 结束本轮，但未接力（${wr:-未知}）"
             fi
           elif [ "$outcome" = "cancelled" ]; then
-            reason="已取消（不自动接力）"
+            if [ -n "$cancelled_successor" ]; then
+              reason="已取消；后继 run ${cancelled_successor} 已在排队/运行，循环继续"
+            else
+              reason="已取消（不自动接力）"
+            fi
           elif [ "$streak" != "?" ] && [ "$streak" -ge 3 ] 2>/dev/null; then
             reason="连续失败 3 次，循环已暂停"
           elif [ "$relay_out" = "failure" ]; then
@@ -1260,7 +1285,11 @@ jobs:
           if [ "$outcome" = "failure" ]; then
             meta="exit=${rc:-?} · 连续失败 ${streak}"
           fi
-          text=$(printf '🛑 CI 循环停止\n原因：%s\nrun %s' "$reason" "${GITHUB_RUN_ID:-?}")
+          title="🛑 CI 循环停止"
+          # R2797: a cancelled run superseded by a successor did not stop the
+          # loop; label the card as a hand-off instead of a stop.
+          [ -n "$cancelled_successor" ] && title="🔁 CI 已交接"
+          text=$(printf '%s\n原因：%s\nrun %s' "$title" "$reason" "${GITHUB_RUN_ID:-?}")
           [ -n "$meta" ] && text=$(printf '%s\n%s' "$text" "$meta")
           if [ -n "$err_line" ]; then
             text=$(printf '%s\n最后错误：%s' "$text" "$err_line")

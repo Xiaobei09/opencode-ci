@@ -285,8 +285,15 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       # the same 2-3 minute restart. The request/evidence stays durable for a
       # later `/loop start`.
       if [ -n "$_sid" ] && bot_sid_stopped "$_botid" "$_state" "$_sid"; then
-        say "option C resume-once skipped for $_sid (bot stopped)"
-        continue
+        # R2797: a rollover-created successor whose seed prompt immediately hit
+        # 429 gets exactly one recovery even if /loop stop was issued earlier.
+        # The ⏹ halt still wins; attempts>=1 / stale seeds do not arm.
+        if ! bot_sid_halted "$_botid" "$_state" "$_sid" && rollover_seed_pending "$_sid"; then
+          say "option C resume-once armed for $_sid (rollover seed one-shot; bot stopped)"
+        else
+          say "option C resume-once skipped for $_sid (bot stopped)"
+          continue
+        fi
       fi
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
@@ -304,8 +311,12 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       bot_is_offline "$_bid" && continue
       _sid=$(resume_front_of "$_state")
       if [ -n "$_sid" ] && bot_sid_stopped "$_bid" "$_state" "$_sid"; then
-        say "option C resume-once skipped for $_sid (bot stopped)"
-        continue
+        if ! bot_sid_halted "$_bid" "$_state" "$_sid" && rollover_seed_pending "$_sid"; then
+          say "option C resume-once armed for $_sid (rollover seed one-shot; bot stopped)"
+        else
+          say "option C resume-once skipped for $_sid (bot stopped)"
+          continue
+        fi
       fi
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"

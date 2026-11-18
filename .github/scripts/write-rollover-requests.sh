@@ -12,6 +12,11 @@
 # as a bound session has 429 evidence this round (streak >= 1); after writing the
 # request reset that session's streak to 0. Still one request per round — the
 # earliest first-429 session wins, the rest wait for later rounds.
+# R2797 (operator: "还是没有429换会话/重启ci"): a rollover-created successor
+# whose injected seed prompt immediately 429'd must NOT chain another rollover.
+# That synthetic 429 (userInitiated=false) is the DOA signal; resume-once owns
+# exactly one recovery attempt via ~/.config/opencode/rollover-seeds/<sid>.json.
+# Legacy evidence without an explicit userInitiated field keeps the old behavior.
 # R2769 (operator: "多个会话都429-下一轮直接给最先429的换；只有一个会话429，
 # 等计数器到1时的新一轮换"):
 #   * multiple sessions with fresh 429 evidence: switch the earliest first-429
@@ -54,6 +59,7 @@ CFG="$HOME/.config/opencode"
 DIR="${ROLLOVER_REQUEST_DIR:-$CFG/rollover-requests}"
 EVIDENCE="${QUOTA_429_EVIDENCE_PATH:-$CFG/quota-429-evidence.json}"
 STREAKS="${QUOTA_429_STREAKS_PATH:-$CFG/quota-429-streaks.json}"
+SEED_DIR="${ROLLOVER_SEED_DIR:-$CFG/rollover-seeds}"
 # R2780: reuse the exact "can the bridge consume this request now?" gate so a
 # stopped/halted/offline Bot cannot monopolize the one request per round.
 _RO_PENDING="$(dirname "$0")/rollover-pending.sh"
@@ -121,15 +127,19 @@ while IFS= read -r sid; do
     EV_FIRST=$(printf '%s' "$EV" | jq -r '.first429At // 0' 2>/dev/null || echo 0)
     EV_LAST=$(printf '%s' "$EV" | jq -r '.last429At // 0' 2>/dev/null || echo 0)
     EV_USER=$(printf '%s' "$EV" | jq -r '.userInitiated == true' 2>/dev/null || echo false)
+    # R2797: distinguish "explicitly synthetic" (false) from legacy evidence
+    # that predates R2795 and has no userInitiated field at all.
+    EV_USER_KNOWN=$(printf '%s' "$EV" | jq -r 'has("userInitiated")' 2>/dev/null || echo false)
     case "$EV_FIRST" in ''|*[!0-9]*) EV_FIRST=0 ;; esac
     case "$EV_LAST" in ''|*[!0-9]*) EV_LAST=0 ;; esac
-    UPDATED=$(printf '%s' "$NEW" | jq -c --argjson prev "$PREV" --arg sid "$sid" --argjson first "$EV_FIRST" --argjson last "$EV_LAST" --argjson user "$EV_USER" '
+    UPDATED=$(printf '%s' "$NEW" | jq -c --argjson prev "$PREV" --arg sid "$sid" --argjson first "$EV_FIRST" --argjson last "$EV_LAST" --argjson user "$EV_USER" --argjson known "$EV_USER_KNOWN" '
       (($prev.sessions // {})[$sid] // {}) as $p
       | .sessions[$sid] = {
           streak: (($p.streak // 0) + 1),
           first429At: ([ ($p.first429At // 0), $first ] | map(select(. > 0)) | min // 0),
           last429At: ([ ($p.last429At // 0), $last ] | map(select(. > 0)) | max // 0),
-          userInitiated: (($p.userInitiated // false) or $user)
+          userInitiated: (($p.userInitiated // false) or $user),
+          userInitiatedKnown: (($p.userInitiatedKnown // false) or $known)
         }' 2>/dev/null)
     [ -n "$UPDATED" ] && NEW="$UPDATED"
   else
@@ -145,11 +155,50 @@ CANDIDATES=$(printf '%s' "$NEW" | jq -c '
   [ .sessions | to_entries[]
     | select((.value.streak | type) == "number" and .value.streak >= 1)
     | select((.value.first429At | type) == "number" and .value.first429At > 0)
-    | {sid: .key, first: .value.first429At, user: (.value.userInitiated == true)} ]
+    | {sid: .key, first: .value.first429At, user: (.value.userInitiated == true),
+       userKnown: (.value.userInitiatedKnown == true)} ]
   | sort_by([.first, .sid])' 2>/dev/null || true)
 [ -n "$CANDIDATES" ] || CANDIDATES='[]'
 CANDIDATE_N=$(printf '%s' "$CANDIDATES" | jq -r 'length' 2>/dev/null || echo 0)
 case "$CANDIDATE_N" in ''|*[!0-9]*) CANDIDATE_N=0 ;; esac
+
+# R2797: do not chain a rollover from the synthetic 429 produced by the previous
+# rollover's seed prompt. Legacy evidence (no explicit userInitiated) keeps the
+# old behavior: it may still switch. A real-user 429 (user=true) always may.
+if [ -d "$SEED_DIR" ] && [ "$CANDIDATE_N" -gt 0 ]; then
+  _NOW_MS=$(date +%s%3N)
+  _FILTERED='[]'
+  while IFS=$'\t' read -r _sid _first _user _known; do
+    [ -n "$_sid" ] || continue
+    _skip=0
+    case "$_sid" in
+      ses_*[!A-Za-z0-9_-]*|ses_) _skip=0 ;;
+      ses_*)
+        if [ "$_known" = "true" ] && [ "$_user" != "true" ]; then
+          _seed="$SEED_DIR/$_sid.json"
+          if [ -s "$_seed" ]; then
+            _seed_at=$(jq -r '.at // 0' "$_seed" 2>/dev/null || echo 0)
+            case "$_seed_at" in ''|*[!0-9]*) _seed_at=0 ;; esac
+            if [ "$_seed_at" -gt 0 ] && [ $((_NOW_MS - _seed_at)) -le 86400000 ]; then
+              _skip=1
+            fi
+          fi
+        fi
+        ;;
+    esac
+    if [ "$_skip" = 1 ]; then
+      echo "rollover: skip $(redact_sid "$_sid") (synthetic 429 on rollover successor; resume-once owns the one-shot retry)" >&2
+      continue
+    fi
+    _FILTERED=$(printf '%s' "$_FILTERED" | jq -c \
+      --arg sid "$_sid" --argjson first "$_first" --argjson user "$_user" --argjson known "$_known" \
+      '. + [{sid:$sid,first:$first,user:$user,userKnown:$known}]' 2>/dev/null) \
+      || _FILTERED='[]'
+  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring), (.user|tostring), (.userKnown|tostring)] | @tsv' 2>/dev/null)"
+  CANDIDATES="$_FILTERED"
+  CANDIDATE_N=$(printf '%s' "$CANDIDATES" | jq -r 'length' 2>/dev/null || echo 0)
+  case "$CANDIDATE_N" in ''|*[!0-9]*) CANDIDATE_N=0 ;; esac
+fi
 
 # R2780 (2026-11-18): bot6 was stopped with the earliest-429 session, so every
 # round wrote a request the bridge could only keep waiting in. The active bot5
