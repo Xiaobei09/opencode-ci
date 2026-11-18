@@ -251,7 +251,16 @@ resume_front_of() {
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rollover-pending.sh"
 RESUME_ONCE_LIST=""
 if [ "$RESUME_ONCE_ENABLED" = "1" ] && [ -n "$RESUME_SID" ] && ! rollover_pending_for "$RESUME_SID"; then
-  RESUME_ONCE_LIST="$RESUME_SID"
+  # R2800: the --session id is usually the primary Bot's front. It used to be
+  # pre-armed here without the R2785 stop gate, so a stopped primary still got
+  # a resume prompt while every other arming path skipped stopped Bots. Defer
+  # to the Bot loop below when the owner is stopped/halted; that loop applies
+  # the R2797 rollover-seed one-shot exception.
+  if sid_owner_stopped "$RESUME_SID"; then
+    say "option C resume-once deferred for $RESUME_SID (owner stopped/halted; seed check in bot loop)"
+  else
+    RESUME_ONCE_LIST="$RESUME_SID"
+  fi
 fi
 RESUME_ONCE_SIDS=""
 if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
