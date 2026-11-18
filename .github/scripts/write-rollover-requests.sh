@@ -120,14 +120,16 @@ while IFS= read -r sid; do
   if [ -n "$EV" ]; then
     EV_FIRST=$(printf '%s' "$EV" | jq -r '.first429At // 0' 2>/dev/null || echo 0)
     EV_LAST=$(printf '%s' "$EV" | jq -r '.last429At // 0' 2>/dev/null || echo 0)
+    EV_USER=$(printf '%s' "$EV" | jq -r '.userInitiated == true' 2>/dev/null || echo false)
     case "$EV_FIRST" in ''|*[!0-9]*) EV_FIRST=0 ;; esac
     case "$EV_LAST" in ''|*[!0-9]*) EV_LAST=0 ;; esac
-    UPDATED=$(printf '%s' "$NEW" | jq -c --argjson prev "$PREV" --arg sid "$sid" --argjson first "$EV_FIRST" --argjson last "$EV_LAST" '
+    UPDATED=$(printf '%s' "$NEW" | jq -c --argjson prev "$PREV" --arg sid "$sid" --argjson first "$EV_FIRST" --argjson last "$EV_LAST" --argjson user "$EV_USER" '
       (($prev.sessions // {})[$sid] // {}) as $p
       | .sessions[$sid] = {
           streak: (($p.streak // 0) + 1),
           first429At: ([ ($p.first429At // 0), $first ] | map(select(. > 0)) | min // 0),
-          last429At: ([ ($p.last429At // 0), $last ] | map(select(. > 0)) | max // 0)
+          last429At: ([ ($p.last429At // 0), $last ] | map(select(. > 0)) | max // 0),
+          userInitiated: (($p.userInitiated // false) or $user)
         }' 2>/dev/null)
     [ -n "$UPDATED" ] && NEW="$UPDATED"
   else
@@ -143,7 +145,7 @@ CANDIDATES=$(printf '%s' "$NEW" | jq -c '
   [ .sessions | to_entries[]
     | select((.value.streak | type) == "number" and .value.streak >= 1)
     | select((.value.first429At | type) == "number" and .value.first429At > 0)
-    | {sid: .key, first: .value.first429At} ]
+    | {sid: .key, first: .value.first429At, user: (.value.userInitiated == true)} ]
   | sort_by([.first, .sid])' 2>/dev/null || true)
 [ -n "$CANDIDATES" ] || CANDIDATES='[]'
 CANDIDATE_N=$(printf '%s' "$CANDIDATES" | jq -r 'length' 2>/dev/null || echo 0)
@@ -157,15 +159,17 @@ case "$CANDIDATE_N" in ''|*[!0-9]*) CANDIDATE_N=0 ;; esac
 # resumes.
 CANDIDATES_ACTIONABLE='[]'
 if declare -F rollover_sid_actionable >/dev/null 2>&1; then
-  while IFS=$'\t' read -r _sid _first; do
+  while IFS=$'\t' read -r _sid _first _user; do
     [ -n "$_sid" ] || continue
     case "$_first" in ''|*[!0-9]*) _first=0 ;; esac
-    if rollover_sid_actionable "$_sid"; then
+    [ "$_user" = "true" ] || _user=false
+    if rollover_sid_actionable "$_sid" false "$_user"; then
       CANDIDATES_ACTIONABLE=$(printf '%s' "$CANDIDATES_ACTIONABLE" | jq -c \
-        --arg sid "$_sid" --argjson first "$_first" '. + [{sid:$sid,first:$first}]' 2>/dev/null) \
+        --arg sid "$_sid" --argjson first "$_first" --argjson user "$_user" \
+        '. + [{sid:$sid,first:$first,user:$user}]' 2>/dev/null) \
         || CANDIDATES_ACTIONABLE='[]'
     fi
-  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring)] | @tsv' 2>/dev/null)"
+  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring), (.user|tostring)] | @tsv' 2>/dev/null)"
 else
   # Older/partial checkout without rollover-pending.sh: preserve the legacy
   # behavior (treat every candidate as actionable) instead of marking all as
@@ -225,12 +229,15 @@ fi
 if [ -n "$CHOSEN" ]; then
   FILE="$DIR/$CHOSEN.json"
   TMP="$FILE.tmp.$$"
+  CHOSEN_USER=$(printf '%s' "$NEW" | jq -r --arg sid "$CHOSEN" '.sessions[$sid].userInitiated == true' 2>/dev/null || echo false)
+  [ "$CHOSEN_USER" = "true" ] || CHOSEN_USER=false
   if jq -n \
       --arg sid "$CHOSEN" \
       --argjson ts "$TS" \
       --arg reason "$REASON" \
       --arg run "$RUN" \
-      '{sid:$sid,ts:$ts,reason:$reason,run:$run}' > "$TMP" 2>/dev/null \
+      --argjson user "$CHOSEN_USER" \
+      '{sid:$sid,ts:$ts,reason:$reason,run:$run,userInitiated:$user}' > "$TMP" 2>/dev/null \
      && mv -f "$TMP" "$FILE" 2>/dev/null; then
     if [ "$CHOSEN_ACTIONABLE" = "1" ]; then
       TRIGGERED=1

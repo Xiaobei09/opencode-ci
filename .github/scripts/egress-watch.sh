@@ -426,8 +426,11 @@ esac
 
 # handle_quota <line>
 handle_quota() {
-  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl cur_egress sid
+  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl cur_egress sid user_initiated
   now=$(egress_now)
+  # R2795: a real user turn's 429 is not a stale synthetic prompt. The plugin
+  # emits this flag; only `true` bypasses the stopped-Bot ignore gate below.
+  user_initiated=$(printf '%s' "$line" | sed -nE 's/.*user_initiated=(true|false).*/\1/p' | head -1)
 
   # R2566 (operator priority: still widespread 429 after a 200 preflight):
   # only the structured quota line emitted by auto-continue is evidence. Other
@@ -475,15 +478,21 @@ handle_quota() {
     fi
   fi
 
-  # R2785: an explicitly stopped/halted Bot can still have a stale synthetic
-  # prompt in flight (e.g. quota-tail recovery from an older build). Its 429 is
-  # not evidence that the selected egress is exhausted for the active Bots.
-  # Ignore it before blacklisting/stopping so the run keeps serving them; an
-  # active Bot's next real turn still proves the egress either way.
+  # R2785/R2795: an explicitly stopped/halted Bot can still have a stale
+  # synthetic prompt in flight (e.g. quota-tail recovery from an older build).
+  # Its 429 is not evidence that the selected egress is exhausted for the active
+  # Bots, so ignore it before blacklisting/stopping. But a **real user message**
+  # that hit 429 while the loop was stopped is different: the operator is
+  # waiting for that answer, and silently ignoring it forces a manual /rollover
+  # plus a manual CI cancel (2026-11-18 bot6 incident). The plugin marks those
+  # turns `user_initiated=true`; only synthetic/restored turns keep R2785.
   sid=$(printf '%s' "$line" | sed -nE 's/.*session=(ses_[A-Za-z0-9_-]+).*/\1/p' | head -1)
-  if [ -n "$sid" ] && sid_owner_stopped "$sid"; then
-    log "quota 429 from stopped/halted Bot session $sid; ignoring for stop/blacklist (intentional stop, active Bots keep running)"
+  if [ "$user_initiated" != "true" ] && [ -n "$sid" ] && sid_owner_stopped "$sid"; then
+    log "quota 429 from stopped/halted Bot session $sid (user_initiated=${user_initiated:-unknown}); ignoring for stop/blacklist (synthetic/restored turn, active Bots keep running)"
     return 0
+  fi
+  if [ "$user_initiated" = "true" ] && [ -n "$sid" ]; then
+    log "quota 429 from a real user turn on stopped/halted Bot session $sid; not ignoring (operator is waiting; end this round and switch)"
   fi
 
   # R2620 (operator: "改为出现一个429就重启吧"): a candidate that passed the

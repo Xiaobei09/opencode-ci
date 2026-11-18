@@ -114,13 +114,21 @@ _ro_halt_released() {
   jq -e --arg sid "$sid" 'type == "object" and has($sid)' "$rel" >/dev/null 2>&1
 }
 
+# R2795: a real user turn's 429 may bypass the loop-stop gate, but never the
+# per-session ⏹ halt. Keep the halt decision separate so the actionable gate
+# can distinguish "user stopped the loop" from "user stopped this session".
+_ro_bot_halted() {
+  local f="$1" sid="$2" halted
+  halted=$(jq -r --arg sid "$sid" '(.halted // []) | index($sid) != null' "$f" 2>/dev/null || echo false)
+  [ "$halted" = "true" ] && ! _ro_halt_released "$sid"
+}
+
 # Mirrors tg-bridge's rollover gate: !manual && (loopStopped() || haltedSet).
 # loopStopped() uses the Bot's current front (persistedFront), not the request
 # sid, so a request for an already-remapped session is not falsely blocked.
 _ro_bot_stopped() {
-  local id="$1" f="$2" sid="$3" ctl front halted
-  halted=$(jq -r --arg sid "$sid" '(.halted // []) | index($sid) != null' "$f" 2>/dev/null || echo false)
-  [ "$halted" = "true" ] && ! _ro_halt_released "$sid" && return 0
+  local id="$1" f="$2" sid="$3" ctl front
+  _ro_bot_halted "$f" "$sid" && return 0
   ctl="$(_ro_ctl)"
   [ -s "$ctl" ] && _ro_have_jq || return 1
   front=$(_ro_front "$f")
@@ -174,11 +182,13 @@ sid_owner_stopped() {
 }
 
 # 0 = a request for this sid can be consumed this run. `manual=true` bypasses
-# loop/halted gates, exactly like the bridge. Shared by the request reader and
-# the CI-side writer (R2780: an earlier 429 on a stopped Bot must not starve an
-# active Bot's switch).
+# loop/halted gates, exactly like the bridge. `user=true` (R2795) bypasses only
+# the loop-stop gate: a real user message that hit 429 must keep working even
+# when the Bot's auto-loop was stopped earlier. A per-session ⏹ halt still
+# blocks it. Shared by the request reader and the CI-side writer (R2780: an
+# earlier 429 on a stopped Bot must not starve an active Bot's switch).
 rollover_sid_actionable() {
-  local sid="$1" manual="${2:-false}" id state
+  local sid="$1" manual="${2:-false}" user="${3:-false}" id state
   [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
   _ro_have_jq || return 0 # no jq: keep the old conservative behavior
   # The bridge does not even read request files when the global switch is off.
@@ -192,7 +202,12 @@ rollover_sid_actionable() {
     # orphan manual request block the next run forever.
     bot_is_offline "$id" && continue
     # Manual requests bypass loop/halted gates, exactly like the bridge.
-    if [ "$manual" = "true" ] || ! _ro_bot_stopped "$id" "$state" "$sid"; then
+    if [ "$manual" = "true" ]; then
+      return 0
+    fi
+    # A real user turn may bypass the loop stop, but never a session halt.
+    _ro_bot_halted "$state" "$sid" && continue
+    if [ "$user" = "true" ] || ! _ro_bot_stopped "$id" "$state" "$sid"; then
       return 0
     fi
   done < <(_ro_bot_states)
@@ -203,7 +218,7 @@ rollover_sid_actionable() {
 # 0 = the bridge can consume this request this run (so do not also resume the
 #     session), 1 = waiting/orphan/expired (so quota-tail recovery may proceed).
 rollover_request_actionable() {
-  local f="$1" ts now sid manual
+  local f="$1" ts now sid manual user
   [ -f "$f" ] || return 1
   _ro_have_jq || return 0 # no jq: keep the old conservative behavior
   # The bridge does not even read request files when the global switch is off.
@@ -218,7 +233,8 @@ rollover_request_actionable() {
   [ -n "$sid" ] || sid=$(basename "$f" .json)
   [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
   manual=$(jq -r '.manual // false' "$f" 2>/dev/null || echo false)
-  rollover_sid_actionable "$sid" "$manual"
+  user=$(jq -r '.userInitiated // false' "$f" 2>/dev/null || echo false)
+  rollover_sid_actionable "$sid" "$manual" "$user"
 }
 
 rollover_pending_for() {
