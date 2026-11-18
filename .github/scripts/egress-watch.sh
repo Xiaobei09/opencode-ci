@@ -488,8 +488,18 @@ handle_quota() {
   # turns `user_initiated=true`; only synthetic/restored turns keep R2785.
   sid=$(printf '%s' "$line" | sed -nE 's/.*session=(ses_[A-Za-z0-9_-]+).*/\1/p' | head -1)
   if [ "$user_initiated" != "true" ] && [ -n "$sid" ] && sid_owner_stopped "$sid"; then
-    log "quota 429 from stopped/halted Bot session $sid (user_initiated=${user_initiated:-unknown}); ignoring for stop/blacklist (synthetic/restored turn, active Bots keep running)"
-    return 0
+    # R2800: the one exception is a rollover-created successor whose seed prompt
+    # is the turn that just 429'd. R2785 would ignore it because the Bot is
+    # stopped, so this round would never end, no successor run would start, and
+    # Option C would never get to perform the one-shot retry (2026-11-18
+    # 09:16→09:44 dead successor). attempts>=1 / stale seeds / ⏹ halted are
+    # still ignored by sid_owner_seed_pending, so this cannot loop.
+    if sid_owner_seed_pending "$sid"; then
+      log "quota 429 from stopped Bot session $sid but its rollover seed successor is unrecovered; ending this round so the next run retries once"
+    else
+      log "quota 429 from stopped/halted Bot session $sid (user_initiated=${user_initiated:-unknown}); ignoring for stop/blacklist (synthetic/restored turn, active Bots keep running)"
+      return 0
+    fi
   fi
   if [ "$user_initiated" = "true" ] && [ -n "$sid" ]; then
     log "quota 429 from a real user turn on stopped/halted Bot session $sid; not ignoring (operator is waiting; end this round and switch)"

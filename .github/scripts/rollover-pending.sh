@@ -186,7 +186,9 @@ rollover_seed_pending() {
 # gate. Returns 1 for orphan/shared prefixes so a real 429 is never hidden.
 # egress-watch.sh uses this to ignore a quota 429 produced by an intentionally
 # stopped Bot instead of ending and relaying the whole CI round.
-sid_owner_stopped() {
+# R2800: the resolver is separate so egress-watch can ask other questions about
+# the same unique owner (e.g. "does it have a pending rollover seed?").
+sid_owner_resolve() {
   local raw="$1" id state front pinned halts cand hit_id="" hit_state="" hit_sid="" hits=0 found=""
   [ -n "$raw" ] || return 1
   _ro_have_jq || return 1
@@ -204,12 +206,34 @@ sid_owner_stopped() {
     done
     [ -n "$found" ] || continue
     hits=$((hits + 1))
+    [ "$hits" -eq 1 ] || return 1
     hit_id="$id"
     hit_state="$state"
     hit_sid="$cand"
   done < <(_ro_bot_states)
   [ "$hits" -eq 1 ] || return 1
-  _ro_bot_stopped "$hit_id" "$hit_state" "$hit_sid"
+  printf '%s\t%s\t%s' "$hit_id" "$hit_state" "$hit_sid"
+}
+
+sid_owner_stopped() {
+  local raw="$1" resolved id state sid
+  resolved=$(sid_owner_resolve "$raw") || return 1
+  IFS=$'\t' read -r id state sid <<< "$resolved"
+  _ro_bot_stopped "$id" "$state" "$sid"
+}
+
+# R2800: a rollover successor whose seed prompt 429'd must end the round even
+# when its Bot's loop is stopped, otherwise the watcher ignores the synthetic
+# 429 and the successor stays dead until something else ends the run. The next
+# run arms the seed (Option C) and performs the one retry. A ⏹ halted session
+# is still ignored: recovery would refuse it, so restarting the round is pure
+# churn. attempts>=1 / stale seeds are already excluded by rollover_seed_pending.
+sid_owner_seed_pending() {
+  local raw="$1" resolved _state sid
+  resolved=$(sid_owner_resolve "$raw") || return 1
+  IFS=$'\t' read -r _ _state sid <<< "$resolved"
+  _ro_bot_halted "$_state" "$sid" && return 1
+  rollover_seed_pending "$sid"
 }
 
 # 0 = a request for this sid can be consumed this run. `manual=true` bypasses
