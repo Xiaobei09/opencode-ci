@@ -153,6 +153,10 @@ ck "restore heartbeat includes the task's last progress line" \
 # task, rc, elapsed and the last progress line on the run page.
 ck "restore failure annotation names task/rc/elapsed/last line" \
   "$(grep -Fq 'failed rc=$rc after ${elapsed}s${last:+ · last: $last}' "$HERE/restore-workspace.sh" && echo 1 || echo 0)"
+# R2803: a corrupt env package must expose tar's own error, not just "failed to
+# extract"; otherwise a restore failure has no reproducible reason in the log.
+ck "env extraction failure surfaces tar stderr" \
+  "$(grep -Fq '2>"$terr"' "$HERE/restore-env.sh" && grep -Fq 'failed to extract (tar' "$HERE/restore-env.sh" && grep -Fq '$(head -c 300 "$terr"' "$HERE/restore-env.sh" && echo 1 || echo 0)"
 # R2792: long-lived scripts must execute from an immutable snapshot. Editing the
 # repository copy during a run made bash read a later byte offset as syntax error
 # (run 44247706098: line 388 near unexpected token ')'.

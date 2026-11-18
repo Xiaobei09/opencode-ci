@@ -24,7 +24,7 @@ ENV_TAG="env"
 # 还原；两者都不可用才 bootstrap。env-safe 由运营者的 env-backup.sh 维护为「最近一次完好代」。
 FALLBACK_TAG="${SESSIONS_FALLBACK_TAG:-env-safe}"
 env_try() {
-  local tag="$1" dl="/tmp/envdl-$1" vols pages bytes expect hdr tflag rel_at t0
+  local tag="$1" dl="/tmp/envdl-$1" vols pages bytes expect hdr tflag rel_at t0 terr
   rm -rf "$dl" && mkdir -p "$dl"
   t0=$(date +%s)
   # R2773: fetch the (tiny) manifest first so the job log names the generation
@@ -62,11 +62,14 @@ env_try() {
     425a68*)      tflag="-j" ;;
     *)            tflag="" ;;
   esac
-  if cat $vols | tar -xf - -C "$HOME" $tflag 2>/dev/null; then
+  # R2803: keep tar's stderr; "failed to extract" alone hid corrupt-page/gzip
+  # errors, which is exactly what makes a restore failure look unreproducible.
+  terr="/tmp/envdl-$1-tar.err"
+  if cat $vols | tar -xf - -C "$HOME" $tflag 2>"$terr"; then
     echo "environment restored from release '$tag' ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect:+, size-verified}${expect_sha:+, sha-verified}, packed ${rel_at:-unknown}, total $(( $(date +%s) - t0 ))s)"
     return 0
   fi
-  echo "::warning::$tag package failed to extract (tar ${tflag:-plain}, $bytes bytes)"
+  echo "::warning::$tag package failed to extract (tar ${tflag:-plain}, $bytes bytes): $(head -c 300 "$terr" 2>/dev/null | tr '\n\r' '  ')"
   return 1
 }
 # ROUND 53（取消序列防丢失）：R42 原子换装的窗口（旧代已删、真名新代尚未上传）里，
@@ -75,7 +78,7 @@ env_try() {
 # stage 必须带 stage-meta.json 且字节数完全吻合，半套/无 manifest 的 stage 一律拒绝
 # （宁可用旧的 env-safe，也绝不铺半套 $HOME）。
 env_try_staged() {
-  local tag="$1" dl="/tmp/envdl-$1-staged" vols pages bytes expect hdr tflag t0
+  local tag="$1" dl="/tmp/envdl-$1-staged" vols pages bytes expect hdr tflag t0 terr
   rm -rf "$dl" && mkdir -p "$dl"
   t0=$(date +%s)
   # R2773: same ordering as env_try — manifest first, then the bounded fetch.
@@ -113,11 +116,14 @@ env_try_staged() {
     425a68*)      tflag="-j" ;;
     *)            tflag="" ;;
   esac
-  if cat $vols | tar -xf - -C "$HOME" $tflag 2>/dev/null; then
+  # R2803: keep tar's stderr; "failed to extract" alone hid corrupt-page/gzip
+  # errors, which is exactly what makes a restore failure look unreproducible.
+  terr="/tmp/envdl-$1-staged-tar.err"
+  if cat $vols | tar -xf - -C "$HOME" $tflag 2>"$terr"; then
     echo "environment restored from '$tag' verified staged generation ($pages page(s), $bytes bytes, tar ${tflag:-plain}${expect_sha:+, sha-verified}, total $(( $(date +%s) - t0 ))s)"
     return 0
   fi
-  echo "::warning::$tag staged generation failed to extract ($pages page(s), $bytes bytes)"
+  echo "::warning::$tag staged generation failed to extract ($pages page(s), $bytes bytes): $(head -c 300 "$terr" 2>/dev/null | tr '\n\r' '  ')"
   return 1
 }
 # ROUND 278（运营者「快照优化」— restore 侧）：env-sync 分支是**首选** env 源。
