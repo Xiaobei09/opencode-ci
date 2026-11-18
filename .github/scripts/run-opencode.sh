@@ -5,6 +5,20 @@
 # log show only real output. Behavior is unchanged: the step invokes
 # `bash -e <file>`, matching the previous default shell.
 set +e
+# R2792（run 44247706098：`run-opencode.sh: line 388: syntax error`）：本轮启动后
+# 仓库里的本脚本被后续提交改写，bash 仍按旧字节偏移继续读 → 把新文件读到一半就
+# 语法错误。这里在启动时把整个 scripts 目录复制到 runner 临时目录，并 exec 副本；
+# 之后无论仓库文件怎么改，本 run 都只读自己启动时的那份快照。
+# 用脚本专属变量，避免子进程误跳过自己的快照（egress-watch 有独立的守卫）。
+if [ -z "${RUN_OPENCODE_SNAPSHOT:-}" ]; then
+  _ro_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _ro_root="${RUNNER_TEMP:-/tmp/opencode}"
+  mkdir -p "$_ro_root"
+  _ro_snap="$(mktemp -d "$_ro_root/ci-script-snapshot.XXXXXX")" || exit 125
+  cp -a "$_ro_src/." "$_ro_snap/" || exit 125
+  export RUN_OPENCODE_SNAPSHOT="$_ro_snap"
+  exec bash "$_ro_snap/run-opencode.sh" "$@"
+fi
 # R2631 (operator: "ci日志的格式很混乱"): shared formatting helpers for
 # the post-run diagnostics. Sections keep the evidence scannable;
 # clip bounds TUI/stack-trace lines that would otherwise wrap.

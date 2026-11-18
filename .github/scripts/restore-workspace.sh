@@ -39,7 +39,10 @@ start_task() {  # start_task <name> <log> <command...>
     while kill -0 "${TASK_PID[$name]}" 2>/dev/null; do
       sleep 15
       kill -0 "${TASK_PID[$name]}" 2>/dev/null || break
-      echo "[$name] still running $(( $(date +%s) - ${TASK_T0[$name]} ))s"
+      # R2793：只报“still running 75s”无法区分慢速下载与卡死。把该任务日志的
+      # 最后一行附上（fetch-asset 每 10s/每个 range 都会更新进度）。
+      last=$(tail -n 1 "$log" 2>/dev/null | tr -d '\r' | cut -c1-180)
+      echo "[$name] still running $(( $(date +%s) - ${TASK_T0[$name]} ))s${last:+ · last: $last}"
     done
   ) &
   TASK_WATCH["$name"]=$!

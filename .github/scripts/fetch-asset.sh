@@ -29,13 +29,13 @@ mkdir -p "$OUT"
 JOBS="${FETCH_ASSET_JOBS:-8}"
 MIN_PARALLEL="${FETCH_ASSET_MIN:-33554432}"   # 32 MiB
 DEADLINE_SECS="${FETCH_ASSET_DEADLINE:-420}"
-MAX_TIME="${FETCH_ASSET_MAX_TIME:-90}"
+MAX_TIME="${FETCH_ASSET_MAX_TIME:-60}"
 SINGLE_TIMEOUT="${FETCH_ASSET_SINGLE_TIMEOUT:-240}"
 case "$JOBS" in (*[!0-9]*|'') JOBS=8 ;; esac
 [ "$JOBS" -ge 1 ] || JOBS=1
 case "$MIN_PARALLEL" in (*[!0-9]*|'') MIN_PARALLEL=33554432 ;; esac
 case "$DEADLINE_SECS" in (*[!0-9]*|'') DEADLINE_SECS=420 ;; esac
-case "$MAX_TIME" in (*[!0-9]*|'') MAX_TIME=90 ;; esac
+case "$MAX_TIME" in (*[!0-9]*|'') MAX_TIME=60 ;; esac
 case "$SINGLE_TIMEOUT" in (*[!0-9]*|'') SINGLE_TIMEOUT=240 ;; esac
 
 T0=$(date +%s)
@@ -63,17 +63,36 @@ fetch_parallel() {  # name id size -> 0 ok / 1 failed
   [ "$mt" -ge 10 ] || mt=10
   t0=$(date +%s)
   echo "[fetch-asset] $name: start ($size bytes, $nchunks range(s), ${mt}s cap each, deadline ${DEADLINE_SECS}s)" >&2
+  # R2793（运营者：「还原环境时间特别长」）：多 range 下载原来是完全静默的。
+  # run 44225119086 在 `[targets] still running 75s` 时被取消，日志无法区分
+  # “慢速下载”与“卡死”。每 10s 打一次已落盘字节水位，每个 range 完成也打一行；
+  # restore-workspace 的心跳会附带最后一行，因此进度能直接出现在 job log 里。
+  local prog_pid=""
+  (
+    while :; do
+      sleep 10
+      got=$(du -sb "$parts" 2>/dev/null | cut -f1)
+      [ -n "$got" ] || got=0
+      echo "[fetch-asset] $name: progress $((got / 1048576))/$((size / 1048576)) MiB"
+    done
+  ) &
+  prog_pid=$!
   if seq 0 $(( nchunks - 1 )) \
-       | SIZE="$size" CHUNK="$chunk" REPO="$REPO" ID="$id" PARTS="$parts" AUTH_H="$AUTH_H" MAX_TIME="$mt" \
+       | SIZE="$size" CHUNK="$chunk" REPO="$REPO" ID="$id" PARTS="$parts" AUTH_H="$AUTH_H" MAX_TIME="$mt" NAME="$name" NCHUNKS="$nchunks" \
          xargs -P "$JOBS" -I CX bash -c '
              i=CX; s=$(( i * CHUNK )); [ "$s" -lt "$SIZE" ] || exit 0
              e=$(( s + CHUNK - 1 )); [ "$e" -lt "$SIZE" ] || e=$(( SIZE - 1 ))
              timeout --signal=TERM --kill-after=5 "$MAX_TIME" \
                curl -sfL --retry 1 --connect-timeout 10 \
+               --speed-limit 10240 --speed-time 20 \
                -H "$AUTH_H" -H "Accept: application/octet-stream" \
                -r "$s-$e" "https://api.github.com/repos/$REPO/releases/assets/$ID" \
                -o "$PARTS/part-$(printf %04d "$i")"
+             rc=$?
+             [ "$rc" = 0 ] && echo "[fetch-asset] $NAME: range $((i + 1))/$NCHUNKS done"
+             exit "$rc"
            '; then
+    kill "$prog_pid" 2>/dev/null; wait "$prog_pid" 2>/dev/null; prog_pid=""
     if cat "$parts"/part-* > "$OUT/$name" 2>/dev/null \
        && [ "$(stat -c%s "$OUT/$name" 2>/dev/null || echo 0)" = "$size" ]; then
       echo "[fetch-asset] $name: $size bytes via $nchunks parallel range(s) in $(( $(date +%s) - t0 ))s" >&2
@@ -81,6 +100,7 @@ fetch_parallel() {  # name id size -> 0 ok / 1 failed
       return 0
     fi
   fi
+  if [ -n "$prog_pid" ]; then kill "$prog_pid" 2>/dev/null; wait "$prog_pid" 2>/dev/null; fi
   rm -rf "$parts" "$OUT/$name" 2>/dev/null
   echo "::warning::[fetch-asset] parallel fetch failed/timed out for $name (falling back to single stream)" >&2
   return 1

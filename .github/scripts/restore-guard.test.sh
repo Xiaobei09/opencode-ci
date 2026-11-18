@@ -141,6 +141,21 @@ ck "targets slim fetch has a timeout" \
   "$(grep -Fq 'TGT_SLIM_FETCH_TIMEOUT' "$HERE/restore-targets.sh" && echo 1 || echo 0)"
 ck "restore step has a workflow-level timeout" \
   "$(grep -Fq 'timeout-minutes: 15' "$HERE/../workflows/iterate.yml" && echo 1 || echo 0)"
+# R2793: a slow release download must show progress and fail a stalled socket early,
+# not look identical to a hang for 75s (run 44225119086 was cancelled at 75s).
+ck "fetch-asset reports interval/range progress" \
+  "$(grep -Fq 'progress $((got / 1048576))' "$HERE/fetch-asset.sh" && grep -Fq 'range $((i + 1))/$NCHUNKS done' "$HERE/fetch-asset.sh" && echo 1 || echo 0)"
+ck "fetch-asset aborts a stalled range quickly" \
+  "$(grep -Fq -- '--speed-limit 10240 --speed-time 20' "$HERE/fetch-asset.sh" && echo 1 || echo 0)"
+ck "restore heartbeat includes the task's last progress line" \
+  "$(grep -Fq '${last:+ · last: $last}' "$HERE/restore-workspace.sh" && echo 1 || echo 0)"
+# R2792: long-lived scripts must execute from an immutable snapshot. Editing the
+# repository copy during a run made bash read a later byte offset as syntax error
+# (run 44247706098: line 388 near unexpected token ')'.
+ck "run-opencode executes from an immutable snapshot" \
+  "$(grep -Fq 'RUN_OPENCODE_SNAPSHOT' "$HERE/run-opencode.sh" && grep -Fq 'exec bash "$_ro_snap/' "$HERE/run-opencode.sh" && echo 1 || echo 0)"
+ck "egress-watch executes from an immutable snapshot" \
+  "$(grep -Fq 'EGRESS_WATCH_SNAPSHOT' "$HERE/egress-watch.sh" && grep -Fq 'exec bash "$_ew_snap/' "$HERE/egress-watch.sh" && echo 1 || echo 0)"
 
 for s in restore-workspace.sh restore-env.sh restore-targets.sh fetch-asset.sh restore-guard.test.sh; do
   ck "bash -n $s" "$(bash -n "$HERE/$s" >/dev/null 2>&1 && echo 1 || echo 0)"

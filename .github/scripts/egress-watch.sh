@@ -24,6 +24,20 @@
 # Usage: egress-watch.sh <run-log> [proxy-log] [plugin-log]
 set -uo pipefail
 
+# R2792：与 run-opencode.sh 同理。egress-watch 在整个 run 中常驻，运行期间被提交
+# 改写会让 bash 按旧偏移读到新内容（语法错误/后半段丢逻辑）。启动时复制整个
+# scripts 目录（egress-lib.sh / rollover-pending.sh / egress-quota-probe.sh 都在
+# 副本里），SCRIPT_DIR 因此也指向快照，后续调用不会混用新旧版本。
+if [ -z "${EGRESS_WATCH_SNAPSHOT:-}" ]; then
+  _ew_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _ew_root="${RUNNER_TEMP:-/tmp/opencode}"
+  mkdir -p "$_ew_root"
+  _ew_snap="$(mktemp -d "$_ew_root/ci-script-snapshot-egress.XXXXXX")" || exit 125
+  cp -a "$_ew_src/." "$_ew_snap/" || exit 125
+  export EGRESS_WATCH_SNAPSHOT="$_ew_snap"
+  exec bash "$_ew_snap/egress-watch.sh" "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=egress-lib.sh
 . "$SCRIPT_DIR/egress-lib.sh"
