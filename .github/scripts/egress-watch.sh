@@ -337,7 +337,7 @@ record_quota() {
   if [ "$quota_streak" -ge "$QUOTA_LIMIT" ]; then
     # R2629: only a real 200 from the live current-egress probe keeps this
     # round alive. A healthy turn later resets the counters; if the retry keeps
-    # failing, auto-continue's 3-consecutive-error limit still ends the round.
+    # failing, the plugin's bounded quota-restart fallback still ends the round.
     # R2634: the 200 branch also writes the fork request for this session.
     if quota_probe_keeps_round "$msg_at" "$sid"; then
       return 0
@@ -450,7 +450,7 @@ handle_quota() {
   msg_at=$(printf '%s' "$line" | sed -nE 's/.*msg_at=([^ ,)]+).*/\1/p' | head -1)
   if [ -z "$msg_at" ] || [ "$msg_at" = "?" ]; then
     # No timestamp means we cannot prove the error belongs to this run. The
-    # plugin's own 3-consecutive-error policy still ends a genuinely bad round.
+    # plugin's bounded quota-restart fallback still ends a genuinely bad round.
     log "quota line has no parseable msg_at; ignoring for stop/blacklist"
     return 0
   fi
