@@ -265,6 +265,15 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       fi
       [ -f "$_state" ] || continue
       _sid=$(resume_front_of "$_state")
+      # R2785: `/loop stop` is a hard gate. Do not even arm a stopped Bot for
+      # quota-tail recovery; the old code armed it, the plugin woke the
+      # exhausted session, the 429 ended the round, and every relay repeated
+      # the same 2-3 minute restart. The request/evidence stays durable for a
+      # later `/loop start`.
+      if [ -n "$_sid" ] && bot_sid_stopped "$_botid" "$_state" "$_sid"; then
+        say "option C resume-once skipped for $_sid (bot stopped)"
+        continue
+      fi
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
       elif [ -n "$_sid" ]; then
@@ -280,6 +289,10 @@ if [ "$RESUME_ONCE_ENABLED" = "1" ]; then
       if [ "$_bid" = "tg-chats" ]; then _bid=primary; else _bid=${_bid#tg-chats-}; fi
       bot_is_offline "$_bid" && continue
       _sid=$(resume_front_of "$_state")
+      if [ -n "$_sid" ] && bot_sid_stopped "$_bid" "$_state" "$_sid"; then
+        say "option C resume-once skipped for $_sid (bot stopped)"
+        continue
+      fi
       if [ -n "$_sid" ] && ! rollover_pending_for "$_sid"; then
         RESUME_ONCE_LIST="${RESUME_ONCE_LIST:+$RESUME_ONCE_LIST,}$_sid"
       fi

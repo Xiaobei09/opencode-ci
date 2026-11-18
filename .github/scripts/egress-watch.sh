@@ -27,6 +27,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=egress-lib.sh
 . "$SCRIPT_DIR/egress-lib.sh"
+# R2785: the same per-Bot stop/halt gate the bridge and rollover consumer use.
+# A quota 429 emitted by a Bot that the operator explicitly stopped must not
+# end and relay the whole CI round (that was the 2-3 minute restart storm).
+# shellcheck source=rollover-pending.sh
+. "$SCRIPT_DIR/rollover-pending.sh"
 
 LOG="${1:?usage: egress-watch.sh <run-log> [proxy-log] [plugin-log]}"
 PROXY_LOG="${2:-$EGRESS_STATE_DIR/proxy.log}"
@@ -407,7 +412,7 @@ esac
 
 # handle_quota <line>
 handle_quota() {
-  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl cur_egress
+  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl cur_egress sid
   now=$(egress_now)
 
   # R2566 (operator priority: still widespread 429 after a 200 preflight):
@@ -454,6 +459,17 @@ handle_quota() {
       log "stale quota line predates selection (line_ts=$err_at, selected=$selected_at); ignoring"
       return 0
     fi
+  fi
+
+  # R2785: an explicitly stopped/halted Bot can still have a stale synthetic
+  # prompt in flight (e.g. quota-tail recovery from an older build). Its 429 is
+  # not evidence that the selected egress is exhausted for the active Bots.
+  # Ignore it before blacklisting/stopping so the run keeps serving them; an
+  # active Bot's next real turn still proves the egress either way.
+  sid=$(printf '%s' "$line" | sed -nE 's/.*session=(ses_[A-Za-z0-9_-]+).*/\1/p' | head -1)
+  if [ -n "$sid" ] && sid_owner_stopped "$sid"; then
+    log "quota 429 from stopped/halted Bot session $sid; ignoring for stop/blacklist (intentional stop, active Bots keep running)"
+    return 0
   fi
 
   # R2620 (operator: "改为出现一个429就重启吧"): a candidate that passed the

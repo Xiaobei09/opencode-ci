@@ -76,6 +76,15 @@ _ro_pinned() {
   case "$sid" in ses_*) printf '%s' "$sid" ;; esac
 }
 
+# R2785: a session that was the front when a synthetic prompt was injected may
+# have moved out of front/pinned by the time its 429 arrives. It stays in the
+# Bot's durable `halted` list, so that is also an ownership hint for the stop
+# gate (halt-release is still honored by _ro_bot_stopped).
+_ro_halted() {
+  local f="$1"
+  jq -r '(.halted // [])[]? | select(type == "string")' "$f" 2>/dev/null || true
+}
+
 # Mirrors tg-bridge's quotaForkMine(): only the Bot whose persisted front or
 # pinned target is this session will claim the request. loop-ctl sids are NOT
 # an ownership source there, so a stale request whose front already moved is
@@ -122,6 +131,46 @@ _ro_bot_stopped() {
         and (((($e.sids // []) | length) == 0) or ((($e.sids // []) | index($front)) != null))
     end
   ' "$ctl" >/dev/null 2>&1
+}
+
+# R2785: public wrapper for non-rollover callers that must honor the same
+# per-Bot stop gate as the bridge. Option C arming uses it so a stopped Bot's
+# front is never even armed for a quota-tail recovery.
+bot_sid_stopped() {
+  local id="$1" f="$2" sid="$3"
+  [ -n "$id" ] && [ -n "$f" ] && [ -n "$sid" ] || return 1
+  _ro_bot_stopped "$id" "$f" "$sid"
+}
+
+# R2785: map a session id from a plugin log line (auto-continue truncates it to
+# 8 chars in public logs) to its unique Bot owner, then apply the stop/halt
+# gate. Returns 1 for orphan/shared prefixes so a real 429 is never hidden.
+# egress-watch.sh uses this to ignore a quota 429 produced by an intentionally
+# stopped Bot instead of ending and relaying the whole CI round.
+sid_owner_stopped() {
+  local raw="$1" id state front pinned halts cand hit_id="" hit_state="" hit_sid="" hits=0 found=""
+  [ -n "$raw" ] || return 1
+  _ro_have_jq || return 1
+  while IFS=$'\t' read -r id state; do
+    [ -n "$id" ] || continue
+    front=$(_ro_front "$state")
+    pinned=$(_ro_pinned "$state")
+    halts=$(_ro_halted "$state")
+    found=""
+    for cand in "$front" "$pinned" $halts; do
+      [ -n "$cand" ] || continue
+      case "$cand" in
+        "$raw"|"$raw"*) found=1; break ;;
+      esac
+    done
+    [ -n "$found" ] || continue
+    hits=$((hits + 1))
+    hit_id="$id"
+    hit_state="$state"
+    hit_sid="$cand"
+  done < <(_ro_bot_states)
+  [ "$hits" -eq 1 ] || return 1
+  _ro_bot_stopped "$hit_id" "$hit_state" "$hit_sid"
 }
 
 # 0 = a request for this sid can be consumed this run. `manual=true` bypasses
