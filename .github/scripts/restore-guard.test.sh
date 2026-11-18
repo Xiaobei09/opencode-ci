@@ -149,6 +149,10 @@ ck "fetch-asset aborts a stalled range quickly" \
   "$(grep -Fq -- '--speed-limit 10240 --speed-time 20' "$HERE/fetch-asset.sh" && echo 1 || echo 0)"
 ck "restore heartbeat includes the task's last progress line" \
   "$(grep -Fq '${last:+ · last: $last}' "$HERE/restore-workspace.sh" && echo 1 || echo 0)"
+# R2802: a normal task failure must be as diagnosable as a timeout — name the
+# task, rc, elapsed and the last progress line on the run page.
+ck "restore failure annotation names task/rc/elapsed/last line" \
+  "$(grep -Fq 'failed rc=$rc after ${elapsed}s${last:+ · last: $last}' "$HERE/restore-workspace.sh" && echo 1 || echo 0)"
 # R2792: long-lived scripts must execute from an immutable snapshot. Editing the
 # repository copy during a run made bash read a later byte offset as syntax error
 # (run 44247706098: line 388 near unexpected token ')'.

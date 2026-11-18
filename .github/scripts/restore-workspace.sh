@@ -57,8 +57,14 @@ finish_task() {  # finish_task <name> -> task rc
     wait "${TASK_WATCH[$name]}" 2>/dev/null
   fi
   local elapsed=$(( $(date +%s) - ${TASK_T0[$name]} ))
+  # R2802（CI 侧）：失败时把最后一行进度带进注释。此前超时只报“exceeded”，
+  # 普通失败只在日志尾部有一行 `done rc=...`，运营者看到的是笼统的“还原失败”。
+  local last=""
+  last=$(tail -n 1 "$log" 2>/dev/null | tr -d '\r' | cut -c1-300)
   if [ "$rc" = 124 ]; then
-    echo "::error::[$name] exceeded its hard timeout after ${elapsed}s; refusing to boot OpenCode with a half-restored environment"
+    echo "::error::[$name] exceeded its hard timeout after ${elapsed}s${last:+ · last: $last}; refusing to boot OpenCode with a half-restored environment"
+  elif [ "$rc" != 0 ]; then
+    echo "::error::[$name] failed rc=$rc after ${elapsed}s${last:+ · last: $last}; refusing to boot OpenCode with a half-restored environment"
   fi
   echo "[$name] done rc=$rc in ${elapsed}s"
   return "$rc"
