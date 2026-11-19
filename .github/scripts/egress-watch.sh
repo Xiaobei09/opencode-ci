@@ -495,7 +495,7 @@ handle_quota() {
     # Option C would never get to perform the one-shot retry (2026-11-18
     # 09:16→09:44 dead successor). attempts>=1 / stale seeds / ⏹ halted are
     # still ignored by sid_owner_seed_pending, so this cannot loop.
-    if sid_owner_seed_pending "$sid"; then
+    if sid_owner_seed_pending "$sid" "$((msg_at_epoch * 1000))"; then
       log "quota 429 from stopped Bot session $sid but its rollover seed successor is unrecovered; ending this round so the next run retries once"
     else
       log "quota 429 from stopped/halted Bot session $sid (user_initiated=${user_initiated:-unknown}); ignoring for stop/blacklist (synthetic/restored turn, active Bots keep running)"

@@ -17,6 +17,10 @@
 # That synthetic 429 (userInitiated=false) is the DOA signal; resume-once owns
 # exactly one recovery attempt via ~/.config/opencode/rollover-seeds/<sid>.json.
 # Legacy evidence without an explicit userInitiated field keeps the old behavior.
+# R2814 (operator: "先修429换会话问题，全面排查"): "immediately" must be proven,
+# not assumed from a 24h marker. The guard now requires the durable first429At
+# to fall inside the seed's own first-turn window (and attempts<1). Otherwise a
+# successor that ran healthily for hours is misclassified as DOA forever.
 # R2769 (operator: "多个会话都429-下一轮直接给最先429的换；只有一个会话429，
 # 等计数器到1时的新一轮换"):
 #   * multiple sessions with fresh 429 evidence: switch the earliest first-429
@@ -60,6 +64,14 @@ DIR="${ROLLOVER_REQUEST_DIR:-$CFG/rollover-requests}"
 EVIDENCE="${QUOTA_429_EVIDENCE_PATH:-$CFG/quota-429-evidence.json}"
 STREAKS="${QUOTA_429_STREAKS_PATH:-$CFG/quota-429-streaks.json}"
 SEED_DIR="${ROLLOVER_SEED_DIR:-$CFG/rollover-seeds}"
+# R2814: a seed marker only suppresses a rollover when the 429 is still the
+# seed's own first turn. A successor that ran healthily for hours is not DOA.
+# The window is generous enough for queue/startup delays but far below the old
+# 24h marker lifetime that swallowed the 2026-11-18 20:37 normal quota 429.
+SEED_DOA_WINDOW_MS="${ROLLOVER_SEED_DOA_WINDOW_MS:-600000}"
+case "$SEED_DOA_WINDOW_MS" in ''|*[!0-9]*) SEED_DOA_WINDOW_MS=600000 ;; esac
+[ "$SEED_DOA_WINDOW_MS" -gt 0 ] || SEED_DOA_WINDOW_MS=600000
+[ "$SEED_DOA_WINDOW_MS" -le 3600000 ] || SEED_DOA_WINDOW_MS=3600000
 # R2780: reuse the exact "can the bridge consume this request now?" gate so a
 # stopped/halted/offline Bot cannot monopolize the one request per round.
 _RO_PENDING="$(dirname "$0")/rollover-pending.sh"
@@ -179,7 +191,18 @@ if [ -d "$SEED_DIR" ] && [ "$CANDIDATE_N" -gt 0 ]; then
           if [ -s "$_seed" ]; then
             _seed_at=$(jq -r '.at // 0' "$_seed" 2>/dev/null || echo 0)
             case "$_seed_at" in ''|*[!0-9]*) _seed_at=0 ;; esac
-            if [ "$_seed_at" -gt 0 ] && [ $((_NOW_MS - _seed_at)) -le 86400000 ]; then
+            _seed_attempts=$(jq -r '.attempts // 0' "$_seed" 2>/dev/null || echo 0)
+            case "$_seed_attempts" in ''|*[!0-9]*) _seed_attempts=0 ;; esac
+            case "$_first" in ''|*[!0-9]*) _first=0 ;; esac
+            # R2814: only an **unconsumed** seed whose first 429 happened in the
+            # seed's own turn may suppress the switch. first429At is durable and
+            # survives across runs; request time would drift after a pause.
+            if [ "$_seed_at" -gt 0 ] \
+               && [ $((_NOW_MS - _seed_at)) -le 86400000 ] \
+               && [ "$_seed_attempts" -lt 1 ] \
+               && [ "$_first" -gt 0 ] \
+               && [ "$_first" -ge $((_seed_at - 10000)) ] \
+               && [ $((_first - _seed_at)) -le "$SEED_DOA_WINDOW_MS" ]; then
               _skip=1
             fi
           fi
@@ -187,7 +210,7 @@ if [ -d "$SEED_DIR" ] && [ "$CANDIDATE_N" -gt 0 ]; then
         ;;
     esac
     if [ "$_skip" = 1 ]; then
-      echo "rollover: skip $(redact_sid "$_sid") (synthetic 429 on rollover successor; resume-once owns the one-shot retry)" >&2
+      echo "rollover: skip $(redact_sid "$_sid") (synthetic 429 on rollover successor's first turn; resume-once owns the one-shot retry)" >&2
       continue
     fi
     _FILTERED=$(printf '%s' "$_FILTERED" | jq -c \
@@ -280,13 +303,16 @@ if [ -n "$CHOSEN" ]; then
   TMP="$FILE.tmp.$$"
   CHOSEN_USER=$(printf '%s' "$NEW" | jq -r --arg sid "$CHOSEN" '.sessions[$sid].userInitiated == true' 2>/dev/null || echo false)
   [ "$CHOSEN_USER" = "true" ] || CHOSEN_USER=false
+  CHOSEN_FIRST=$(printf '%s' "$NEW" | jq -r --arg sid "$CHOSEN" '.sessions[$sid].first429At // 0' 2>/dev/null || echo 0)
+  case "$CHOSEN_FIRST" in ''|*[!0-9]*) CHOSEN_FIRST=0 ;; esac
   if jq -n \
       --arg sid "$CHOSEN" \
       --argjson ts "$TS" \
+      --argjson first "$CHOSEN_FIRST" \
       --arg reason "$REASON" \
       --arg run "$RUN" \
       --argjson user "$CHOSEN_USER" \
-      '{sid:$sid,ts:$ts,reason:$reason,run:$run,userInitiated:$user}' > "$TMP" 2>/dev/null \
+      '{sid:$sid,ts:$ts,first429At:$first,reason:$reason,run:$run,userInitiated:$user}' > "$TMP" 2>/dev/null \
      && mv -f "$TMP" "$FILE" 2>/dev/null; then
     if [ "$CHOSEN_ACTIONABLE" = "1" ]; then
       TRIGGERED=1

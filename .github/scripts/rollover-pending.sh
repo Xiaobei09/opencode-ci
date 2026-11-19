@@ -160,12 +160,24 @@ bot_sid_halted() {
 }
 
 _ro_seed_dir() { printf '%s' "${ROLLOVER_SEED_DIR:-$(_ro_home)/.config/opencode/rollover-seeds}"; }
+# R2814: a seed marker only suppresses/arms the successor's own first turn.
+# Keep the default in sync with write-rollover-requests.sh and tg-bridge.
+_ro_seed_doa_window() {
+  local w="${ROLLOVER_SEED_DOA_WINDOW_MS:-600000}"
+  case "$w" in ''|*[!0-9]*) w=600000 ;; esac
+  [ "$w" -gt 0 ] || w=600000
+  [ "$w" -le 3600000 ] || w=3600000
+  printf '%s' "$w"
+}
 
 # R2797: a 429 rollover-created successor whose seed prompt immediately 429'd
 # must still be armed for Option C even when the Bot's loop is stopped. The
 # seed is one-shot: attempts>=1 or older than 24h no longer arms anything.
+# R2814: when the caller knows the observed 429 time, the marker only counts
+# while that 429 is still the seed's first turn; otherwise a healthy successor
+# that later hit the normal quota would be misclassified forever.
 rollover_seed_pending() {
-  local sid="$1" f at attempts now
+  local sid="$1" observed="${2:-0}" f at attempts now
   [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
   f="$(_ro_seed_dir)/$sid.json"
   [ -s "$f" ] && _ro_have_jq || return 1
@@ -178,6 +190,11 @@ rollover_seed_pending() {
   [ "$(jq -r --arg sid "$sid" '.sid // empty' "$f" 2>/dev/null)" = "$sid" ] || return 1
   now=$(date +%s%3N)
   [ $((now - at)) -le 86400000 ] || return 1
+  case "$observed" in ''|*[!0-9]*) observed=0 ;; esac
+  if [ "$observed" -gt 0 ]; then
+    [ $((observed - at)) -ge -10000 ] || return 1
+    [ $((observed - at)) -le "$(_ro_seed_doa_window)" ] || return 1
+  fi
   return 0
 }
 
@@ -240,11 +257,11 @@ sid_owner_halted() {
 # is still ignored: recovery would refuse it, so restarting the round is pure
 # churn. attempts>=1 / stale seeds are already excluded by rollover_seed_pending.
 sid_owner_seed_pending() {
-  local raw="$1" resolved _state sid
+  local raw="$1" observed="${2:-0}" resolved _state sid
   resolved=$(sid_owner_resolve "$raw") || return 1
   IFS=$'\t' read -r _ _state sid <<< "$resolved"
   _ro_bot_halted "$_state" "$sid" && return 1
-  rollover_seed_pending "$sid"
+  rollover_seed_pending "$sid" "$observed"
 }
 
 # 0 = a request for this sid can be consumed this run. `manual=true` bypasses
