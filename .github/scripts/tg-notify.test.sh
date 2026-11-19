@@ -16,15 +16,31 @@ LOG="$TD/curl.log"
 cat > "$TD/bin/curl" <<'FAKE'
 #!/usr/bin/env bash
 url=""
+mid=4242
 for a in "$@"; do
-  case "$a" in https://api.telegram.org/*) url="$a" ;; esac
+  case "$a" in
+    https://api.telegram.org/*) url="$a" ;;
+    message_id=*) mid=${a#message_id=} ;;
+  esac
 done
 tok=${url#https://api.telegram.org/bot}
 tok=${tok%%/*}
+method=sendMessage
+case "$url" in */editMessageText) method=editMessageText ;; esac
 printf '%s\n' "$tok" >> "$FAKE_LOG"
 case " ${FAKE_FAIL_TOKENS:-} " in
   *" $tok "*) printf '%s\n%s\n' '{"ok":false,"description":"fake failure"}' 500 ;;
-  *) printf '%s\n%s\n' '{"ok":true}' 200 ;;
+  *)
+    if [ "$method" = "editMessageText" ]; then
+      if [ "${FAKE_EDIT_NOT_FOUND:-0}" = "1" ]; then
+        printf '%s\n%s\n' '{"ok":false,"description":"Bad Request: message to edit not found"}' 400
+      else
+        printf '{"ok":true,"result":{"message_id":%s}}\n%s\n' "$mid" 200
+      fi
+    else
+      printf '%s\n%s\n' '{"ok":true,"result":{"message_id":4242}}' 200
+    fi
+    ;;
 esac
 FAKE
 chmod +x "$TD/bin/curl"
@@ -186,6 +202,35 @@ setops '{"enabled":false,"bots":{"bot5":{"enabled":true}},"notifyBot":"bot6"}'
 setledger '{"bot5":{"in":300,"seen":300}}'
 run quota
 ck "R2729: 旧全局关 + 单 Bot 显式开启时按该 Bot 推" "$(printf '%s' "$out" | grep -q 'via=bot5' && echo yes)"
+
+# R2840 (operator: "174762和174763是同一个429吗，如果不是，为什么会有两个，
+# 修复"): a quota window can produce several 429 rounds; the round-end card must
+# be edited in place instead of sending one notification per round.
+setops '{"bots":{"bot6":{"enabled":true}},"notifyBot":"bot6"}'
+setledger '{"bot6":{"in":200,"seen":300}}'
+run quota
+ck "R2840: 发送结果带 message_id，供下一轮原地编辑" "$(printf '%s' "$out" | grep -q 'message_id=4242' && echo yes)"
+: > "$LOG"
+out=$(printf 'quota 429 test round 2\n' | TG_NOTIFY_MODE=edit TG_NOTIFY_EDIT_BOT=bot6 \
+  TG_NOTIFY_EDIT_MSG=4242 bash "$SCRIPT" round-end 2>&1)
+rc=$?
+ck "R2840: 同一额度窗口改原卡而不是新发" "$(printf '%s' "$out" | grep -q 'telegram round-end edited .*msg=4242, via=bot6' && echo yes)"
+ck "R2840: 编辑只走原 Bot，不再打扰主 Bot" "$(grep -qx '666:bot6-token' "$LOG" && ! grep -q '111:primary-token' "$LOG" && echo yes)"
+ck "R2840: 编辑成功退出 0" "$([ "$rc" = 0 ] && echo yes)"
+: > "$LOG"
+out=$(printf 'x\n' | FAKE_EDIT_NOT_FOUND=1 TG_NOTIFY_MODE=edit TG_NOTIFY_EDIT_BOT=bot6 \
+  TG_NOTIFY_EDIT_MSG=4242 bash "$SCRIPT" round-end 2>&1)
+rc=$?
+ck "R2840: 原卡已删除时返回 2，让调用方补发" "$([ "$rc" = 2 ] && echo yes)"
+ck "R2840: 原卡不可编辑时不会自行换 Bot 新发" "$(! grep -q '111:primary-token' "$LOG" && echo yes)"
+setops '{"bots":{"bot6":{"enabled":false},"primary":{"enabled":true}},"notifyBot":"bot6"}'
+: > "$LOG"
+out=$(printf 'x\n' | TG_NOTIFY_MODE=edit TG_NOTIFY_EDIT_BOT=bot6 \
+  TG_NOTIFY_EDIT_MSG=4242 bash "$SCRIPT" round-end 2>&1)
+rc=$?
+ck "R2840: 原 Bot 被关闭时返回 2" "$([ "$rc" = 2 ] && echo yes)"
+ck "R2840: 原 Bot 被关闭时不产生编辑请求" "$([ ! -s "$LOG" ] && echo yes)"
+setops '{"bots":{"bot6":{"enabled":true}},"notifyBot":"bot6"}'
 
 # R2731: ids from the ledger/switch file reach a file path and jq args; reject
 # anything outside the registry alphabet instead of trusting the JSON.

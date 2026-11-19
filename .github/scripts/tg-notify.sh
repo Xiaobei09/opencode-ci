@@ -9,15 +9,23 @@
 #   tag  short label used in logs, e.g. round-end, loop-stop, egress
 # Env:
 #   TG_BOT_TOKEN, TG_PUSH_CHAT  primary Bot credentials; missing means "skipped"
+#   TG_NOTIFY_MODE              "send" (default) or "edit". R2840: "edit"
+#                               rewrites one existing message in place so a
+#                               quota window with multiple 429 rounds produces
+#                               one card, not one notification per round.
+#   TG_NOTIFY_EDIT_BOT          Bot id that sent the original card (edit mode)
+#   TG_NOTIFY_EDIT_MSG          Telegram message_id to edit (edit mode)
 #   TG_NOTIFY_CLASS             retained for logs/back-compat ("quota" marks a
 #                               provider-429 card; "egress" marked the old
 #                               run-start proxy card, folded into round-end by
 #                               R2837). R2732/R2733 route **all** global
 #                               notices through the per-Bot switches.
 # Exit:
-#   0 = sent, or intentionally skipped (no credentials / empty text / all routes
-#       disabled by their own switches)
+#   0 = sent/edited, or intentionally skipped (no credentials / empty text /
+#       all routes disabled by their own switches)
 #   1 = all attempted routes failed
+#   2 = edit target cannot be edited (deleted, bot disabled/unavailable); the
+#       caller should send a fresh card instead of editing
 #
 # R2728/R2729/R2732: the bridge menu writes one **per-Bot** switch to
 #   ${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}/card-ops.json
@@ -125,7 +133,7 @@ send_via() {
   local url="https://api.telegram.org/bot${token}/sendMessage"
   local attempt=1
   while [ "$attempt" -le "$max" ]; do
-    local errf resp curl_rc code body err desc ra
+    local errf resp curl_rc code body err desc ra msg_id
     errf=$(mktemp)
     resp=$(curl -sS -m 20 -w $'\n%{http_code}' -X POST "$url" \
       --data-urlencode "chat_id=${chat}" \
@@ -141,7 +149,10 @@ send_via() {
 
     if [ "$curl_rc" -eq 0 ] && [ "$code" = "200" ] \
        && printf '%s' "$body" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true'; then
-      echo "telegram ${tag} sent (attempt=${attempt}/${max}, http=200, chars=${#text}, via=${label})"
+      # R2840: the caller persists this id so later rounds in the same quota
+      # window can edit the card instead of sending a duplicate notification.
+      msg_id=$(printf '%s' "$body" | sed -nE 's/.*"message_id"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -1)
+      echo "telegram ${tag} sent (attempt=${attempt}/${max}, http=200, chars=${#text}, via=${label}${msg_id:+, message_id=${msg_id}})"
       return 0
     fi
 
@@ -150,6 +161,62 @@ send_via() {
 
     # Telegram returns parameters.retry_after on 429. Cap the wait so the job
     # cannot stall for minutes; otherwise back off 2s, 4s.
+    ra=$(printf '%s' "$body" | sed -nE 's/.*"retry_after":([0-9]+).*/\1/p' | head -1)
+    if [ "${TG_NOTIFY_NO_SLEEP:-0}" = "1" ]; then
+      :
+    elif [ -n "$ra" ] && [ "$ra" -gt 0 ] 2>/dev/null; then
+      [ "$ra" -gt 10 ] && ra=10
+      sleep "$ra"
+    elif [ "$attempt" -lt "$max" ]; then
+      sleep $((attempt * 2))
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+# R2840: rewrite one existing card. Same retry/backoff shape as send_via, but
+# returns 0 on success/unchanged, 2 when the target is gone or cannot be
+# edited (caller should send a fresh card), and 1 on transient failure (caller
+# must not send a duplicate).
+edit_via() {
+  local token="$1" chat="$2" msg="$3" max="$4" label="$5"
+  local url="https://api.telegram.org/bot${token}/editMessageText"
+  local attempt=1
+  while [ "$attempt" -le "$max" ]; do
+    local errf resp curl_rc code body err desc ra
+    errf=$(mktemp)
+    resp=$(curl -sS -m 20 -w $'\n%{http_code}' -X POST "$url" \
+      --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "message_id=${msg}" \
+      --data-urlencode "text=${text}" 2>"$errf")
+    curl_rc=$?
+    code=$(printf '%s\n' "$resp" | tail -1)
+    body=$(printf '%s\n' "$resp" | sed '$d')
+    err=$(tr '\n' ' ' < "$errf" 2>/dev/null | cut -c1-200)
+    err="${err//${token}/***}"
+    err=$(printf '%s' "$err" | sed -E 's/[0-9]{8,10}:[A-Za-z0-9_-]{30,}/<telegram-token>/g')
+    rm -f "$errf"
+
+    if [ "$curl_rc" -eq 0 ] && [ "$code" = "200" ] \
+       && printf '%s' "$body" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true'; then
+      echo "telegram ${tag} edited (attempt=${attempt}/${max}, http=200, chars=${#text}, msg=${msg}, via=${label})"
+      return 0
+    fi
+
+    desc=$(printf '%s' "$body" | sed -nE 's/.*"description":"([^"]*)".*/\1/p' | head -1)
+    case "$desc" in
+      *"message is not modified"*)
+        echo "telegram ${tag} unchanged (msg=${msg}, via=${label})"
+        return 0
+        ;;
+      *"message to edit not found"*|*"message can't be edited"*|*"MESSAGE_ID_INVALID"*)
+        echo "::warning::telegram ${tag} cannot edit original message ${msg} via ${label}: ${desc:-http=${code:-?}}"
+        return 2
+        ;;
+    esac
+    echo "::warning::telegram ${tag} edit via ${label} attempt ${attempt}/${max} failed (curl=${curl_rc}, http=${code:-?}): ${desc:-${err:-no response}}"
+
     ra=$(printf '%s' "$body" | sed -nE 's/.*"retry_after":([0-9]+).*/\1/p' | head -1)
     if [ "${TG_NOTIFY_NO_SLEEP:-0}" = "1" ]; then
       :
@@ -175,6 +242,35 @@ valid_bot() {
   case "$bot" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
   [ "${#bot}" -le 32 ]
 }
+
+# R2840 edit mode: use exactly the Bot that owns the original message. No
+# fallback route -- sending via another Bot would create the duplicate card
+# this mode exists to avoid.
+if [ "${TG_NOTIFY_MODE:-send}" = "edit" ]; then
+  edit_bot="${TG_NOTIFY_EDIT_BOT:-primary}"
+  edit_msg="${TG_NOTIFY_EDIT_MSG:-}"
+  if ! valid_bot "$edit_bot"; then
+    echo "::warning::telegram ${tag} edit skipped: invalid bot id"
+    exit 2
+  fi
+  case "$edit_msg" in
+    ''|*[!0-9]*)
+      echo "::warning::telegram ${tag} edit skipped: invalid message id"
+      exit 2
+      ;;
+  esac
+  if ! ops_bot_on "$edit_bot"; then
+    echo "::notice::telegram ${tag} edit route ${edit_bot} disabled by its own card-ops switch; cannot update original card"
+    exit 2
+  fi
+  if ! load_candidate "$edit_bot"; then
+    echo "::warning::telegram ${tag} edit route ${edit_bot} unavailable (missing token/chat)"
+    exit 2
+  fi
+  edit_via "$TOKEN" "$CHAT" "$edit_msg" "$MAX_ATTEMPTS" "$edit_bot"
+  exit $?
+fi
+
 CANDIDATES=()
 add_candidate() {
   local bot="$1" c
