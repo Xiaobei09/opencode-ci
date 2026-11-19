@@ -54,8 +54,15 @@ export EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
 mkdir -p "$EGRESS_DIR"
 PROXY_PID=""
 WATCH_PID=""
+HOT_RELOAD_PID=""
 PROXY_READY=0
 cleanup_egress() {
+  # R2824: stop the repo->live hot-reload watcher before the egress helpers;
+  # no more code edits can arrive after OpenCode exits.
+  if [ -n "${HOT_RELOAD_PID:-}" ]; then
+    kill "$HOT_RELOAD_PID" 2>/dev/null
+    wait "$HOT_RELOAD_PID" 2>/dev/null
+  fi
   if [ -n "$WATCH_PID" ]; then
     kill "$WATCH_PID" 2>/dev/null
     wait "$WATCH_PID" 2>/dev/null
@@ -416,6 +423,26 @@ if [ -f "$EGRESS_DIR/stop" ]; then
   echo "::error::egress watcher rejected the selected path before the round started: $(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)"
   RC=0
 else
+  # R2824（运营者：「每一次更新都热重载」）：仓库里的 plugins/v2lib/scripts 一变更，
+  # 就同步到运行态并给运行态入口追加 reload trigger；不再等下一次 CI run。
+  # 独立 daemon 而不是插件：即使某次坏代码让插件装载失败，watcher 仍活着，
+  # 下一次修正会再次同步并自愈。只监听仓库，hotreload.sh 写运行态，不会回环。
+  if [ "${HOT_RELOAD_WATCH:-1}" != "0" ] && command -v node >/dev/null 2>&1; then
+    _hr_repo="${SESSIONS_DIR:-/home/runner/work/sessions}/opencode/config"
+    if [ -f "$_hr_repo/scripts/hot-reload-watch.mjs" ]; then
+      HOT_RELOAD_LOG="$RUNNER_TEMP/hot-reload-watch.log" \
+      HOT_RELOAD_ECHO=0 \
+      HOT_RELOAD_SYNC_ON_START="${HOT_RELOAD_SYNC_ON_START:-0}" \
+        node "$_hr_repo/scripts/hot-reload-watch.mjs" \
+        >> "$RUNNER_TEMP/hot-reload-watch.stderr" 2>&1 &
+      HOT_RELOAD_PID=$!
+      echo "hot reload watcher started: pid=$HOT_RELOAD_PID repo=$_hr_repo log=$RUNNER_TEMP/hot-reload-watch.log"
+    else
+      echo "hot reload watcher skipped: missing $_hr_repo/scripts/hot-reload-watch.mjs"
+    fi
+  else
+    echo "hot reload watcher disabled (HOT_RELOAD_WATCH=${HOT_RELOAD_WATCH:-1}, node=$(command -v node >/dev/null 2>&1 && echo yes || echo no))"
+  fi
   if [ "${BUDGET:-0}" -gt 0 ] 2>/dev/null; then
     # Explicit operator budget only; the default is 0 (no timeout).
     TERM=xterm-256color timeout --signal=TERM --kill-after=30s "$BUDGET" \
@@ -512,6 +539,19 @@ if [ -s /tmp/opencode/v2plugin.log ]; then
   [ -n "$PLUGIN_ERR" ] && printf '%s\n' "$PLUGIN_ERR" | redact | clip | sed 's/^/  /'
 else
   echo "no plugin log"
+fi
+# R2824: prove whether repo edits hot-reloaded during this run, and whether the
+# watcher died before it could (stderr is empty in the normal path).
+section "hot reload watcher"
+if [ -s "$RUNNER_TEMP/hot-reload-watch.log" ]; then
+  echo "events (last 12):"
+  tail -12 "$RUNNER_TEMP/hot-reload-watch.log" | redact | clip | sed 's/^/  /'
+else
+  echo "no hot reload events"
+fi
+if [ -s "$RUNNER_TEMP/hot-reload-watch.stderr" ]; then
+  echo "stderr (last 5):"
+  tail -5 "$RUNNER_TEMP/hot-reload-watch.stderr" | redact | clip | sed 's/^/  /'
 fi
 ERR_TXT="$RUNNER_TEMP/opencode-errors.txt"
 section "opencode errors"
