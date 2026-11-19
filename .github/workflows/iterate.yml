@@ -1165,6 +1165,14 @@ jobs:
           if [ -n "$probe_line" ]; then
             text=$(printf '%s\n%s' "$text" "$probe_line")
           fi
+          # R2837 (operator: "精简 ci 本轮结束 … 尾部添加"): the run-start egress
+          # card is gone; the selected-egress line is now the last line of this
+          # card. Keeping it after the probe leaves the card ending with the
+          # actionable egress result.
+          egress_tail="${CI_EGRESS_TAIL:-}"
+          if [ -n "$egress_tail" ]; then
+            text=$(printf '%s\n%s' "$text" "$egress_tail")
+          fi
           # R2630: retry + log the Telegram API result, so a lost notice is
           # visible as a warning with the HTTP code instead of disappearing.
           # R2732: every round-end/relay card follows the per-Bot switches and
@@ -1320,6 +1328,13 @@ jobs:
           fi
           if [ -n "$probe_line" ]; then
             text=$(printf '%s\n%s' "$text" "$probe_line")
+          fi
+          # R2837: the loop-stop card is the only card sent when this round did
+          # not relay, so it carries the same selected-egress tail. Without it
+          # the removed run-start card would lose the egress result entirely.
+          egress_tail="${CI_EGRESS_TAIL:-}"
+          if [ -n "$egress_tail" ]; then
+            text=$(printf '%s\n%s' "$text" "$egress_tail")
           fi
           # R2630: retry + log the Telegram API result, so a lost notice is
           # visible as a warning with the HTTP code instead of disappearing.

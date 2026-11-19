@@ -116,37 +116,38 @@ fi
 # Consumed by the Run OpenCode step (and then by the Option C plugin).
 echo "RESUME_ONCE_QUOTA_RECOVER=$QR_ENABLED" >> "$GITHUB_ENV"
 echo "R2626/R2665 quota-tail recover: prev=${PREV_UP:-none}/${PREV_EG:-?} new=${NEW_UP:-?}/${NEW_EG:-?} changed=$EGRESS_CHANGED mode=$QR_MODE enabled=$QR_ENABLED actionable_rollover=$ROLLOVER_PENDING"
-if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_PUSH_CHAT:-}" ]; then
-  # R2734 (operator: "进一步精简提示，现在很多废话"): show the result the
-  # operator acts on — exit kind, egress IP, and (only when proxied) direct IP —
-  # not the local proxy address or raw key=value fields (the 🌐 出口代理 panel
-  # keeps full details).
-  # R2520's "same keys as exitProxySummary()" no longer applies to this card.
-  KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-  UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-  EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
-  # R2740 (operator: "继续精简提示，现在很多废话"): when the exit is direct,
-  # 出口 and 直连 are the same IP, so show it once. Only a proxied exit needs
-  # the separate direct IP for comparison.
-  MSG="🌐 ${KIND}"
-  [ -n "$UP" ] && [ "$UP" != "$KIND" ] && MSG="$MSG (${UP})"
-  MSG="$MSG · 出口 ${EIP}"
-  if [ "$KIND" != "direct" ]; then
-    MSG="$MSG · 直连 $(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
-  fi
-  # R2626: visible proof that this run may recover a pre-boot quota
-  # tail once (only when the egress actually changed).
-  [ "$QR_ENABLED" = "1" ] && MSG="$MSG · 额度尾恢复"
-  # R2665: only the session with an actionable rollover is skipped; waiting
-  # requests no longer disable recovery for every Bot.
-  [ "$ROLLOVER_PENDING" = "1" ] && MSG="$MSG · 换会话待处理"
-  # R2733: the run-start egress card is a global notice too. Route it through
-  # tg-notify.sh so it shares the candidate order and **each Bot's own switch**:
-  # a Bot that is OFF is never used, and when every Bot is OFF the notice is
-  # skipped intentionally (exit 0, no request, no primary fallback).
-  printf '%s' "$MSG" | TG_NOTIFY_CLASS=egress bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" egress \
-    || echo "::warning::could not send the exit-proxy notice to telegram"
+# R2837 (operator: "精简 ci 本轮结束，🌐 … 改为 ci 本轮结束（尾部添加）"):
+# the selected-egress line is no longer a separate run-start card. Persist it
+# and let the round-end / loop-stop card append it as its last line: one global
+# notice per round instead of two. It still follows each Bot's switch because
+# it now rides the round card through tg-notify.sh.
+# R2734 (operator: "进一步精简提示，现在很多废话"): show the result the
+# operator acts on — exit kind, egress IP, and (only when proxied) direct IP —
+# not the local proxy address or raw key=value fields (the 🌐 出口代理 panel
+# keeps full details).
+# R2520's "same keys as exitProxySummary()" no longer applies to this card.
+KIND=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+UP=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+EIP=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+# R2740 (operator: "继续精简提示，现在很多废话"): when the exit is direct,
+# 出口 and 直连 are the same IP, so show it once. Only a proxied exit needs
+# the separate direct IP for comparison.
+MSG="🌐 ${KIND}"
+[ -n "$UP" ] && [ "$UP" != "$KIND" ] && MSG="$MSG (${UP})"
+MSG="$MSG · 出口 ${EIP}"
+if [ "$KIND" != "direct" ]; then
+  MSG="$MSG · 直连 $(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
 fi
+# R2626: visible proof that this run may recover a pre-boot quota
+# tail once (only when the egress actually changed).
+[ "$QR_ENABLED" = "1" ] && MSG="$MSG · 额度尾恢复"
+# R2665: only the session with an actionable rollover is skipped; waiting
+# requests no longer disable recovery for every Bot.
+[ "$ROLLOVER_PENDING" = "1" ] && MSG="$MSG · 换会话待处理"
+if [ -n "${GITHUB_ENV:-}" ]; then
+  printf 'CI_EGRESS_TAIL=%s\n' "$MSG" >> "$GITHUB_ENV"
+fi
+echo "R2837 egress tail -> round-end card: $MSG"
 if [ -n "${PRE_OPENCODE_T0:-}" ]; then
   echo "setup timing: pre-opencode $(( $(date +%s) - PRE_OPENCODE_T0 ))s (target <60s: checkout+restore+install+select)"
 fi
