@@ -124,12 +124,12 @@ leak_files "host path" '/home/runner' || die "/home/runner path found"
 # ------------------------------------------------------- expected contents
 for f in README.md install.sh add-bots.sh \
          src/_v2compat.ts src/auto-continue.ts src/auto-continue-v2.ts \
-         src/tg-bridge.ts src/tg-bridge-v2.ts src/compaction-card.ts; do
+         src/tg-bridge.ts src/tg-bridge-v2.ts src/compaction-card.ts src/version.ts; do
   [ -s "$BRIDGE_DIR/$f" ] || die "clean copy is missing $f"
 done
 
-VERSION=$(sed -n 's/^const VERSION = "\([^"]*\)"/\1/p' "$BRIDGE_DIR/src/tg-bridge.ts" | head -1)
-[ -n "$VERSION" ] || die "cannot read VERSION from src/tg-bridge.ts"
+VERSION=$(sed -n 's/^export const BRIDGE_VERSION = "\([^"]*\)"/\1/p' "$BRIDGE_DIR/src/version.ts" | head -1)
+[ -n "$VERSION" ] || die "cannot read BRIDGE_VERSION from src/version.ts"
 ROUND=${VERSION%%-*}
 case "$ROUND" in r[0-9]*) ;; *) die "unexpected VERSION '$VERSION'" ;; esac
 log "bridge version: $VERSION ($ROUND)"
@@ -140,7 +140,9 @@ TMPHOME=$(mktemp -d)
 trap 'rm -rf "$TMPHOME"' EXIT
 ( cd "$BRIDGE_DIR" && HOME="$TMPHOME" bash ./install.sh >/dev/null )
 for f in "$TMPHOME/.opencode/v2lib/tg-bridge.ts" \
+         "$TMPHOME/.opencode/v2lib/version.ts" \
          "$TMPHOME/.config/opencode/v2lib/tg-bridge.ts" \
+         "$TMPHOME/.config/opencode/v2lib/version.ts" \
          "$TMPHOME/.config/opencode/plugins/tg-bridge-v2.ts"; do
   [ -s "$f" ] || die "install smoke test did not produce $f"
 done
@@ -227,9 +229,9 @@ else
   [ "$private" = "false" ] || die "remote repo is not public (private=$private)"
   fetched=$(mktemp)
   trap 'rm -rf "$TMPHOME" "$fetched"' EXIT
-  curl -fsS "https://raw.githubusercontent.com/$BRIDGE_REPO/main/src/tg-bridge.ts" >"$fetched" \
+  curl -fsS "https://raw.githubusercontent.com/$BRIDGE_REPO/main/src/version.ts" >"$fetched" \
     || die "anonymous raw fetch failed"
-  grep -q "const VERSION = \"$VERSION\"" "$fetched" || die "raw fetch does not contain VERSION=$VERSION"
+  grep -q "export const BRIDGE_VERSION = \"$VERSION\"" "$fetched" || die "raw fetch does not contain BRIDGE_VERSION=$VERSION"
   if grep -qE 'ses_[0-9a-fA-F]{16,}|msg_[0-9a-fA-F]{16,}|ghp_[A-Za-z0-9]{30,}|github_pat_|/home/runner' "$fetched"; then
     die "raw fetch failed the leak scan"
   fi
