@@ -400,6 +400,25 @@ PY
     echo "::warning::env-sync payload apply failed; considering release packages"
     return 1
   fi
+  # R2870（运营者：「为什么现在一轮会话这么慢，时间都去哪了」）：restore 已经
+  # 付过下载整条 env-sync 分支的代价，但这个 depth-1 克隆随后被删除。新 run 的
+  # env-sync 工作副本因此没有父链，首拍只能生成孤儿根并把整棵 ~947MB 载荷重传
+  # （实测 root push 139s / ~210MB pack）。把克隆的 `.git` 与 manifest **move**
+  # 到 env-sync 默认工作副本（同一 /tmp 文件系统，纯 rename，不走网络）：首拍
+  # 成为分支 tip 的快进子提交；$HOME 与分支一致时 `read-tree --empty` + 全量
+  # add 仍会得到同一棵树，直接走 no-change，不产生任何上传。
+  # 只在 env-sync 已成功应用后做；release/克隆失败路径保持旧的孤儿根行为。
+  # 回滚：设 ENV_SYNC_SEED=0，下一轮恢复仍走旧路径。
+  local seed_dir="${ENV_SYNC_SEED_DIR:-/tmp/opencode/env-sync-repo}"
+  if [ "${ENV_SYNC_SEED:-1}" != "0" ] && [ ! -e "$seed_dir/.git" ]; then
+    if mkdir -p "$seed_dir" 2>/dev/null && mv "$d/.git" "$seed_dir/.git" 2>/dev/null; then
+      [ -s "$d/env-sync.json" ] && mv "$d/env-sync.json" "$seed_dir/env-sync.json" 2>/dev/null || true
+      echo "env-sync: seeded workdir from restored tip ${sha} (first push is incremental, no orphan root)"
+    else
+      rm -rf "$seed_dir/.git" 2>/dev/null
+      echo "::warning::env-sync seed move failed; next push will be an orphan root"
+    fi
+  fi
   rm -rf "$d" 2>/dev/null
   echo "environment restored from env-sync branch (commit=${sha}, age=${age}min, db=${dbfmt} ${dbsz} bytes, apply $(( $(date +%s) - t_step ))s, total $(( $(date +%s) - t_all ))s)"
   return 0
