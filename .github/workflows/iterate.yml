@@ -940,17 +940,13 @@ jobs:
           if [ -z "$reset_epoch" ] && [ -n "$retry_after_s" ] && [ "$retry_after_s" -gt 0 ] 2>/dev/null; then
             reset_epoch=$(( $(date +%s) + retry_after_s ))
           fi
-          # R2840 (operator: "174762和174763是同一个429吗，如果不是，为什么会有
-          # 两个，修复"): the provider free bucket can emit a 429 on several
-          # consecutive rounds while its reset hint moves by a few minutes
-          # (2026-11-19 11:56/12:11/12:39 all reset 2026-11-20 ~08:20-08:31
-          # CST). Those are different 429 responses in the SAME quota window;
-          # one full round-end card per response looked like duplicate alarms.
-          # Keep one card per window: the first round sends it, later rounds
-          # edit it in place with the later run and a "同一额度窗口第 N 轮" line
-          # (an edit does not push a new notification). A ±45min tolerance
-          # covers retry_after jitter while a genuinely new reset window still
-          # gets its own card.
+          # R2864 (operator: "改为直接发卡"): every quota round must send a NEW
+          # Telegram card. R2840 edited the first card in place, but Telegram
+          # edits do not push a notification, so the operator only saw the first
+          # 429 of a window and nothing after that. The window count is still
+          # kept for the "同一额度窗口第 N 轮" label; a ±45min tolerance covers
+          # retry_after jitter while a genuinely new reset window still starts a
+          # fresh count.
           quota_round=false
           if [ "$egress_retry" = "true" ] \
              || printf '%s' "$reason" | grep -qaiE 'quota 429|FreeUsageLimit|free usage limit'; then
@@ -959,30 +955,20 @@ jobs:
           same_window=false
           window_count=1
           card_window_reset=""
-          card_bot=""
-          card_msg=""
           if [ "$quota_round" = "true" ] && [ -n "$reset_epoch" ] && [ "$reset_epoch" -gt 0 ] 2>/dev/null; then
             stored_reset=$(gh variable get CI_QUOTA_CARD_RESET --repo "$repo" 2>/dev/null || true)
             if [ -n "$stored_reset" ] && [ "$stored_reset" -gt 0 ] 2>/dev/null; then
               drift=$(( reset_epoch - stored_reset ))
               [ "$drift" -lt 0 ] && drift=$(( -drift ))
               if [ "$drift" -le 2700 ]; then
-                stored_bot=$(gh variable get CI_QUOTA_CARD_BOT --repo "$repo" 2>/dev/null || true)
-                stored_msg=$(gh variable get CI_QUOTA_CARD_MSG --repo "$repo" 2>/dev/null || true)
-                case "$stored_bot" in ''|*[!A-Za-z0-9_-]*) stored_bot="" ;; esac
-                case "$stored_msg" in ''|*[!0-9]*) stored_msg="" ;; esac
-                if [ -n "$stored_bot" ] && [ -n "$stored_msg" ]; then
-                  same_window=true
-                  card_bot="$stored_bot"
-                  card_msg="$stored_msg"
-                  card_window_reset="$stored_reset"
-                  stored_count=$(gh variable get CI_QUOTA_CARD_COUNT --repo "$repo" 2>/dev/null || true)
-                  case "$stored_count" in ''|*[!0-9]*) stored_count=1 ;; esac
-                  window_count=$(( stored_count + 1 ))
-                  # Keep the first card's reset hint for the whole window so
-                  # every update shows one stable timestamp, not a moving one.
-                  reset_epoch="$stored_reset"
-                fi
+                same_window=true
+                card_window_reset="$stored_reset"
+                stored_count=$(gh variable get CI_QUOTA_CARD_COUNT --repo "$repo" 2>/dev/null || true)
+                case "$stored_count" in ''|*[!0-9]*) stored_count=0 ;; esac
+                window_count=$(( stored_count + 1 ))
+                # Keep the first card's reset hint for the whole window so
+                # every card shows one stable timestamp, not a moving one.
+                reset_epoch="$stored_reset"
               fi
             fi
             [ -n "$card_window_reset" ] || card_window_reset="$reset_epoch"
@@ -1116,60 +1102,25 @@ jobs:
           # OFF means intentionally skipped, not a failure.
           notify_class=""
           if [ "$quota_round" = "true" ] || [ "${R2651_QUOTA_EVIDENCE:-}" = "true" ]; then notify_class="quota"; fi
-          sent_ok=false
           sent_bot=""
           sent_msg=""
-          if [ "$same_window" = "true" ] && [ -n "$card_bot" ] && [ -n "$card_msg" ]; then
-            # R2840: same quota window -> update the existing card in place.
-            # Telegram edits do not produce a new notification, so the operator
-            # sees one card per 429 window instead of one per round.
-            edit_out=$(printf '%s' "$text" \
-              | TG_NOTIFY_MODE=edit TG_NOTIFY_EDIT_BOT="$card_bot" TG_NOTIFY_EDIT_MSG="$card_msg" \
-                TG_NOTIFY_CLASS="$notify_class" \
-                bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" round-end 2>&1)
-            edit_rc=$?
-            printf '%s\n' "$edit_out"
-            if [ "$edit_rc" = 0 ]; then
-              sent_ok=true
-              sent_bot="$card_bot"
-              sent_msg="$card_msg"
-              gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 \
-                || echo "::warning::could not persist CI_QUOTA_CARD_COUNT=$window_count"
-            elif [ "$edit_rc" = 2 ]; then
-              # Original message deleted / its Bot switched off: a fresh card
-              # is correct, otherwise this window would stay silent.
-              echo "::warning::original quota-window card is no longer editable; sending a fresh card"
-            else
-              # Transient edit failure: do NOT send a second card (that is the
-              # duplicate this fix exists for). The next quota round retries
-              # the edit with the then-current text.
-              sent_ok=true
-              sent_bot="$card_bot"
-              sent_msg="$card_msg"
-              gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 || true
-            fi
+          # R2864: always send a new card. The window count above is the only
+          # cross-round state; no message is edited in place.
+          send_out=$(printf '%s' "$text" \
+            | TG_NOTIFY_CLASS="$notify_class" \
+              bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" round-end 2>&1)
+          send_rc=$?
+          printf '%s\n' "$send_out"
+          if [ "$send_rc" = 0 ]; then
+            sent_bot=$(printf '%s\n' "$send_out" | sed -nE 's/.*telegram round-end sent \(.*via=([A-Za-z0-9_-]+).*/\1/p' | tail -1)
+            sent_msg=$(printf '%s\n' "$send_out" | sed -nE 's/.*message_id=([0-9]+).*/\1/p' | tail -1)
           fi
-          if [ "$sent_ok" != "true" ]; then
-            send_out=$(printf '%s' "$text" \
-              | TG_NOTIFY_CLASS="$notify_class" \
-                bash "$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh" round-end 2>&1)
-            send_rc=$?
-            printf '%s\n' "$send_out"
-            if [ "$send_rc" = 0 ]; then
-              sent_bot=$(printf '%s\n' "$send_out" | sed -nE 's/.*telegram round-end sent \(.*via=([A-Za-z0-9_-]+).*/\1/p' | tail -1)
-              sent_msg=$(printf '%s\n' "$send_out" | sed -nE 's/.*message_id=([0-9]+).*/\1/p' | tail -1)
-            fi
-            if [ "$quota_round" = "true" ] && [ -n "$card_window_reset" ] \
-               && [ -n "$sent_bot" ] && [ -n "$sent_msg" ]; then
-              gh variable set CI_QUOTA_CARD_RESET --body "$card_window_reset" --repo "$repo" >/dev/null 2>&1 \
-                || echo "::warning::could not persist CI_QUOTA_CARD_RESET=$card_window_reset"
-              gh variable set CI_QUOTA_CARD_BOT --body "$sent_bot" --repo "$repo" >/dev/null 2>&1 \
-                || echo "::warning::could not persist CI_QUOTA_CARD_BOT=$sent_bot"
-              gh variable set CI_QUOTA_CARD_MSG --body "$sent_msg" --repo "$repo" >/dev/null 2>&1 \
-                || echo "::warning::could not persist CI_QUOTA_CARD_MSG=$sent_msg"
-              gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 \
-                || echo "::warning::could not persist CI_QUOTA_CARD_COUNT=$window_count"
-            fi
+          if [ "$quota_round" = "true" ] && [ -n "$card_window_reset" ] \
+             && [ -n "$sent_bot" ] && [ -n "$sent_msg" ]; then
+            gh variable set CI_QUOTA_CARD_RESET --body "$card_window_reset" --repo "$repo" >/dev/null 2>&1 \
+              || echo "::warning::could not persist CI_QUOTA_CARD_RESET=$card_window_reset"
+            gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 \
+              || echo "::warning::could not persist CI_QUOTA_CARD_COUNT=$window_count"
           fi
           # R2861: persist the card target + text for the relayed successor.
           # It edits this card from "本轮结束 · 接力中" to "上一轮结束" once the

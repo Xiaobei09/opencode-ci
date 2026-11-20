@@ -9,10 +9,11 @@
 #   tag  short label used in logs, e.g. round-end, loop-stop, egress
 # Env:
 #   TG_BOT_TOKEN, TG_PUSH_CHAT  primary Bot credentials; missing means "skipped"
-#   TG_NOTIFY_MODE              "send" (default) or "edit". R2840: "edit"
-#                               rewrites one existing message in place so a
-#                               quota window with multiple 429 rounds produces
-#                               one card, not one notification per round.
+#   TG_NOTIFY_MODE              "send" (default) or "edit". R2861: "edit"
+#                               retitles the previous round-end card in place.
+#                               Quota 429 cards always send a new card (R2864:
+#                               an edit is silent on Telegram, so the operator
+#                               stopped seeing later 429s in a window).
 #   TG_NOTIFY_EDIT_BOT          Bot id that sent the original card (edit mode)
 #   TG_NOTIFY_EDIT_MSG          Telegram message_id to edit (edit mode)
 #   TG_NOTIFY_CLASS             retained for logs/back-compat ("quota" marks a
@@ -149,8 +150,8 @@ send_via() {
 
     if [ "$curl_rc" -eq 0 ] && [ "$code" = "200" ] \
        && printf '%s' "$body" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true'; then
-      # R2840: the caller persists this id so later rounds in the same quota
-      # window can edit the card instead of sending a duplicate notification.
+      # R2840/R2861: the caller persists this id so a successor can retitle the
+      # card. R2864 quota cards send a new message every round instead.
       msg_id=$(printf '%s' "$body" | sed -nE 's/.*"message_id"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -1)
       echo "telegram ${tag} sent (attempt=${attempt}/${max}, http=200, chars=${#text}, via=${label}${msg_id:+, message_id=${msg_id}})"
       return 0

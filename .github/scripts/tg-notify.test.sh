@@ -204,20 +204,25 @@ setledger '{"bot5":{"in":300,"seen":300}}'
 run quota
 ck "R2729: 旧全局关 + 单 Bot 显式开启时按该 Bot 推" "$(printf '%s' "$out" | grep -q 'via=bot5' && echo yes)"
 
-# R2840 (operator: "174762和174763是同一个429吗，如果不是，为什么会有两个，
-# 修复"): a quota window can produce several 429 rounds; the round-end card must
-# be edited in place instead of sending one notification per round.
+# R2840/R2861: edit mode is still used to retitle the previous round-end card
+# (mark-previous-round.sh). R2864 changed the quota path to send a new card
+# every round, so this section only tests the script's edit primitive.
 setops '{"bots":{"bot6":{"enabled":true}},"notifyBot":"bot6"}'
 setledger '{"bot6":{"in":200,"seen":300}}'
 run quota
-ck "R2840: 发送结果带 message_id，供下一轮原地编辑" "$(printf '%s' "$out" | grep -q 'message_id=4242' && echo yes)"
+ck "R2840: 发送结果带 message_id，供后继轮次改写" "$(printf '%s' "$out" | grep -q 'message_id=4242' && echo yes)"
 : > "$LOG"
 out=$(printf 'quota 429 test round 2\n' | TG_NOTIFY_MODE=edit TG_NOTIFY_EDIT_BOT=bot6 \
   TG_NOTIFY_EDIT_MSG=4242 bash "$SCRIPT" round-end 2>&1)
 rc=$?
-ck "R2840: 同一额度窗口改原卡而不是新发" "$(printf '%s' "$out" | grep -q 'telegram round-end edited .*msg=4242, via=bot6' && echo yes)"
+ck "R2840/R2861: edit 模式改写指定消息而不是新发" "$(printf '%s' "$out" | grep -q 'telegram round-end edited .*msg=4242, via=bot6' && echo yes)"
 ck "R2840: 编辑只走原 Bot，不再打扰主 Bot" "$(grep -qx '666:bot6-token' "$LOG" && ! grep -q '111:primary-token' "$LOG" && echo yes)"
 ck "R2840: 编辑成功退出 0" "$([ "$rc" = 0 ] && echo yes)"
+
+# R2864 (operator: "改为直接发卡"): the CI quota path must send a new card every
+# round instead of editing the first card (an edit is silent on Telegram).
+ck "R2864: CI workflow 的配额轮不再使用 edit 模式" \
+  "$(! grep -q 'TG_NOTIFY_MODE=edit' "$wf" && echo yes)"
 : > "$LOG"
 out=$(printf 'x\n' | FAKE_EDIT_NOT_FOUND=1 TG_NOTIFY_MODE=edit TG_NOTIFY_EDIT_BOT=bot6 \
   TG_NOTIFY_EDIT_MSG=4242 bash "$SCRIPT" round-end 2>&1)
