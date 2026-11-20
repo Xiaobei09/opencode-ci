@@ -145,6 +145,11 @@ jobs:
         # matrix uses a fake curl and a temp HOME, so it costs ~1s.
         run: bash .github/scripts/tg-notify.test.sh
 
+      - name: Self-test previous round card relay mark
+        # R2861: the successor rewrites the finishing run's card in place.
+        # Offline matrix with a fake gh + fake tg-notify (no network).
+        run: bash .github/scripts/mark-previous-round.test.sh
+
       - name: Self-test restore freshness guard
         # R2773: the stale-release refusal protects the env-sync branch from
         # being overwritten by a days-old release restore. Offline matrix with a
@@ -184,6 +189,20 @@ jobs:
         id: lock
         run: |
           echo "acquired=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mark previous round card as relayed
+        # R2861（运营者：「ci结束时发ci结束提示，重启后改为
+        # 🌐 relay.....
+        # 🔄 CI 上一轮结束 ...」）：上一轮结束时先发「🔄 CI 本轮结束 · 接力中」；
+        # 接力出来的本轮一启动，就把那张卡原地改成「🌐 relay · run 上一轮 → 本轮 /
+        # 🔄 CI 上一轮结束 · 原因」，不再推送第二条通知。只处理 relay 启动的轮次；
+        # 失败只告警，不影响本轮。
+        if: always() && github.event.inputs.smoke != 'true' && github.event.inputs.relay == 'true' && steps.lock.outputs.acquired == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_PAT }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
+        run: bash -e "$GITHUB_WORKSPACE/.github/scripts/mark-previous-round.sh"
 
       - name: Resume loop on manual dispatch
         # R2513: a manual dispatch is an explicit "restart" signal. Previous
@@ -1112,6 +1131,8 @@ jobs:
             printf '%s\n' "$edit_out"
             if [ "$edit_rc" = 0 ]; then
               sent_ok=true
+              sent_bot="$card_bot"
+              sent_msg="$card_msg"
               gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 \
                 || echo "::warning::could not persist CI_QUOTA_CARD_COUNT=$window_count"
             elif [ "$edit_rc" = 2 ]; then
@@ -1123,6 +1144,8 @@ jobs:
               # duplicate this fix exists for). The next quota round retries
               # the edit with the then-current text.
               sent_ok=true
+              sent_bot="$card_bot"
+              sent_msg="$card_msg"
               gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 || true
             fi
           fi
@@ -1147,6 +1170,19 @@ jobs:
               gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 \
                 || echo "::warning::could not persist CI_QUOTA_CARD_COUNT=$window_count"
             fi
+          fi
+          # R2861: persist the card target + text for the relayed successor.
+          # It edits this card from "本轮结束 · 接力中" to "上一轮结束" once the
+          # new run is actually alive, without sending a second notification.
+          # One JSON variable keeps the four fields consistent (and avoids four
+          # repository-variable round trips on the round-end tail).
+          if [ -n "$sent_bot" ] && [ -n "$sent_msg" ]; then
+            card_text_b64=$(printf '%s' "$text" | base64 | tr -d '\n')
+            last_card=$(jq -cn --arg bot "$sent_bot" --arg msg "$sent_msg" \
+              --arg run "${GITHUB_RUN_ID:-}" --arg text "$card_text_b64" \
+              '{bot:$bot,msg:$msg,run:$run,text:$text}')
+            gh variable set CI_LAST_ROUND_CARD --body "$last_card" --repo "$repo" >/dev/null 2>&1 \
+              || echo "::warning::could not persist CI_LAST_ROUND_CARD for the relayed successor"
           fi
 
       - name: Relay next run

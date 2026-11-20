@@ -7,6 +7,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/tg-notify.sh"
+wf="$HERE/../workflows/iterate.yml"
 TD=$(mktemp -d)
 trap 'rm -rf "$TD"' EXIT
 mkdir -p "$TD/bin" "$TD/home/.config/opencode" "$TD/home/.opencode"
@@ -273,6 +274,34 @@ out=$(printf 'normal\n' | PATH="$NOJQ" TG_NOTIFY_NO_SLEEP=1 TG_NOTIFY_MAX_ATTEMP
 rc=$?
 ck "R2732: 无 jq 时旧全局关仍能主动跳过" "$(printf '%s' "$out" | grep -q 'all notice routes disabled' && [ "$rc" = 0 ] && echo yes)"
 ck "R2732: 无 jq 旧全局关不发请求" "$([ ! -s "$LOG" ] && echo yes)"
+
+# R2861 (operator: "ci结束时发ci结束提示，重启后改为 🌐 relay..... /
+# 🔄 CI 上一轮结束 ..."): the finishing run persists its card target; the
+# relayed successor edits that card in place instead of sending a new notice.
+mark="$HERE/mark-previous-round.sh"
+ck "R2861: 接力启动步骤调用上一轮卡改写脚本" \
+  "$(grep -q 'name: Mark previous round card as relayed' "$wf" \
+     && grep -q 'mark-previous-round.sh' "$wf" && echo yes)"
+ck "R2861: 只对 relay 启动、非 smoke 的轮次改写" \
+  "$(grep -A12 'name: Mark previous round card as relayed' "$wf" \
+     | grep -q "github.event.inputs.relay == 'true'" && echo yes)"
+ck "R2861: 轮末持久化 CI_LAST_ROUND_CARD（bot/msg/run/text）" \
+  "$(grep -q 'CI_LAST_ROUND_CARD' "$wf" \
+     && grep -q "arg bot \"\$sent_bot\"" "$wf" \
+     && grep -q "arg msg \"\$sent_msg\"" "$wf" && echo yes)"
+ck "R2861: 新卡首行 relay、标题上一轮结束" \
+  "$(grep -q '🌐 relay · run' "$mark" \
+     && grep -q '🔄 CI 上一轮结束' "$mark" && echo yes)"
+ck "R2861: 已标记的卡不重复编辑" \
+  "$(grep -q 'already marked as relayed' "$mark" && echo yes)"
+ck "R2861: 原卡不可编辑时清理变量且不影响本轮" \
+  "$(grep -q 'gh variable delete CI_LAST_ROUND_CARD' "$mark" \
+     && grep -q 'exit 0' "$mark" && echo yes)"
+ck "R2861: 离线用例覆盖改写/幂等/删除/缺卡" \
+  "$([ -x "$HERE/mark-previous-round.test.sh" ] \
+     && grep -q '已标记的卡不再重复编辑' "$HERE/mark-previous-round.test.sh" \
+     && grep -q '原卡不可编辑' "$HERE/mark-previous-round.test.sh" \
+     && grep -q '没有上一轮卡' "$HERE/mark-previous-round.test.sh" && echo yes)"
 
 echo "tg-notify: $([ "$fail" = 0 ] && echo PASS || echo FAIL) ($checks checks)"
 exit "$fail"
