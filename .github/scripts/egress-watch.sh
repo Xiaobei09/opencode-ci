@@ -435,11 +435,15 @@ esac
 
 # handle_quota <line>
 handle_quota() {
-  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl cur_egress sid user_initiated
+  local line="$1" now err_up err_at msg_at msg_at_epoch retry_after ttl cur_egress sid user_initiated continuation
   now=$(egress_now)
   # R2795: a real user turn's 429 is not a stale synthetic prompt. The plugin
   # emits this flag; only `true` bypasses the stopped-Bot ignore gate below.
   user_initiated=$(printf '%s' "$line" | sed -nE 's/.*user_initiated=(true|false).*/\1/p' | head -1)
+  # R2886: a rollover continuation / CI recovery prompt is synthetic, but it is
+  # the work currently in flight. Ignoring its 429 leaves the whole round stuck
+  # until the operator sends a real message (2026-11-21 10:44→10:56, bot5+bot6).
+  continuation=$(printf '%s' "$line" | sed -nE 's/.*continuation=(true|false).*/\1/p' | head -1)
 
   # R2566 (operator priority: still widespread 429 after a 200 preflight):
   # only the structured quota line emitted by auto-continue is evidence. Other
@@ -495,8 +499,11 @@ handle_quota() {
   # waiting for that answer, and silently ignoring it forces a manual /rollover
   # plus a manual CI cancel (2026-11-18 bot6 incident). The plugin marks those
   # turns `user_initiated=true`; only synthetic/restored turns keep R2785.
+  # R2886: the same applies to an **active continuation** turn (rollover seed
+  # `阅读（…）对话历史` or CI recovery `CI 在上一回合…`). It is synthetic, but it
+  # is the work currently in flight; ignoring it made both bots idle for 10+ min.
   sid=$(printf '%s' "$line" | sed -nE 's/.*session=(ses_[A-Za-z0-9_-]+).*/\1/p' | head -1)
-  if [ "$user_initiated" != "true" ] && [ -n "$sid" ] && sid_owner_stopped "$sid"; then
+  if [ "$user_initiated" != "true" ] && [ "$continuation" != "true" ] && [ -n "$sid" ] && sid_owner_stopped "$sid"; then
     # R2800: the one exception is a rollover-created successor whose seed prompt
     # is the turn that just 429'd. R2785 would ignore it because the Bot is
     # stopped, so this round would never end, no successor run would start, and
@@ -506,12 +513,14 @@ handle_quota() {
     if sid_owner_seed_pending "$sid" "$((msg_at_epoch * 1000))"; then
       log "quota 429 from stopped Bot session $sid but its rollover seed successor is unrecovered; ending this round so the next run retries once"
     else
-      log "quota 429 from stopped/halted Bot session $sid (user_initiated=${user_initiated:-unknown}); ignoring for stop/blacklist (synthetic/restored turn, active Bots keep running)"
+      log "quota 429 from stopped/halted Bot session $sid (user_initiated=${user_initiated:-unknown}, continuation=${continuation:-unknown}); ignoring for stop/blacklist (synthetic/restored turn, active Bots keep running)"
       return 0
     fi
   fi
   if [ "$user_initiated" = "true" ] && [ -n "$sid" ]; then
     log "quota 429 from a real user turn on stopped/halted Bot session $sid; not ignoring (operator is waiting; end this round and switch)"
+  elif [ "$continuation" = "true" ] && [ -n "$sid" ]; then
+    log "quota 429 from an active continuation turn on stopped/halted Bot session $sid; not ignoring (rollover/recovery in flight; end this round and switch)"
   fi
 
   # R2620 (operator: "改为出现一个429就重启吧"): a candidate that passed the
