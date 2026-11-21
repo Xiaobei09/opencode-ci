@@ -139,18 +139,23 @@ while IFS= read -r sid; do
     EV_FIRST=$(printf '%s' "$EV" | jq -r '.first429At // 0' 2>/dev/null || echo 0)
     EV_LAST=$(printf '%s' "$EV" | jq -r '.last429At // 0' 2>/dev/null || echo 0)
     EV_USER=$(printf '%s' "$EV" | jq -r '.userInitiated == true' 2>/dev/null || echo false)
+    # R2893: a rollover/CI-recovery prompt is not a real user turn, but its 429
+    # is the work currently in flight. Persist it so the request may bypass a
+    # stopped Bot's loop gate (halt still wins).
+    EV_CONT=$(printf '%s' "$EV" | jq -r '.continuation == true' 2>/dev/null || echo false)
     # R2797: distinguish "explicitly synthetic" (false) from legacy evidence
     # that predates R2795 and has no userInitiated field at all.
     EV_USER_KNOWN=$(printf '%s' "$EV" | jq -r 'has("userInitiated")' 2>/dev/null || echo false)
     case "$EV_FIRST" in ''|*[!0-9]*) EV_FIRST=0 ;; esac
     case "$EV_LAST" in ''|*[!0-9]*) EV_LAST=0 ;; esac
-    UPDATED=$(printf '%s' "$NEW" | jq -c --argjson prev "$PREV" --arg sid "$sid" --argjson first "$EV_FIRST" --argjson last "$EV_LAST" --argjson user "$EV_USER" --argjson known "$EV_USER_KNOWN" '
+    UPDATED=$(printf '%s' "$NEW" | jq -c --argjson prev "$PREV" --arg sid "$sid" --argjson first "$EV_FIRST" --argjson last "$EV_LAST" --argjson user "$EV_USER" --argjson cont "$EV_CONT" --argjson known "$EV_USER_KNOWN" '
       (($prev.sessions // {})[$sid] // {}) as $p
       | .sessions[$sid] = {
           streak: (($p.streak // 0) + 1),
           first429At: ([ ($p.first429At // 0), $first ] | map(select(. > 0)) | min // 0),
           last429At: ([ ($p.last429At // 0), $last ] | map(select(. > 0)) | max // 0),
           userInitiated: (($p.userInitiated // false) or $user),
+          continuation: (($p.continuation // false) or $cont),
           userInitiatedKnown: (($p.userInitiatedKnown // false) or $known)
         }' 2>/dev/null)
     [ -n "$UPDATED" ] && NEW="$UPDATED"
@@ -168,6 +173,7 @@ CANDIDATES=$(printf '%s' "$NEW" | jq -c '
     | select((.value.streak | type) == "number" and .value.streak >= 1)
     | select((.value.first429At | type) == "number" and .value.first429At > 0)
     | {sid: .key, first: .value.first429At, user: (.value.userInitiated == true),
+       continuation: (.value.continuation == true),
        userKnown: (.value.userInitiatedKnown == true)} ]
   | sort_by([.first, .sid])' 2>/dev/null || true)
 [ -n "$CANDIDATES" ] || CANDIDATES='[]'
@@ -180,7 +186,7 @@ case "$CANDIDATE_N" in ''|*[!0-9]*) CANDIDATE_N=0 ;; esac
 if [ -d "$SEED_DIR" ] && [ "$CANDIDATE_N" -gt 0 ]; then
   _NOW_MS=$(date +%s%3N)
   _FILTERED='[]'
-  while IFS=$'\t' read -r _sid _first _user _known; do
+  while IFS=$'\t' read -r _sid _first _user _known _cont; do
     [ -n "$_sid" ] || continue
     _skip=0
     case "$_sid" in
@@ -214,10 +220,10 @@ if [ -d "$SEED_DIR" ] && [ "$CANDIDATE_N" -gt 0 ]; then
       continue
     fi
     _FILTERED=$(printf '%s' "$_FILTERED" | jq -c \
-      --arg sid "$_sid" --argjson first "$_first" --argjson user "$_user" --argjson known "$_known" \
-      '. + [{sid:$sid,first:$first,user:$user,userKnown:$known}]' 2>/dev/null) \
+      --arg sid "$_sid" --argjson first "$_first" --argjson user "$_user" --argjson cont "$_cont" --argjson known "$_known" \
+      '. + [{sid:$sid,first:$first,user:$user,continuation:$cont,userKnown:$known}]' 2>/dev/null) \
       || _FILTERED='[]'
-  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring), (.user|tostring), (.userKnown|tostring)] | @tsv' 2>/dev/null)"
+  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring), (.user|tostring), (.userKnown|tostring), (.continuation|tostring)] | @tsv' 2>/dev/null)"
   CANDIDATES="$_FILTERED"
   CANDIDATE_N=$(printf '%s' "$CANDIDATES" | jq -r 'length' 2>/dev/null || echo 0)
   case "$CANDIDATE_N" in ''|*[!0-9]*) CANDIDATE_N=0 ;; esac
@@ -231,17 +237,18 @@ fi
 # resumes.
 CANDIDATES_ACTIONABLE='[]'
 if declare -F rollover_sid_actionable >/dev/null 2>&1; then
-  while IFS=$'\t' read -r _sid _first _user; do
+  while IFS=$'\t' read -r _sid _first _user _cont; do
     [ -n "$_sid" ] || continue
     case "$_first" in ''|*[!0-9]*) _first=0 ;; esac
     [ "$_user" = "true" ] || _user=false
-    if rollover_sid_actionable "$_sid" false "$_user"; then
+    [ "$_cont" = "true" ] || _cont=false
+    if rollover_sid_actionable "$_sid" false "$_user" "$_cont"; then
       CANDIDATES_ACTIONABLE=$(printf '%s' "$CANDIDATES_ACTIONABLE" | jq -c \
-        --arg sid "$_sid" --argjson first "$_first" --argjson user "$_user" \
-        '. + [{sid:$sid,first:$first,user:$user}]' 2>/dev/null) \
+        --arg sid "$_sid" --argjson first "$_first" --argjson user "$_user" --argjson cont "$_cont" \
+        '. + [{sid:$sid,first:$first,user:$user,continuation:$cont}]' 2>/dev/null) \
         || CANDIDATES_ACTIONABLE='[]'
     fi
-  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring), (.user|tostring)] | @tsv' 2>/dev/null)"
+  done <<< "$(printf '%s' "$CANDIDATES" | jq -r '.[] | [.sid, (.first|tostring), (.user|tostring), (.continuation|tostring)] | @tsv' 2>/dev/null)"
 else
   # Older/partial checkout without rollover-pending.sh: preserve the legacy
   # behavior (treat every candidate as actionable) instead of marking all as
@@ -303,6 +310,8 @@ if [ -n "$CHOSEN" ]; then
   TMP="$FILE.tmp.$$"
   CHOSEN_USER=$(printf '%s' "$NEW" | jq -r --arg sid "$CHOSEN" '.sessions[$sid].userInitiated == true' 2>/dev/null || echo false)
   [ "$CHOSEN_USER" = "true" ] || CHOSEN_USER=false
+  CHOSEN_CONT=$(printf '%s' "$NEW" | jq -r --arg sid "$CHOSEN" '.sessions[$sid].continuation == true' 2>/dev/null || echo false)
+  [ "$CHOSEN_CONT" = "true" ] || CHOSEN_CONT=false
   CHOSEN_FIRST=$(printf '%s' "$NEW" | jq -r --arg sid "$CHOSEN" '.sessions[$sid].first429At // 0' 2>/dev/null || echo 0)
   case "$CHOSEN_FIRST" in ''|*[!0-9]*) CHOSEN_FIRST=0 ;; esac
   if jq -n \
@@ -312,7 +321,8 @@ if [ -n "$CHOSEN" ]; then
       --arg reason "$REASON" \
       --arg run "$RUN" \
       --argjson user "$CHOSEN_USER" \
-      '{sid:$sid,ts:$ts,first429At:$first,reason:$reason,run:$run,userInitiated:$user}' > "$TMP" 2>/dev/null \
+      --argjson cont "$CHOSEN_CONT" \
+      '{sid:$sid,ts:$ts,first429At:$first,reason:$reason,run:$run,userInitiated:$user,continuation:$cont}' > "$TMP" 2>/dev/null \
      && mv -f "$TMP" "$FILE" 2>/dev/null; then
     if [ "$CHOSEN_ACTIONABLE" = "1" ]; then
       TRIGGERED=1

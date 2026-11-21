@@ -267,11 +267,13 @@ sid_owner_seed_pending() {
 # 0 = a request for this sid can be consumed this run. `manual=true` bypasses
 # loop/halted gates, exactly like the bridge. `user=true` (R2795) bypasses only
 # the loop-stop gate: a real user message that hit 429 must keep working even
-# when the Bot's auto-loop was stopped earlier. A per-session ⏹ halt still
-# blocks it. Shared by the request reader and the CI-side writer (R2780: an
-# earlier 429 on a stopped Bot must not starve an active Bot's switch).
+# when the Bot's auto-loop was stopped earlier. `continuation=true` (R2893)
+# gets the same loop-stop bypass for the in-flight rollover/recovery prompt
+# (its 429 is current work, not a stale synthetic turn). A per-session ⏹ halt
+# still blocks both. Shared by the request reader and the CI-side writer
+# (R2780: an earlier 429 on a stopped Bot must not starve an active Bot's switch).
 rollover_sid_actionable() {
-  local sid="$1" manual="${2:-false}" user="${3:-false}" id state
+  local sid="$1" manual="${2:-false}" user="${3:-false}" continuation="${4:-false}" id state
   [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
   _ro_have_jq || return 0 # no jq: keep the old conservative behavior
   # The bridge does not even read request files when the global switch is off.
@@ -288,9 +290,10 @@ rollover_sid_actionable() {
     if [ "$manual" = "true" ]; then
       return 0
     fi
-    # A real user turn may bypass the loop stop, but never a session halt.
+    # A real user turn or an in-flight continuation may bypass the loop stop,
+    # but never a session halt.
     _ro_bot_halted "$state" "$sid" && continue
-    if [ "$user" = "true" ] || ! _ro_bot_stopped "$id" "$state" "$sid"; then
+    if [ "$user" = "true" ] || [ "$continuation" = "true" ] || ! _ro_bot_stopped "$id" "$state" "$sid"; then
       return 0
     fi
   done < <(_ro_bot_states)
@@ -301,7 +304,7 @@ rollover_sid_actionable() {
 # 0 = the bridge can consume this request this run (so do not also resume the
 #     session), 1 = waiting/orphan/expired (so quota-tail recovery may proceed).
 rollover_request_actionable() {
-  local f="$1" ts now sid manual user
+  local f="$1" ts now sid manual user continuation
   [ -f "$f" ] || return 1
   _ro_have_jq || return 0 # no jq: keep the old conservative behavior
   # The bridge does not even read request files when the global switch is off.
@@ -317,7 +320,8 @@ rollover_request_actionable() {
   [[ "$sid" =~ ^ses_[A-Za-z0-9_-]+$ ]] || return 1
   manual=$(jq -r '.manual // false' "$f" 2>/dev/null || echo false)
   user=$(jq -r '.userInitiated // false' "$f" 2>/dev/null || echo false)
-  rollover_sid_actionable "$sid" "$manual" "$user"
+  continuation=$(jq -r '.continuation // false' "$f" 2>/dev/null || echo false)
+  rollover_sid_actionable "$sid" "$manual" "$user" "$continuation"
 }
 
 rollover_pending_for() {
