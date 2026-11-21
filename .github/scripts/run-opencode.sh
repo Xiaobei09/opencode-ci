@@ -209,23 +209,63 @@ fi
 # quota 429 (R2620: the first one ends the round); the job-level
 # timeout-minutes: 360 remains the hard safety cap.
 BUDGET="${BUDGET_SECONDS:-0}"
-# ── R2884: opt-in hot egress switch ───────────────────────────────────────
-# EGRESS_HOT_SWITCH=1 replaces "end this CI round -> relay -> select a new
-# egress" with "rotate the local proxy's upstream -> restart only the OpenCode
-# process in this same CI job". The proxy address, restored workspace and
-# session DB stay alive, so the switch costs seconds instead of the 2-3 minute
-# CI relay. Default 0 keeps the existing select-once-per-run model.
+# ── R2884/R2894: opt-in hot egress switch ────────────────────────────────
+# Hot mode replaces "end this CI round -> relay -> select a new egress" with
+# "rotate the local proxy's upstream -> restart only the OpenCode process in
+# this same CI job". The proxy address, restored workspace and session DB stay
+# alive, so the switch costs seconds instead of the 2-3 minute CI relay.
+#
+# R2894: the operator can toggle it from the Telegram menu. The bridge writes
+# $HOME/.config/opencode/egress-hot-switch.json (snapshotted with HOME across
+# runs). Precedence: menu preference (when the file exists) > repo variable
+# EGRESS_HOT_SWITCH=1 as the initial default > off. This supervisor re-reads
+# the preference at every decision, so a toggle applies to the next 429 or
+# manual /proxy next in the same run. EGRESS_HOT_SWITCH_RAW preserves the repo
+# variable across `exec` restarts so a menu "off" is not undone by re-exec.
 # Ownership: only this supervisor rotates. egress-watch.sh still only writes
 # the stop marker; the bridge only writes a manual request file.
-HOT_SWITCH_MODE="${EGRESS_HOT_SWITCH:-0}"
-case "$HOT_SWITCH_MODE" in
-  1|true|TRUE|yes|YES|on|ON) HOT_SWITCH_MODE=1 ;;
-  *) HOT_SWITCH_MODE=0 ;;
+HOT_SWITCH_ENV_RAW="${EGRESS_HOT_SWITCH_RAW:-${EGRESS_HOT_SWITCH:-}}"
+export EGRESS_HOT_SWITCH_RAW="$HOT_SWITCH_ENV_RAW"
+HOT_SWITCH_ENV_ON=0
+case "$HOT_SWITCH_ENV_RAW" in
+  1|true|TRUE|yes|YES|on|ON) HOT_SWITCH_ENV_ON=1 ;;
 esac
+HOT_SWITCH_PREF="$HOME/.config/opencode/egress-hot-switch.json"
+# A present preference file is authoritative even when it says "off": the menu
+# must be able to override EGRESS_HOT_SWITCH=1. Missing/corrupt = no preference.
+hot_switch_pref_mode() {
+  [ -s "$HOT_SWITCH_PREF" ] || { echo "none"; return 0; }
+  if grep -qE '"mode"[[:space:]]*:[[:space:]]*"on"' "$HOT_SWITCH_PREF" 2>/dev/null; then
+    echo "on"
+  elif grep -qE '"mode"[[:space:]]*:[[:space:]]*"off"' "$HOT_SWITCH_PREF" 2>/dev/null; then
+    echo "off"
+  else
+    echo "none"
+  fi
+}
 # Clean recovery and explicit per-round budgets are one-shot boundaries; do not
 # extend them with in-run restarts.
-if [ "${CI_RECOVERY:-0}" = "1" ]; then HOT_SWITCH_MODE=0; fi
-if [ "${BUDGET:-0}" -gt 0 ] 2>/dev/null; then HOT_SWITCH_MODE=0; fi
+HOT_SWITCH_HARD_OFF=0
+if [ "${CI_RECOVERY:-0}" = "1" ]; then HOT_SWITCH_HARD_OFF=1; fi
+if [ "${BUDGET:-0}" -gt 0 ] 2>/dev/null; then HOT_SWITCH_HARD_OFF=1; fi
+hot_switch_enabled() {
+  [ "$HOT_SWITCH_HARD_OFF" = "1" ] && return 1
+  case "$(hot_switch_pref_mode)" in
+    on) return 0 ;;
+    off) return 1 ;;
+  esac
+  [ "$HOT_SWITCH_ENV_ON" = "1" ]
+}
+hot_switch_source() {
+  if [ "$HOT_SWITCH_HARD_OFF" = "1" ]; then echo "hard-off"; return 0; fi
+  case "$(hot_switch_pref_mode)" in
+    on|off) echo "menu"; return 0 ;;
+  esac
+  [ "$HOT_SWITCH_ENV_ON" = "1" ] && { echo "repo-var"; return 0; }
+  echo "default"
+}
+HOT_SWITCH_MODE=0
+if hot_switch_enabled; then HOT_SWITCH_MODE=1; fi
 export EGRESS_HOT_SWITCH="$HOT_SWITCH_MODE"
 HOT_SWITCH_MAX="${EGRESS_HOT_SWITCH_MAX:-3}"
 case "$HOT_SWITCH_MAX" in ''|*[!0-9]*) HOT_SWITCH_MAX=3 ;; esac
@@ -237,9 +277,9 @@ case "$HOT_COUNT" in ''|*[!0-9]*) HOT_COUNT=0 ;; esac
 HOT_ATTEMPT="${RUN_OPENCODE_HOT_ATTEMPT:-0}"
 case "$HOT_ATTEMPT" in ''|*[!0-9]*) HOT_ATTEMPT=0 ;; esac
 if [ "$HOT_SWITCH_MODE" = "1" ]; then
-  echo "hot egress switch: enabled (attempt=$HOT_ATTEMPT/$HOT_SWITCH_MAX, timeout=${HOT_SWITCH_TIMEOUT}s)"
+  echo "hot egress switch: enabled (source=$(hot_switch_source), attempt=$HOT_ATTEMPT/$HOT_SWITCH_MAX, timeout=${HOT_SWITCH_TIMEOUT}s)"
 else
-  echo "hot egress switch: disabled (EGRESS_HOT_SWITCH=${EGRESS_HOT_SWITCH:-0}, budget=${BUDGET:-0}, recovery=${CI_RECOVERY:-0})"
+  echo "hot egress switch: disabled (source=$(hot_switch_source), EGRESS_HOT_SWITCH_RAW=${HOT_SWITCH_ENV_RAW:-0}, budget=${BUDGET:-0}, recovery=${CI_RECOVERY:-0})"
 fi
 SID=""
 # Option C receives the exact session this run opens, so it never
@@ -555,7 +595,9 @@ elif [ -f "$RUNNER_TEMP/round-end.json" ] \
      && grep -qiE 'quota|free[- ]limit|FreeUsageLimitError|provider\.free-limit' "$RUNNER_TEMP/round-end.json"; then
   hot_switch_reason="quota"
 fi
-if [ "$HOT_SWITCH_MODE" = "1" ] && [ -n "$hot_switch_reason" ] && [ "$HOT_COUNT" -lt "$HOT_SWITCH_MAX" ]; then
+HOT_SWITCH_EFFECTIVE=0
+if hot_switch_enabled; then HOT_SWITCH_EFFECTIVE=1; fi
+if [ "$HOT_SWITCH_EFFECTIVE" = "1" ] && [ -n "$hot_switch_reason" ] && [ "$HOT_COUNT" -lt "$HOT_SWITCH_MAX" ]; then
   say "hot switch: reason=$hot_switch_reason attempt=$((HOT_COUNT + 1))/$HOT_SWITCH_MAX; rotating egress without ending the CI round"
   # The watcher is the only other stop/blacklist writer. It already exited on a
   # quota stop; for a manual request it is still tailing, so stop it first.
@@ -613,11 +655,17 @@ if [ "$HOT_SWITCH_MODE" = "1" ] && [ -n "$hot_switch_reason" ] && [ "$HOT_COUNT"
     # treating a killed OpenCode process as a successful round.
     printf '%s\n' "manual egress hot switch failed (rc=$ROTATE_RC); ending this round so the next run re-selects an egress" > "$EGRESS_DIR/stop"
   fi
-elif [ "$HOT_SWITCH_MODE" = "1" ] && [ -n "$hot_switch_reason" ]; then
+elif [ "$HOT_SWITCH_EFFECTIVE" = "1" ] && [ -n "$hot_switch_reason" ]; then
   # Budget exhausted: the next run must select a fresh egress through the
   # normal relay path. A quota stop already carries its marker; a manual
   # request has none, so drop it and let the round end normally.
   say "hot switch: budget exhausted (count=$HOT_COUNT/$HOT_SWITCH_MAX, reason=$hot_switch_reason); falling back to the normal round-end/relay path"
+  rm -f "$EGRESS_DIR/hot-switch.request" 2>/dev/null || true
+elif [ "$HOT_SWITCH_EFFECTIVE" != "1" ] && [ -f "$EGRESS_DIR/hot-switch.request" ]; then
+  # R2894: the menu was toggled off after a manual request was written. Drop
+  # the stale request so the round ends through the normal path instead of
+  # silently rotating later.
+  say "hot switch: request ignored (mode disabled); ending this round normally"
   rm -f "$EGRESS_DIR/hot-switch.request" 2>/dev/null || true
 fi
 if [ -f "$EGRESS_DIR/stop" ]; then
@@ -770,7 +818,9 @@ fi
 section "egress watch"
 _hot_done=$(cat "$HOT_COUNT_FILE" 2>/dev/null || echo 0)
 case "$_hot_done" in ''|*[!0-9]*) _hot_done=0 ;; esac
-echo "hot switch: mode=$HOT_SWITCH_MODE count=$_hot_done/$HOT_SWITCH_MAX"
+_hot_effective=0
+if hot_switch_enabled; then _hot_effective=1; fi
+echo "hot switch: mode=$_hot_effective source=$(hot_switch_source) count=$_hot_done/$HOT_SWITCH_MAX"
 if [ -s "$EGRESS_DIR/hot-switch.log" ]; then
   echo "hot switch log (last 8):"
   tail -8 "$EGRESS_DIR/hot-switch.log" | redact | clip | sed 's/^/  /'
