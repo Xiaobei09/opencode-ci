@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# R2562 (operator): DEPRECATED for CI. The workflow selects the egress exactly
-# once in "Select egress proxy" and egress-watch.sh no longer calls this script.
-# Single-run rotation is intentionally disabled. This file is kept only for
-# manual diagnostics; do not wire it back into the workflow without an explicit
-# operator decision.
+# R2884 (operator: "增加一个模式让换出口代替ci重启"): hot-switch engine for
+# EGRESS_HOT_SWITCH=1. run-opencode.sh is the only caller: after a verified
+# quota 429 (or a manual /proxy next) it rotates the local proxy's upstream and
+# restarts only the OpenCode process inside the same CI run. The watcher still
+# never rotates (R2562); outside this mode the workflow still selects exactly
+# once per run. Do not wire this into egress-watch.sh.
 #
-# Move the local CONNECT proxy to the next candidate that passes the real
-# inference preflight with HTTP 200. The current candidate is skipped first, so
-# a quota-exhausted relay is not retried immediately.
+# Move the local CONNECT proxy to the next candidate that passes the preflight.
+# The current candidate is skipped first, so a quota-exhausted relay is not
+# retried immediately. With the default path preflight this spends no provider
+# message; set EGRESS_PREFLIGHT_MODE=zengate to use the real-OpenCode probe.
 #
-# Usage: egress-rotate.sh [--reason quota|transport|http]
+# Usage: egress-rotate.sh [--reason quota|manual|transport|http]
 #
 # The candidate list is produced by select-proxy.sh:
 #   <direct|relay|http>\t<target>\t<source>
@@ -29,6 +31,7 @@ REASON="${1:-quota}"
 case "$REASON" in
   quota)     TTL=1800 ;;  # 30m: anonymous free quota is IP-scoped; cool the limited IP down
   transport) TTL=1800 ;;  # 30m for dead relays
+  manual)    TTL=600 ;;   # operator asked to move; only failed candidates cool down
   *)         TTL=3600  ;;
 esac
 
@@ -38,13 +41,25 @@ mkdir -p "$EGRESS_STATE_DIR"
 [ -f "$EGRESS_CANDIDATES_FILE" ] || { echo "rotate: no candidate list"; exit 1; }
 
 PREFLIGHT_TMO="${EGRESS_PREFLIGHT_TIMEOUT:-20}"
-PROBE_ENGINE=curl
-if bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
-  PROBE_ENGINE=zengate
-  trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
-  echo "rotate: preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate)"
+# R2884: use the same preflight mode as the run's selection. The default
+# zero-message path probe is important here: a hot switch happens right after a
+# quota 429, and a real-inference probe on the new exit could spend the fresh
+# message and reproduce "probe 200, real turn 429".
+PROBE_ENGINE="${EGRESS_PREFLIGHT_MODE:-path}"
+case "$PROBE_ENGINE" in
+  path|zengate|curl) ;;
+  *) echo "rotate: warning: unknown EGRESS_PREFLIGHT_MODE=$PROBE_ENGINE; using path"; PROBE_ENGINE=path ;;
+esac
+if [ "$PROBE_ENGINE" = "zengate" ]; then
+  if bash "$SCRIPT_DIR/egress-probe-server.sh" start; then
+    trap 'bash "$SCRIPT_DIR/egress-probe-server.sh" stop' EXIT
+    echo "rotate: preflight engine=zengate model=$EGRESS_PROBE_MODEL (real OpenCode, fresh session per candidate)"
+  else
+    echo "rotate: warning: zengate probe unavailable; falling back to zero-message path preflight"
+    PROBE_ENGINE=path
+  fi
 else
-  echo "rotate: warning: zengate probe unavailable; falling back to curl preflight"
+  echo "rotate: preflight engine=$PROBE_ENGINE (path spends no provider message)"
 fi
 
 CUR_KIND=$(jq -r '.kind // "direct"' "$EGRESS_STATE_FILE" 2>/dev/null || echo direct)
@@ -66,6 +81,7 @@ esac
 # transport 失败仍走原有黑名单/全量候选预算。
 MAX_TRIES=${EGRESS_SELECT_MAX:-12}
 [ "$REASON" = "quota" ] && MAX_TRIES=${EGRESS_QUOTA_PROBE_MAX:-4}
+[ "$REASON" = "manual" ] && MAX_TRIES=${EGRESS_HOT_SWITCH_PROBE_MAX:-4}
 
 QUOTA_BLOCKED_FILE="$EGRESS_STATE_DIR/quota-blocked.txt"
 touch "$QUOTA_BLOCKED_FILE" 2>/dev/null || true
@@ -85,6 +101,8 @@ CUR_EGRESS=$(jq -r '.egress_ip // empty' "$EGRESS_STATE_FILE" 2>/dev/null || tru
 if [ "$REASON" = "quota" ]; then
   quota_block_add "$CUR_KEY"
   echo "rotate: quota is anonymous/IP-scoped; skipping $CUR_KEY for the rest of this run (run-scoped, not persistent)"
+elif [ "$REASON" = "manual" ]; then
+  echo "rotate: manual switch; current $CUR_KEY stays eligible (no blacklist)"
 else
   egress_bl_add "$CUR_KEY" "$CUR_EGRESS" "$REASON" "$TTL" || true
   if [ "$EGRESS_BLACKLIST_ENABLED" = "1" ]; then
@@ -129,21 +147,33 @@ while IFS=$'\t' read -r kind target source; do
   # rotations keep the full 48-candidate budget.
   [ "$tries" -gt "$MAX_TRIES" ] && { echo "rotate: candidate budget exhausted ($MAX_TRIES)"; break; }
 
-  if [ "$PROBE_ENGINE" = "zengate" ]; then
-    out=$(bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$([ "$kind" = direct ] && echo '' || echo "$target")" "$PREFLIGHT_TMO" 2>/dev/null || true)
+  preflight_target="$([ "$kind" = direct ] && echo '' || echo "$target")"
+  stable_egress=""
+  if [ "$PROBE_ENGINE" = "path" ]; then
+    _meta="$EGRESS_STATE_DIR/rotate-preflight.$$"
+    rm -f "$_meta"
+    _expected=""
+    [ "$DIRECT_IP" != "unknown" ] && _expected="$DIRECT_IP"
+    out=$(EGRESS_PREFLIGHT_META="$_meta" EGRESS_EXPECTED_IP="$_expected" \
+      bash "$SCRIPT_DIR/egress-preflight-path.sh" "$kind" "$preflight_target" "$PREFLIGHT_TMO" 2>/dev/null || true)
+    stable_egress=$(sed -n 's/^egress=//p' "$_meta" 2>/dev/null | tail -1)
+    rm -f "$_meta"
+  elif [ "$PROBE_ENGINE" = "zengate" ]; then
+    out=$(bash "$SCRIPT_DIR/egress-preflight-zengate.sh" "$kind" "$preflight_target" "$PREFLIGHT_TMO" 2>/dev/null || true)
   else
-    out=$(bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$([ "$kind" = direct ] && echo '' || echo "$target")" "$PREFLIGHT_TMO" 2>/dev/null || true)
+    out=$(bash "$SCRIPT_DIR/egress-preflight.sh" "$kind" "$preflight_target" "$PREFLIGHT_TMO" 2>/dev/null || true)
   fi
   code=${out%%$'\t'*}
   why=${out##*$'\t'}
   [ -n "$code" ] || code=000
   [ -n "$why" ] || why=transport
 
-  if [ "$code" = "200" ] && [ "$why" = "ok" ]; then
+  if [ "$code" = "200" ] && { [ "$why" = "ok" ] || [ "$why" = "path_ok" ]; }; then
     # R2551: 与 select-proxy 同一判据——relay 出口 IP 若轮换，preflight 的 200
     # 不能代表真实会话将使用的 IP，必须跳过，避免“200 后仍 429”。
-    stable_egress=""
-    if [ "$kind" = "relay" ] || [ "$kind" = "http" ]; then
+    # R2884: the path preflight already sampled 8 parallel traces and returned
+    # the stable IP; only the message-spending engines need the extra check.
+    if [ "$PROBE_ENGINE" != "path" ] && { [ "$kind" = "relay" ] || [ "$kind" = "http" ]; }; then
       if ! egress_trace_stable "$kind" "$target" 8 > "$EGRESS_STATE_DIR/stable-rotate.$$"; then
         echo "rotate: candidate $kind $target passed preflight but egress rotates (saw ${EGRESS_TRACE_SEEN:-?}); skipping: preflight cannot validate the IP the real session will use"
         other_fails=$((other_fails + 1))
@@ -154,15 +184,29 @@ while IFS=$'\t' read -r kind target source; do
       stable_egress=$(cat "$EGRESS_STATE_DIR/stable-rotate.$$")
       rm -f "$EGRESS_STATE_DIR/stable-rotate.$$"
     fi
-    egress_write_upstream "$up"
+    if ! egress_write_upstream "$up"; then
+      echo "rotate: failed to write $EGRESS_UPSTREAM_FILE; keeping $CUR_UP"
+      exit 1
+    fi
     case "$kind" in
-      direct) egress="$DIRECT_IP" ;;
+      # The path preflight observed the live runner IP; prefer it over a stale
+      # or unknown direct_ip from the previous state file.
+      direct)
+        [ -n "$stable_egress" ] && DIRECT_IP="$stable_egress"
+        egress="$DIRECT_IP"
+        ;;
       relay|http) egress="$stable_egress" ;;
     esac
     [ -n "$egress" ] || egress="unknown"
-    egress_write_state "$kind" "$up" "$egress" "$source" "$DIRECT_IP" "zengate"
+    if ! egress_write_state "$kind" "$up" "$egress" "$source" "$DIRECT_IP" "$PROBE_ENGINE"; then
+      # The proxy is already on the new upstream; restore the old one so a
+      # half-written switch cannot leave the run with a state/upstream mismatch.
+      echo "rotate: failed to write $EGRESS_STATE_FILE; restoring $CUR_UP and refusing switch"
+      egress_write_upstream "$CUR_UP" || true
+      exit 1
+    fi
     egress_bl_del "$key"
-    echo "rotate: switched to $kind $target egress=$egress (source=$source$( [ -n "$stable_egress" ] && echo ', egress sticky over 8 parallel traces' ))"
+    echo "rotate: switched to $kind $target egress=$egress (source=$source preflight=$PROBE_ENGINE$( [ -n "$stable_egress" ] && echo ', egress sticky over 8 parallel traces' ))"
     exit 0
   fi
 
@@ -188,12 +232,20 @@ while IFS=$'\t' read -r kind target source; do
 done < "$EGRESS_CANDIDATES_FILE"
 
 # No alternative passed. The egress we were already using is still the best
-# choice we have, so undo its persistent blacklist entry instead of leaving the
-# runner with no usable route. Quota failures are anonymous/IP-scoped: the
-# run-scoped quota-blocked list keeps the exhausted IPs out of the next
-# rotation this run, and a new run starts with a fresh list + fresh selection.
-egress_bl_del "$CUR_KEY"
-echo "rotate: no candidate passed the preflight; keeping current egress and unblacklisting $CUR_KEY (quota_fails=$quota_fails other_fails=$other_fails skipped_quota=$skipped_quota)"
+# choice we have, so keep it. A quota switch must NOT undo the persistent
+# blacklist that egress-watch.sh / the gateway preflight already wrote: the
+# supervisor is about to fall back to the relay path, and the next run must not
+# immediately re-select the exhausted exit. A manual switch changes nothing
+# about the current exit's blacklist state. Only transport/http rotation (the
+# old diagnostic path) unblacklists the current entry to avoid no route.
+if [ "$REASON" = "quota" ]; then
+  echo "rotate: no candidate passed the preflight; keeping current egress $CUR_KEY (quota-blocked for the next run; quota_fails=$quota_fails other_fails=$other_fails skipped_quota=$skipped_quota)"
+elif [ "$REASON" = "manual" ]; then
+  echo "rotate: no candidate passed the preflight; keeping current egress $CUR_KEY (manual switch; blacklist unchanged; other_fails=$other_fails skipped_quota=$skipped_quota)"
+else
+  egress_bl_del "$CUR_KEY"
+  echo "rotate: no candidate passed the preflight; keeping current egress and unblacklisting $CUR_KEY (quota_fails=$quota_fails other_fails=$other_fails skipped_quota=$skipped_quota)"
+fi
 echo "rotate: quota-blocked this run: $(paste -sd, "$QUOTA_BLOCKED_FILE" 2>/dev/null || echo none)"
 echo "rotate: unstable-egress this run: $(paste -sd, "$UNSTABLE_BLOCKED_FILE" 2>/dev/null || echo none)"
 if [ "$quota_fails" -gt 0 ] && [ "$other_fails" -eq 0 ]; then

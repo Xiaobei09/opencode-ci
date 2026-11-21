@@ -53,7 +53,15 @@ PLUGIN_LOG="${3:-${AC_TAP_PATH:-/tmp/opencode/v2plugin.log}}"
 mkdir -p "$EGRESS_STATE_DIR"
 WATCH_LOG="$EGRESS_STATE_DIR/watch.log"
 STOP_FILE="$EGRESS_STATE_DIR/stop"
-: > "$WATCH_LOG"
+# R2884: a hot egress switch restarts only the OpenCode process; keep the
+# previous attempts' watch evidence instead of truncating it. The new watcher
+# starts tailing at EOF (EGRESS_WATCH_TAIL_FROM_END=1) so old quota lines are
+# not re-processed and cannot stop the fresh attempt.
+if [ "${EGRESS_WATCH_APPEND:-0}" = "1" ]; then
+  : >> "$WATCH_LOG"
+else
+  : > "$WATCH_LOG"
+fi
 rm -f "$STOP_FILE"
 
 # The blacklist is persisted under $HOME/.config/opencode and restored across
@@ -143,7 +151,7 @@ if [ "$CUR_UP" = "?" ] && [ -n "$selected_kind" ]; then
       ;;
   esac
 fi
-log "watch start run_log=$LOG proxy_log=$PROXY_LOG plugin_log=$PLUGIN_LOG upstream=$CUR_UP selected_at=$selected_at preflight=$selected_preflight mode=select-once"
+log "watch start run_log=$LOG proxy_log=$PROXY_LOG plugin_log=$PLUGIN_LOG upstream=$CUR_UP selected_at=$selected_at preflight=$selected_preflight mode=select-once hot=${EGRESS_HOT_SWITCH:-0} tail_from_end=${EGRESS_WATCH_TAIL_FROM_END:-0}"
 
 while [ ! -f "$LOG" ]; do sleep 1; done
 # The proxy is started immediately before this watcher, but make tail tolerant
@@ -558,6 +566,14 @@ handle_quota() {
 RECHECK_SECONDS="${EGRESS_WATCH_RECHECK_SECONDS:-300}"
 last_path_check=$(egress_now)
 
+# R2884: a hot restart must not replay the previous attempt's quota lines.
+# The default keeps the historical from-start behavior; the hot supervisor sets
+# EGRESS_WATCH_TAIL_FROM_END=1 so the new watcher starts at EOF.
+TAIL_ARGS=(-q -n +1 -F)
+if [ "${EGRESS_WATCH_TAIL_FROM_END:-0}" = "1" ]; then
+  TAIL_ARGS=(-q -n 0 -F)
+fi
+
 while IFS= read -r line; do
   now=$(egress_now)
   if [ "${EGRESS_WATCH_SKIP_EGRESS_PROBE:-0}" != "1" ] \
@@ -623,6 +639,6 @@ while IFS= read -r line; do
       log "provider tunnel closed (${line:0:220})"
       ;;
   esac
-done < <(tail -q -n +1 -F -- "$PROXY_LOG" "$PLUGIN_LOG" 2>/dev/null)
+done < <(tail "${TAIL_ARGS[@]}" -- "$PROXY_LOG" "$PLUGIN_LOG" 2>/dev/null)
 
 log "watch end"

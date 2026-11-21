@@ -318,6 +318,10 @@ jobs:
           BUDGET_SECONDS: ${{ github.event.inputs.recovery == 'true' && (github.event.inputs.budget_seconds != '0' && github.event.inputs.budget_seconds || '1800') || inputs.budget_seconds }}
           EGRESS_BLACKLIST_ENABLED: "1"
           EGRESS_PREFLIGHT_TIMEOUT: "20"
+          # R2884: the hot-switch rotation in run-opencode.sh must use the same
+          # preflight mode as the run's initial selection. Default path spends
+          # no provider message; zengate is the opt-in real-inference probe.
+          EGRESS_PREFLIGHT_MODE: ${{ vars.EGRESS_PREFLIGHT_MODE || 'path' }}
           # Option C: one-shot resume after a CI restart, independent of the
           # auto-continue loop. Default on; set repository variable
           # CI_RESUME_ONCE=0 to disable. RESUME_ONCE_FORCE=1 lets it run even
@@ -332,6 +336,15 @@ jobs:
           # CURRENT egress (a fresh alternate always has quota and says
           # nothing). Diagnostic only; set the repo variable to 0 to skip.
           EGRESS_QUOTA_PROBE: ${{ vars.EGRESS_QUOTA_PROBE || '1' }}
+          # R2884 (operator: "增加一个模式让换出口代替ci重启"): opt-in hot
+          # egress switch. 1 = on a verified quota 429 (or /proxy next) rotate
+          # the local proxy upstream and restart only the OpenCode process in
+          # this same CI job; the workspace/session DB and proxy stay alive.
+          # 0 = the existing end-round + relay selection. A failed rotation or
+          # EGRESS_HOT_SWITCH_MAX (default 3) falls back to the relay path.
+          EGRESS_HOT_SWITCH: ${{ vars.EGRESS_HOT_SWITCH || '0' }}
+          EGRESS_HOT_SWITCH_MAX: ${{ vars.EGRESS_HOT_SWITCH_MAX || '3' }}
+          EGRESS_HOT_SWITCH_TIMEOUT: ${{ vars.EGRESS_HOT_SWITCH_TIMEOUT || '180' }}
           # R2634: when the 429 re-probe returns 200, the watcher writes a fork
           # request. The bot bridge owning that session forks it, remaps the
           # bot's ID to the new session, and sends one notice. Full history is

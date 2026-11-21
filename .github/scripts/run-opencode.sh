@@ -46,15 +46,25 @@ say() { printf '%s\n' "$*" | redact; }
 # R2576 (D9): stamp the OpenCode phase so the snapshot step can report
 # the real non-opencode wall time (setup + post-run) instead of only
 # the setup half. OPENCODE_START_T0 is the boundary between the two.
-echo "OPENCODE_START_T0=$(date +%s)" >> "$GITHUB_ENV"
+# R2884: a hot egress switch re-execs this script inside the same CI run;
+# the stamp must describe the CI run, not the last process restart.
+if [ "${RUN_OPENCODE_HOT_ATTEMPT:-0}" = "0" ]; then
+  echo "OPENCODE_START_T0=$(date +%s)" >> "$GITHUB_ENV"
+fi
 RUN_LOG="$RUNNER_TEMP/opencode-run.log"
 EGRESS_DIR="${EGRESS_STATE_DIR:-$RUNNER_TEMP/egress}"
 export EGRESS_STATE_DIR="$EGRESS_DIR"
 export EGRESS_LOCAL_PORT="${EGRESS_LOCAL_PORT:-8089}"
 mkdir -p "$EGRESS_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROXY_PID=""
 WATCH_PID=""
 HOT_RELOAD_PID=""
+# R2884: the repo->live hot-reload watcher is independent of the OpenCode
+# process; adopt it across a hot restart instead of starting a second one.
+if [ -n "${EGRESS_HOT_RELOAD_PID:-}" ] && kill -0 "$EGRESS_HOT_RELOAD_PID" 2>/dev/null; then
+  HOT_RELOAD_PID="$EGRESS_HOT_RELOAD_PID"
+fi
 PROXY_READY=0
 cleanup_egress() {
   # R2824: stop the repo->live hot-reload watcher before the egress helpers;
@@ -100,21 +110,57 @@ if [ ! -s "$EGRESS_DIR/upstream" ]; then
   echo "::error::egress upstream $EGRESS_DIR/upstream is missing; refusing to start OpenCode without a verified egress (no direct fallback)"
   exit 1
 fi
-python3 "$GITHUB_WORKSPACE/.github/scripts/egress-proxy.py" \
-  > "$EGRESS_DIR/proxy.log" 2>&1 &
-PROXY_PID=$!
-for _ in $(seq 1 12); do
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then break; fi
-  if curl -sS -m 4 -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
-       -o /dev/null https://opencode.ai/cdn-cgi/trace 2>/dev/null; then
-    PROXY_READY=1
-    break
+proxy_healthy() {
+  curl -sS -m 4 -x "http://127.0.0.1:${EGRESS_LOCAL_PORT}" \
+    -o /dev/null https://opencode.ai/cdn-cgi/trace 2>/dev/null
+}
+start_proxy() {
+  python3 "$SCRIPT_DIR/egress-proxy.py" \
+    > "$EGRESS_DIR/proxy.log" 2>&1 &
+  PROXY_PID=$!
+  for _ in $(seq 1 12); do
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then break; fi
+    if proxy_healthy; then
+      PROXY_READY=1
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+# R2884: on a hot restart the proxy (and its hot-swappable upstream) must
+# survive. Adopt the pid passed by the previous instance instead of starting a
+# second listener on the same port; the upstream file, not the proxy address,
+# is what changes.
+PROXY_PID="${EGRESS_PROXY_PID:-}"
+if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+  echo "egress proxy: adopting pid=$PROXY_PID across hot restart"
+  for _ in $(seq 1 12); do
+    if proxy_healthy; then PROXY_READY=1; break; fi
+    sleep 0.25
+  done
+  if [ "$PROXY_READY" != 1 ]; then
+    echo "::warning::adopted egress proxy pid=$PROXY_PID is not healthy; restarting it"
+    kill "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+    PROXY_PID=""
   fi
-  sleep 0.25
-done
+else
+  PROXY_PID=""
+fi
+if [ "$PROXY_READY" != 1 ]; then
+  start_proxy || true
+fi
 if [ "$PROXY_READY" = 1 ]; then
+  export EGRESS_PROXY_PID="$PROXY_PID"
+  # R2884: a previous attempt's watcher was stopped before rotation. The new
+  # watcher must not replay the old attempt's quota lines.
+  if [ "${RUN_OPENCODE_HOT_ATTEMPT:-0}" -gt 0 ] 2>/dev/null; then
+    export EGRESS_WATCH_TAIL_FROM_END=1
+    export EGRESS_WATCH_APPEND=1
+  fi
   echo "egress proxy: ${HTTPS_PROXY:-none} kind=$(jq -r '.kind // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null) upstream=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?') egress=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)"
-  bash "$GITHUB_WORKSPACE/.github/scripts/egress-watch.sh" "$RUN_LOG" \
+  bash "$SCRIPT_DIR/egress-watch.sh" "$RUN_LOG" \
     >> "$EGRESS_DIR/watch.log" 2>&1 &
   WATCH_PID=$!
   # R2575 (D8): a watcher that dies at startup leaves the round with
@@ -142,8 +188,12 @@ fi
 # It also disables resume-once and the rolling env-sync: recovery is a one-shot
 # clean room and the workflow must not save this session.
 if [ "${CI_RECOVERY:-0}" = "1" ]; then
-  section "clean recovery prep"
-  bash "$GITHUB_WORKSPACE/.github/scripts/prepare-recovery.sh"
+  # R2884: clean recovery is a one-shot room; hot switch is disabled for it.
+  # Guard the destructive prep anyway in case a future re-exec slips through.
+  if [ "${RUN_OPENCODE_HOT_ATTEMPT:-0}" = "0" ]; then
+    section "clean recovery prep"
+    bash "$SCRIPT_DIR/prepare-recovery.sh"
+  fi
   export CI_RESUME_ONCE=0
   export RESUME_ONCE_SIDS=""
   export ENV_SYNC_SCRIPT=/nonexistent
@@ -159,6 +209,38 @@ fi
 # quota 429 (R2620: the first one ends the round); the job-level
 # timeout-minutes: 360 remains the hard safety cap.
 BUDGET="${BUDGET_SECONDS:-0}"
+# ── R2884: opt-in hot egress switch ───────────────────────────────────────
+# EGRESS_HOT_SWITCH=1 replaces "end this CI round -> relay -> select a new
+# egress" with "rotate the local proxy's upstream -> restart only the OpenCode
+# process in this same CI job". The proxy address, restored workspace and
+# session DB stay alive, so the switch costs seconds instead of the 2-3 minute
+# CI relay. Default 0 keeps the existing select-once-per-run model.
+# Ownership: only this supervisor rotates. egress-watch.sh still only writes
+# the stop marker; the bridge only writes a manual request file.
+HOT_SWITCH_MODE="${EGRESS_HOT_SWITCH:-0}"
+case "$HOT_SWITCH_MODE" in
+  1|true|TRUE|yes|YES|on|ON) HOT_SWITCH_MODE=1 ;;
+  *) HOT_SWITCH_MODE=0 ;;
+esac
+# Clean recovery and explicit per-round budgets are one-shot boundaries; do not
+# extend them with in-run restarts.
+if [ "${CI_RECOVERY:-0}" = "1" ]; then HOT_SWITCH_MODE=0; fi
+if [ "${BUDGET:-0}" -gt 0 ] 2>/dev/null; then HOT_SWITCH_MODE=0; fi
+export EGRESS_HOT_SWITCH="$HOT_SWITCH_MODE"
+HOT_SWITCH_MAX="${EGRESS_HOT_SWITCH_MAX:-3}"
+case "$HOT_SWITCH_MAX" in ''|*[!0-9]*) HOT_SWITCH_MAX=3 ;; esac
+HOT_SWITCH_TIMEOUT="${EGRESS_HOT_SWITCH_TIMEOUT:-180}"
+case "$HOT_SWITCH_TIMEOUT" in ''|*[!0-9]*) HOT_SWITCH_TIMEOUT=180 ;; esac
+HOT_COUNT_FILE="$EGRESS_DIR/hot-switch.count"
+HOT_COUNT=$(cat "$HOT_COUNT_FILE" 2>/dev/null || echo 0)
+case "$HOT_COUNT" in ''|*[!0-9]*) HOT_COUNT=0 ;; esac
+HOT_ATTEMPT="${RUN_OPENCODE_HOT_ATTEMPT:-0}"
+case "$HOT_ATTEMPT" in ''|*[!0-9]*) HOT_ATTEMPT=0 ;; esac
+if [ "$HOT_SWITCH_MODE" = "1" ]; then
+  echo "hot egress switch: enabled (attempt=$HOT_ATTEMPT/$HOT_SWITCH_MAX, timeout=${HOT_SWITCH_TIMEOUT}s)"
+else
+  echo "hot egress switch: disabled (EGRESS_HOT_SWITCH=${EGRESS_HOT_SWITCH:-0}, budget=${BUDGET:-0}, recovery=${CI_RECOVERY:-0})"
+fi
 SID=""
 # Option C receives the exact session this run opens, so it never
 # guesses a different front/pinned target from restored state.
@@ -429,7 +511,10 @@ else
   # 下一次修正会再次同步并自愈。只监听仓库，hotreload.sh 写运行态，不会回环。
   if [ "${HOT_RELOAD_WATCH:-1}" != "0" ] && command -v node >/dev/null 2>&1; then
     _hr_repo="${SESSIONS_DIR:-/home/runner/work/sessions}/opencode/config"
-    if [ -f "$_hr_repo/scripts/hot-reload-watch.mjs" ]; then
+    if [ -n "${HOT_RELOAD_PID:-}" ] && kill -0 "$HOT_RELOAD_PID" 2>/dev/null; then
+      # R2884: keep the repo->live watcher alive across a hot restart.
+      echo "hot reload watcher adopted: pid=$HOT_RELOAD_PID repo=$_hr_repo"
+    elif [ -f "$_hr_repo/scripts/hot-reload-watch.mjs" ]; then
       HOT_RELOAD_LOG="$RUNNER_TEMP/hot-reload-watch.log" \
       HOT_RELOAD_ECHO=0 \
       HOT_RELOAD_SYNC_ON_START="${HOT_RELOAD_SYNC_ON_START:-0}" \
@@ -443,14 +528,97 @@ else
   else
     echo "hot reload watcher disabled (HOT_RELOAD_WATCH=${HOT_RELOAD_WATCH:-1}, node=$(command -v node >/dev/null 2>&1 && echo yes || echo no))"
   fi
+  export EGRESS_HOT_RELOAD_PID="${HOT_RELOAD_PID:-}"
   if [ "${BUDGET:-0}" -gt 0 ] 2>/dev/null; then
     # Explicit operator budget only; the default is 0 (no timeout).
     TERM=xterm-256color timeout --signal=TERM --kill-after=30s "$BUDGET" \
-      opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
+      opencode "${ARGS[@]}" --print-logs </dev/null >>"$RUN_LOG" 2>&1
   else
-    TERM=xterm-256color opencode "${ARGS[@]}" --print-logs </dev/null >"$RUN_LOG" 2>&1
+    TERM=xterm-256color opencode "${ARGS[@]}" --print-logs </dev/null >>"$RUN_LOG" 2>&1
   fi
   RC=$?
+fi
+# ── R2884: hot egress switch ─────────────────────────────────────────────
+# Triggered by (a) a verified quota stop from egress-watch.sh / the zero-message
+# gateway preflight, or (b) a manual /proxy next request written by the bridge.
+# Rotate the local proxy's upstream, then re-exec this same step. The proxy,
+# workspace and session DB survive; only the OpenCode process restarts. Any
+# failure or budget exhaustion falls through to the existing round-end/relay
+# path, so the mode can only replace restarts, never remove the fallback.
+hot_switch_reason=""
+if [ -f "$EGRESS_DIR/hot-switch.request" ]; then
+  hot_switch_reason="manual"
+elif [ -f "$EGRESS_DIR/stop" ] \
+     && grep -qiE 'quota|free[- ]limit|FreeUsageLimitError|provider\.free-limit' "$EGRESS_DIR/stop"; then
+  hot_switch_reason="quota"
+elif [ -f "$RUNNER_TEMP/round-end.json" ] \
+     && grep -qiE 'quota|free[- ]limit|FreeUsageLimitError|provider\.free-limit' "$RUNNER_TEMP/round-end.json"; then
+  hot_switch_reason="quota"
+fi
+if [ "$HOT_SWITCH_MODE" = "1" ] && [ -n "$hot_switch_reason" ] && [ "$HOT_COUNT" -lt "$HOT_SWITCH_MAX" ]; then
+  say "hot switch: reason=$hot_switch_reason attempt=$((HOT_COUNT + 1))/$HOT_SWITCH_MAX; rotating egress without ending the CI round"
+  # The watcher is the only other stop/blacklist writer. It already exited on a
+  # quota stop; for a manual request it is still tailing, so stop it first.
+  # Kill its `tail -F` child too, otherwise it lingers until the next log line.
+  if [ -n "${WATCH_PID:-}" ]; then
+    pkill -TERM -P "$WATCH_PID" 2>/dev/null || true
+    kill "$WATCH_PID" 2>/dev/null || true
+    wait "$WATCH_PID" 2>/dev/null || true
+    WATCH_PID=""
+  fi
+  OLD_UP=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?')
+  ROTATE_SH="$SCRIPT_DIR/egress-rotate.sh"
+  [ -f "$ROTATE_SH" ] || ROTATE_SH="$GITHUB_WORKSPACE/.github/scripts/egress-rotate.sh"
+  ROTATE_RC=1
+  if [ -f "$ROTATE_SH" ]; then
+    timeout "${HOT_SWITCH_TIMEOUT}s" bash "$ROTATE_SH" --reason "$hot_switch_reason" \
+      >> "$EGRESS_DIR/hot-switch.log" 2>&1
+    ROTATE_RC=$?
+  else
+    echo "::warning::hot switch: rotation script not found ($ROTATE_SH)"
+  fi
+  NEW_UP=$(cat "$EGRESS_DIR/upstream" 2>/dev/null || echo '?')
+  if [ "$ROTATE_RC" -eq 0 ] && [ "$NEW_UP" != "?" ] && [ "$NEW_UP" != "$OLD_UP" ]; then
+    HOT_COUNT=$((HOT_COUNT + 1))
+    printf '%s\n' "$HOT_COUNT" > "$HOT_COUNT_FILE"
+    # Preserve this CI run's healthy-turn count across process restarts. The
+    # plugin overwrites round-200-count per process; sum the attempts here.
+    if [ -f "$RUNNER_TEMP/round-200-count" ]; then
+      _hot_n=$(tr -cd '0-9' < "$RUNNER_TEMP/round-200-count" 2>/dev/null | head -c 9)
+      case "$_hot_n" in ''|*[!0-9]*) _hot_n=0 ;; esac
+      HOT_200_BASE=$(( ${HOT_200_BASE:-0} + _hot_n ))
+      export HOT_200_BASE
+      # Reset the per-process file so a second switch before the restarted
+      # plugin writes it cannot count the same healthy turns twice.
+      printf '0\n' > "$RUNNER_TEMP/round-200-count" 2>/dev/null || true
+    fi
+    rm -f "$EGRESS_DIR/stop" "$EGRESS_DIR/hot-switch.request" \
+          "$EGRESS_DIR/quota-probe.meta" "$RUNNER_TEMP/round-end.json" 2>/dev/null || true
+    export EGRESS_PROXY_PID="$PROXY_PID"
+    export EGRESS_HOT_RELOAD_PID="${HOT_RELOAD_PID:-}"
+    export RUN_OPENCODE_HOT_ATTEMPT="$HOT_COUNT"
+    export EGRESS_WATCH_TAIL_FROM_END=1
+    export EGRESS_WATCH_APPEND=1
+    # The restarted process sees a pre-boot quota tail on a NEW egress. This is
+    # exactly what resume-once's quota-recover gate needs to finish the turn.
+    export RESUME_ONCE_QUOTA_RECOVER=1
+    say "hot switch: $OLD_UP -> $NEW_UP (kind=$(jq -r '.kind // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null) egress=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)); restarting OpenCode in this CI run (no relay)"
+    exec bash "${BASH_SOURCE[0]}" "$@"
+  fi
+  say "hot switch: rotation did not produce a new egress (rc=$ROTATE_RC, old=$OLD_UP, new=$NEW_UP); falling back to the normal round-end/relay path"
+  rm -f "$EGRESS_DIR/hot-switch.request" 2>/dev/null || true
+  if [ "$hot_switch_reason" = "manual" ]; then
+    # A manual switch has no quota stop marker to relay; write one so the
+    # workflow starts a fresh run (and selects a new egress) instead of
+    # treating a killed OpenCode process as a successful round.
+    printf '%s\n' "manual egress hot switch failed (rc=$ROTATE_RC); ending this round so the next run re-selects an egress" > "$EGRESS_DIR/stop"
+  fi
+elif [ "$HOT_SWITCH_MODE" = "1" ] && [ -n "$hot_switch_reason" ]; then
+  # Budget exhausted: the next run must select a fresh egress through the
+  # normal relay path. A quota stop already carries its marker; a manual
+  # request has none, so drop it and let the round end normally.
+  say "hot switch: budget exhausted (count=$HOT_COUNT/$HOT_SWITCH_MAX, reason=$hot_switch_reason); falling back to the normal round-end/relay path"
+  rm -f "$EGRESS_DIR/hot-switch.request" 2>/dev/null || true
 fi
 if [ -f "$EGRESS_DIR/stop" ]; then
   STOP_REASON=$(tr '\n' ' ' < "$EGRESS_DIR/stop" 2>/dev/null | cut -c1-300)
@@ -514,6 +682,17 @@ if [ "${EGRESS_QUOTA_PROBE:-1}" != "0" ] \
   echo "post-stop fallback (live probe did not run)"
   EGRESS_QUOTA_PROBE=1 bash "$GITHUB_WORKSPACE/.github/scripts/egress-quota-probe.sh" \
     2>&1 | tee "$EGRESS_DIR/quota-probe.log" || true
+fi
+# R2884: add healthy turns from attempts that were hot-restarted. Without this
+# the egress-only valve would see only the final attempt's count and could
+# pause a loop that actually produced plenty of healthy turns this CI run.
+if [ "${HOT_200_BASE:-0}" -gt 0 ] 2>/dev/null; then
+  _hot_n=0
+  if [ -f "$RUNNER_TEMP/round-200-count" ]; then
+    _hot_n=$(tr -cd '0-9' < "$RUNNER_TEMP/round-200-count" 2>/dev/null | head -c 9)
+    case "$_hot_n" in ''|*[!0-9]*) _hot_n=0 ;; esac
+  fi
+  printf '%s\n' $((_hot_n + HOT_200_BASE)) > "$RUNNER_TEMP/round-200-count"
 fi
 section "opencode result"
 echo "exit=$RC lines=$(wc -l < "$RUN_LOG" 2>/dev/null || echo 0)"
@@ -589,6 +768,13 @@ else
   echo "no proxy log"
 fi
 section "egress watch"
+_hot_done=$(cat "$HOT_COUNT_FILE" 2>/dev/null || echo 0)
+case "$_hot_done" in ''|*[!0-9]*) _hot_done=0 ;; esac
+echo "hot switch: mode=$HOT_SWITCH_MODE count=$_hot_done/$HOT_SWITCH_MAX"
+if [ -s "$EGRESS_DIR/hot-switch.log" ]; then
+  echo "hot switch log (last 8):"
+  tail -8 "$EGRESS_DIR/hot-switch.log" | redact | clip | sed 's/^/  /'
+fi
 if [ -s "$EGRESS_DIR/watch.log" ]; then
   # R2562：watcher 不再轮换；诊断单轮内的连续失败与停止原因。
   # R2588（D8）：last-40 里常混着“quota-like line ignoring”噪声，先给
