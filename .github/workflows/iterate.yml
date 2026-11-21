@@ -956,17 +956,15 @@ jobs:
           # R2864 (operator: "改为直接发卡"): every quota round must send a NEW
           # Telegram card. R2840 edited the first card in place, but Telegram
           # edits do not push a notification, so the operator only saw the first
-          # 429 of a window and nothing after that. The window count is still
-          # kept for the "同一额度窗口第 N 轮" label; a ±45min tolerance covers
-          # retry_after jitter while a genuinely new reset window still starts a
-          # fresh count.
+          # 429 of a window and nothing after that. A ±45min tolerance still
+          # keeps the reset hint stable across retry_after jitter.
+          # R2888 (operator: "删除所有同一额度窗口第 n 轮 提示"): the round
+          # count label is removed; only the stable reset time remains.
           quota_round=false
           if [ "$egress_retry" = "true" ] \
              || printf '%s' "$reason" | grep -qaiE 'quota 429|FreeUsageLimit|free usage limit'; then
             quota_round=true
           fi
-          same_window=false
-          window_count=1
           card_window_reset=""
           if [ "$quota_round" = "true" ] && [ -n "$reset_epoch" ] && [ "$reset_epoch" -gt 0 ] 2>/dev/null; then
             stored_reset=$(gh variable get CI_QUOTA_CARD_RESET --repo "$repo" 2>/dev/null || true)
@@ -974,11 +972,7 @@ jobs:
               drift=$(( reset_epoch - stored_reset ))
               [ "$drift" -lt 0 ] && drift=$(( -drift ))
               if [ "$drift" -le 2700 ]; then
-                same_window=true
                 card_window_reset="$stored_reset"
-                stored_count=$(gh variable get CI_QUOTA_CARD_COUNT --repo "$repo" 2>/dev/null || true)
-                case "$stored_count" in ''|*[!0-9]*) stored_count=0 ;; esac
-                window_count=$(( stored_count + 1 ))
                 # Keep the first card's reset hint for the whole window so
                 # every card shows one stable timestamp, not a moving one.
                 reset_epoch="$stored_reset"
@@ -1005,7 +999,6 @@ jobs:
             # R2620: every quota 429 ends its round. Do not claim the bucket is
             # keyed by exit IP: fresh runner IPs still hit the same wall.
             reason="配额 429（免费额度耗尽）· 第 ${egress_n} 次${reset_hint:+ · 预计 ${reset_hint} 重置}"
-            [ "$same_window" = "true" ] && reason="${reason} · 同一额度窗口第 ${window_count} 轮"
           elif [ "$restore_failed" = "true" ]; then
             reason="环境还原失败，已跳过 OpenCode"
           elif [ "$select_failed" = "true" ]; then
@@ -1015,7 +1008,6 @@ jobs:
             # >=10 healthy turns is not egress-only). Show the same friendly
             # cause as the egress-only branch instead of raw watcher prose.
             reason="配额 429（免费额度耗尽）${reset_hint:+ · 预计 ${reset_hint} 重置}"
-            [ "$same_window" = "true" ] && reason="${reason} · 同一额度窗口第 ${window_count} 轮"
           elif [ "$watcher" = "true" ]; then
             [ -n "$reason" ] || reason="watcher 结束本轮（未提供原因）"
             reason="watcher：${reason}"
@@ -1117,7 +1109,7 @@ jobs:
           if [ "$quota_round" = "true" ] || [ "${R2651_QUOTA_EVIDENCE:-}" = "true" ]; then notify_class="quota"; fi
           sent_bot=""
           sent_msg=""
-          # R2864: always send a new card. The window count above is the only
+          # R2864: always send a new card. The reset anchor above is the only
           # cross-round state; no message is edited in place.
           send_out=$(printf '%s' "$text" \
             | TG_NOTIFY_CLASS="$notify_class" \
@@ -1132,8 +1124,6 @@ jobs:
              && [ -n "$sent_bot" ] && [ -n "$sent_msg" ]; then
             gh variable set CI_QUOTA_CARD_RESET --body "$card_window_reset" --repo "$repo" >/dev/null 2>&1 \
               || echo "::warning::could not persist CI_QUOTA_CARD_RESET=$card_window_reset"
-            gh variable set CI_QUOTA_CARD_COUNT --body "$window_count" --repo "$repo" >/dev/null 2>&1 \
-              || echo "::warning::could not persist CI_QUOTA_CARD_COUNT=$window_count"
           fi
           # R2861: persist the card target + text for the relayed successor.
           # It edits this card from "本轮结束 · 接力中" to "上一轮结束" once the
