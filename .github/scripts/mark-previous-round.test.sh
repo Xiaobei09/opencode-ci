@@ -3,7 +3,7 @@
 #
 # The successor edits the finishing run's round-end card from
 # "🔄 CI 本轮结束 · 接力中" to:
-#   🌐 relay · run <prev> → <current>
+#   🌐 <selected egress>          (R2895: promoted from the card tail)
 #   🔄 CI 上一轮结束 · <reason>
 #   <rest>
 # A fake gh + fake tg-notify keep this fast and network-free.
@@ -84,8 +84,12 @@ run_mark() {
 run_mark
 rc=$?
 ck "R2861: 正常编辑退出 0" "$([ "$rc" = 0 ] && echo yes)"
-ck "R2861: 首行是 relay 上一轮 → 本轮" \
-  "$([ "$(head -1 "$TD/notify.txt")" = '🌐 relay · run 111 → 222' ] && echo yes)"
+ck "R2895: 首行是选中的出口（原卡尾部上移）" \
+  "$([ "$(head -1 "$TD/notify.txt")" = '🌐 direct · 出口 1.2.3.4' ] && echo yes)"
+ck "R2895: 出口行不再在尾部重复" \
+  "$([ "$(grep -c '^🌐 ' "$TD/notify.txt")" -eq 1 ] && echo yes)"
+ck "R2895: 第二行是上一轮结束标题" \
+  "$([ "$(sed -n '2p' "$TD/notify.txt")" = '🔄 CI 上一轮结束 · opencode 正常结束' ] && echo yes)"
 ck "R2861: 标题改为上一轮结束并带原因" \
   "$(grep -qx '🔄 CI 上一轮结束 · opencode 正常结束' "$TD/notify.txt" && echo yes)"
 ck "R2861: 不再重复原因行" "$(! grep -q '^原因：' "$TD/notify.txt" && echo yes)"
@@ -97,7 +101,7 @@ ck "R2861: 编辑走原 Bot/原消息" \
      && grep -qx 'TG_NOTIFY_EDIT_MSG=4242' "$TD/notify.env" && echo yes)"
 ck "R2861: 写回标记文本与 relayed_by" \
   "$(jq -e '.relayed_by == "222"' "$TD/CI_LAST_ROUND_CARD.out" >/dev/null \
-     && [ "$(jq -r '.text' "$TD/CI_LAST_ROUND_CARD.out" | base64 -d | head -1)" = '🌐 relay · run 111 → 222' ] \
+     && [ "$(jq -r '.text' "$TD/CI_LAST_ROUND_CARD.out" | base64 -d | head -1)" = '🌐 direct · 出口 1.2.3.4' ] \
      && echo yes)"
 
 # Idempotent: the successor fails before sending its own card, so the next
@@ -108,6 +112,15 @@ run_mark
 rc=$?
 ck "R2861: 已标记的卡不再重复编辑" "$([ "$rc" = 0 ] && [ ! -f "$TD/notify.txt" ] && echo yes)"
 ck "R2861: 跳过时日志说明 already marked" "$(grep -q 'already marked' "$TD/out" && echo yes)"
+
+# R2895: a card without the egress tail (older workflow / failed selection)
+# still gets a first line; fall back to the relay run line.
+make_card $'🔄 CI 本轮结束 · 接力中\n原因：opencode 正常结束\nrun 111'
+rm -f "$TD/notify.txt" "$TD/deleted"
+run_mark
+rc=$?
+ck "R2895: 无出口行时回落到 relay 行" \
+  "$([ "$rc" = 0 ] && [ "$(head -1 "$TD/notify.txt")" = '🌐 relay · run 111 → 222' ] && echo yes)"
 
 # Deleted message / Bot switched off -> exit 2, clear the variable, keep run green.
 make_card "$orig_body"

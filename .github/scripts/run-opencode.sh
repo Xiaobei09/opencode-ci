@@ -578,6 +578,40 @@ else
   fi
   RC=$?
 fi
+# ── R2895: hot-switch completion card ───────────────────────────────────
+# A hot switch rotates the upstream in place, so the round-end card never runs.
+# Send the same 🌐 egress line the relay path shows, followed by the in-run
+# completion title. Best-effort: the switch must proceed even when Telegram is
+# unavailable or every Bot switch is off (tg-notify exits 0 for intentional
+# skips). The old→new upstream is kept because the new 🌐 line only shows the
+# selected one.
+notify_hot_switch_egress() {
+  local old_up="$1" new_up="$2" reason="$3"
+  local kind up eip direct why line bin text
+  kind=$(jq -r '.kind // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+  up=$(jq -r '.upstream // "direct"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+  eip=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+  direct=$(jq -r '.direct_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)
+  case "$reason" in
+    quota) why="配额 429" ;;
+    manual) why="手动换出口" ;;
+    *) why="${reason:-热切换}" ;;
+  esac
+  line="🌐 ${kind}"
+  [ -n "$up" ] && [ "$up" != "$kind" ] && line="$line (${up})"
+  line="$line · 出口 ${eip}"
+  [ "$kind" != "direct" ] && line="$line · 直连 ${direct}"
+  text=$(printf '%s\n%s' "$line" \
+    "🔄 热切换完成（未重启 CI） · ${why} · ${old_up:-?} → ${new_up:-?} · run ${GITHUB_RUN_ID:-?}")
+  bin="$SCRIPT_DIR/tg-notify.sh"
+  [ -f "$bin" ] || bin="$GITHUB_WORKSPACE/.github/scripts/tg-notify.sh"
+  if [ ! -f "$bin" ]; then
+    say "hot switch: tg-notify.sh not found; egress card skipped"
+    return 0
+  fi
+  printf '%s' "$text" | TG_NOTIFY_CLASS=egress bash "$bin" egress 2>&1 | sed 's/^/  /' || true
+}
+
 # ── R2884: hot egress switch ─────────────────────────────────────────────
 # Triggered by (a) a verified quota stop from egress-watch.sh / the zero-message
 # gateway preflight, or (b) a manual /proxy next request written by the bridge.
@@ -645,6 +679,9 @@ if [ "$HOT_SWITCH_EFFECTIVE" = "1" ] && [ -n "$hot_switch_reason" ] && [ "$HOT_C
     # exactly what resume-once's quota-recover gate needs to finish the turn.
     export RESUME_ONCE_QUOTA_RECOVER=1
     say "hot switch: $OLD_UP -> $NEW_UP (kind=$(jq -r '.kind // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null) egress=$(jq -r '.egress_ip // "?"' "$HOME/.config/opencode/exit-proxy.json" 2>/dev/null)); restarting OpenCode in this CI run (no relay)"
+    # R2895: the relay path's 🌐 line never runs for an in-run switch; send it
+    # here so the operator sees the new exit even though the CI round continues.
+    notify_hot_switch_egress "$OLD_UP" "$NEW_UP" "$hot_switch_reason"
     exec bash "${BASH_SOURCE[0]}" "$@"
   fi
   say "hot switch: rotation did not produce a new egress (rc=$ROTATE_RC, old=$OLD_UP, new=$NEW_UP); falling back to the normal round-end/relay path"

@@ -9,9 +9,16 @@
 # now running. This step edits the previous card in place (no new Telegram
 # notification) to:
 #
-#   🌐 relay · run <previous> → <current>
+#   🌐 <selected egress>
 #   🔄 CI 上一轮结束 · <reason>
 #   <the rest of the original card>
+#
+# R2895 (operator: "CI 开始编辑为 🌐 …出口… / 🔄 CI 上一轮结束 …"): the egress
+# line the finishing run appends to the card is moved to the top, so the
+# successor card starts with the exit that is actually in use. The old
+# "🌐 relay · run X → Y" line is only a fallback for cards without an egress
+# tail (older workflow / failed selection); its duplicate is removed from the
+# body either way.
 #
 # The finishing run persists the card target + full text in the repository
 # variable CI_LAST_ROUND_CARD (JSON: bot/msg/run/text). A successor reads it,
@@ -53,21 +60,30 @@ body=$(printf '%s' "$b64" | base64 -d 2>/dev/null) || {
   echo "::warning::previous round card text is not valid base64; skipped"
   exit 0
 }
-first=$(printf '%s\n' "$body" | head -1)
-case "$first" in
-  "🌐 relay "*|"🔄 CI 上一轮结束"*)
-    echo "previous round card is already marked as relayed; skipped"
-    exit 0
-    ;;
-esac
+# R2895: the title is the stable idempotence marker; the first line is now an
+# egress line, so the old "🌐 relay …" first-line check would re-edit it.
+if printf '%s\n' "$body" | grep -q '^🔄 CI 上一轮结束'; then
+  echo "previous round card is already marked as relayed; skipped"
+  exit 0
+fi
 
 # Move the original 原因： line into the title so it is not repeated.
 reason=$(printf '%s\n' "$body" | sed -n 's/^原因：//p' | head -1)
 rest=$(printf '%s\n' "$body" | grep -v '^原因：' || true)
 # Drop the old "🔄 CI 本轮结束 · 接力中" first line; the new title replaces it.
 rest=$(printf '%s\n' "$rest" | tail -n +2)
+# R2895: the egress tail is appended last by the finishing run. Promote it to
+# the top and remove the duplicate from the rest; keep the relay line only as a
+# fallback when the card has no egress tail.
+egress=$(printf '%s\n' "$body" | grep '^🌐 ' | tail -1 || true)
+if [ -n "$egress" ]; then
+  rest=$(printf '%s\n' "$rest" | grep -vxF -- "$egress" || true)
+  headline="$egress"
+else
+  headline="🌐 relay · run ${prev_run:-?} → $run_id"
+fi
 title="🔄 CI 上一轮结束${reason:+ · $reason}"
-new=$(printf '🌐 relay · run %s → %s\n%s\n%s' "${prev_run:-?}" "$run_id" "$title" "$rest")
+new=$(printf '%s\n%s\n%s' "$headline" "$title" "$rest")
 
 out=$(printf '%s' "$new" \
   | TG_NOTIFY_MODE=edit TG_NOTIFY_EDIT_BOT="$bot" TG_NOTIFY_EDIT_MSG="$msg" \

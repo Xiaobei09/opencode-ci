@@ -312,6 +312,10 @@ jobs:
           SESSIONS_DIR: /home/runner/work/sessions
           TARGETS_DIR: /home/runner/work/targets
           TG_BRIDGE_FORCE_SERVE: "1"
+          # R2895: the in-run hot-switch completion card uses the same
+          # tg-notify.sh routing (per-Bot switches) as the round-end card.
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_PUSH_CHAT: ${{ secrets.TG_PUSH_CHAT }}
           # R2755: the recovery prompt has no loop protocol ([STATUS: ...]), so
           # without a bound the one-shot repair would idle until the 360m job cap.
           # 1800s is the recovery default; a non-zero manual budget still wins.
